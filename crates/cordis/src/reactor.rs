@@ -1,0 +1,517 @@
+//! The reactor: one task that owns every fiber and applies lifecycle transitions.
+
+use std::any::Any;
+use std::collections::{HashMap, VecDeque};
+use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
+
+use futures::FutureExt;
+use serde_json::Value;
+use slotmap::{SecondaryMap, SlotMap, new_key_type};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
+
+use crate::erased::{Factory, Instance};
+use crate::{Component, Erased, Events, Key, KeyId};
+
+new_key_type! {
+    /// Identity of a fiber: one configured instance of a component.
+    pub struct FiberId;
+}
+
+/// Lifecycle state of a fiber.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Status {
+    /// Not running; waiting for its dependencies or for an exclusively provided key to free up.
+    Inactive,
+    /// `activate` is running.
+    Loading,
+    /// Running; its provisions are visible to consumers.
+    Active,
+    /// Its provisions are withdrawn; waiting for its consumers to finish their teardown.
+    Leaving,
+    /// `deactivate` is running.
+    Deactivating,
+    /// `activate` returned an error or panicked. Retried when the fiber's dependencies or
+    /// configuration change.
+    Failed(String),
+}
+
+/// Handle to a running reactor.
+///
+/// Clones share one reactor. The reactor stops when every handle is dropped; call
+/// [`shutdown`](App::shutdown) first to run every component's teardown in dependency order.
+#[derive(Clone)]
+pub struct App {
+    commands: mpsc::UnboundedSender<Command>,
+    events: Events,
+}
+
+impl App {
+    /// Starts a reactor on the current Tokio runtime.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a Tokio runtime.
+    pub fn new() -> Self {
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        let (reactor_events, event_rx) = mpsc::unbounded_channel();
+        let events = Events::default();
+        tokio::spawn(Reactor::new(reactor_events, events.clone()).run(command_rx, event_rx));
+        Self { commands, events }
+    }
+
+    /// Returns the event bus shared by every component of this app.
+    pub fn events(&self) -> &Events {
+        &self.events
+    }
+
+    /// Inserts a fiber of component `C` with `config`.
+    ///
+    /// # Returns
+    ///
+    /// The new fiber's id. The fiber activates once its dependencies are available.
+    pub async fn insert<C: Component>(&self, config: Value) -> FiberId {
+        self.insert_factory(Arc::new(Factory::of::<C>()), config).await
+    }
+
+    pub(crate) async fn insert_factory(&self, factory: Arc<Factory>, config: Value) -> FiberId {
+        let (reply, answer) = oneshot::channel();
+        self.send(Command::Insert { factory, config, reply });
+        answer.await.expect("the reactor replies to every command")
+    }
+
+    /// Replaces a fiber's configuration; an active fiber reloads, and its consumers with it.
+    pub fn update(&self, id: FiberId, config: Value) {
+        self.send(Command::Update { id, config });
+    }
+
+    /// Retires a fiber. It deactivates after its consumers, then is discarded.
+    pub fn remove(&self, id: FiberId) {
+        self.send(Command::Remove { id });
+    }
+
+    /// Returns a fiber's state, or `None` once the fiber has been discarded.
+    pub async fn status(&self, id: FiberId) -> Option<Status> {
+        let (reply, answer) = oneshot::channel();
+        self.send(Command::Status { id, reply });
+        answer.await.expect("the reactor replies to every command")
+    }
+
+    /// Returns the current active provider of `K`, if any.
+    pub async fn get<K: Key + ?Sized>(&self) -> Option<Arc<K::Value>> {
+        let (reply, answer) = oneshot::channel();
+        self.send(Command::Get { key: KeyId::of::<K>(), reply });
+        let value = answer.await.expect("the reactor replies to every command");
+        value.map(|value| value.get::<K>())
+    }
+
+    /// Waits until no activation or deactivation is in flight and every fiber has settled.
+    pub async fn settled(&self) {
+        let (reply, answer) = oneshot::channel();
+        self.send(Command::Settled { reply });
+        answer.await.expect("the reactor replies to every command");
+    }
+
+    /// Retires every fiber and waits until all of them have been torn down.
+    pub async fn shutdown(&self) {
+        self.send(Command::RemoveAll);
+        self.settled().await;
+    }
+
+    fn send(&self, command: Command) {
+        self.commands.send(command).expect("the reactor runs while a handle exists");
+    }
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+enum Command {
+    Insert { factory: Arc<Factory>, config: Value, reply: oneshot::Sender<FiberId> },
+    Update { id: FiberId, config: Value },
+    Remove { id: FiberId },
+    RemoveAll,
+    Status { id: FiberId, reply: oneshot::Sender<Option<Status>> },
+    Get { key: KeyId, reply: oneshot::Sender<Option<Erased>> },
+    Settled { reply: oneshot::Sender<()> },
+}
+
+enum Event {
+    /// An activation task ended. `outcome` is `None` when the task was cancelled.
+    Loaded {
+        id: FiberId,
+        token: u64,
+        outcome: Option<Result<Box<dyn Instance>, String>>,
+    },
+    Deactivated {
+        id: FiberId,
+    },
+}
+
+/// The provider fiber of each dependency key, in declaration order. Providers are compared
+/// by identity, so a replaced provider changes the view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct View(Vec<(KeyId, FiberId)>);
+
+impl View {
+    fn providers(&self) -> impl Iterator<Item = FiberId> + '_ {
+        self.0.iter().map(|(_, provider)| *provider)
+    }
+}
+
+/// The view and configuration epoch a fiber activated against.
+struct Committed {
+    view: View,
+    epoch: u64,
+}
+
+enum State {
+    Inactive,
+    Loading { token: u64, cancel: CancellationToken },
+    Active { instance: Box<dyn Instance> },
+    Leaving { instance: Box<dyn Instance> },
+    Deactivating,
+    Failed { view: View, epoch: u64, error: String },
+}
+
+impl State {
+    fn status(&self) -> Status {
+        match self {
+            State::Inactive => Status::Inactive,
+            State::Loading { .. } => Status::Loading,
+            State::Active { .. } => Status::Active,
+            State::Leaving { .. } => Status::Leaving,
+            State::Deactivating => Status::Deactivating,
+            State::Failed { error, .. } => Status::Failed(error.clone()),
+        }
+    }
+}
+
+struct Fiber {
+    factory: Arc<Factory>,
+    config: Value,
+    epoch: u64,
+    retired: bool,
+    committed: Option<Committed>,
+    state: State,
+}
+
+struct Reactor {
+    fibers: SlotMap<FiberId, Fiber>,
+    /// Active provisions. Only `Active` fibers appear here.
+    table: HashMap<KeyId, (FiberId, Erased)>,
+    /// Fibers to settle when a key's provider changes: dependents and competing providers.
+    watchers: HashMap<KeyId, Vec<FiberId>>,
+    /// Number of committed views that name each fiber.
+    relied: SecondaryMap<FiberId, u32>,
+    dirty: VecDeque<FiberId>,
+    in_flight: usize,
+    next_token: u64,
+    events: mpsc::UnboundedSender<Event>,
+    bus: Events,
+    waiters: Vec<oneshot::Sender<()>>,
+}
+
+impl Reactor {
+    fn new(events: mpsc::UnboundedSender<Event>, bus: Events) -> Self {
+        Self {
+            fibers: SlotMap::with_key(),
+            table: HashMap::new(),
+            watchers: HashMap::new(),
+            relied: SecondaryMap::new(),
+            dirty: VecDeque::new(),
+            in_flight: 0,
+            next_token: 0,
+            events,
+            bus,
+            waiters: Vec::new(),
+        }
+    }
+
+    async fn run(mut self, mut commands: mpsc::UnboundedReceiver<Command>, mut events: mpsc::UnboundedReceiver<Event>) {
+        loop {
+            tokio::select! {
+                command = commands.recv() => match command {
+                    Some(command) => self.command(command),
+                    None => break,
+                },
+                Some(event) = events.recv() => self.event(event),
+            }
+            while let Some(id) = self.dirty.pop_front() {
+                self.settle(id);
+            }
+            if self.in_flight == 0 {
+                for waiter in self.waiters.drain(..) {
+                    let _ = waiter.send(());
+                }
+            }
+        }
+    }
+
+    fn command(&mut self, command: Command) {
+        match command {
+            Command::Insert { factory, config, reply } => {
+                let watched: Vec<KeyId> = factory.deps.iter().chain(&factory.provides).copied().collect();
+                let id = self.fibers.insert(Fiber {
+                    factory,
+                    config,
+                    epoch: 0,
+                    retired: false,
+                    committed: None,
+                    state: State::Inactive,
+                });
+                for key in watched {
+                    self.watchers.entry(key).or_default().push(id);
+                }
+                self.relied.insert(id, 0);
+                self.dirty.push_back(id);
+                let _ = reply.send(id);
+            }
+            Command::Update { id, config } => {
+                if let Some(fiber) = self.fibers.get_mut(id) {
+                    fiber.config = config;
+                    fiber.epoch += 1;
+                    self.dirty.push_back(id);
+                }
+            }
+            Command::Remove { id } => {
+                if let Some(fiber) = self.fibers.get_mut(id) {
+                    fiber.retired = true;
+                    self.dirty.push_back(id);
+                }
+            }
+            Command::RemoveAll => {
+                for (id, fiber) in &mut self.fibers {
+                    fiber.retired = true;
+                    self.dirty.push_back(id);
+                }
+            }
+            Command::Status { id, reply } => {
+                let _ = reply.send(self.fibers.get(id).map(|fiber| fiber.state.status()));
+            }
+            Command::Get { key, reply } => {
+                let _ = reply.send(self.table.get(&key).map(|(_, value)| value.clone()));
+            }
+            Command::Settled { reply } => self.waiters.push(reply),
+        }
+    }
+
+    fn event(&mut self, event: Event) {
+        self.in_flight -= 1;
+        match event {
+            Event::Loaded { id, token, outcome } => self.loaded(id, token, outcome),
+            Event::Deactivated { id } => self.deactivated(id),
+        }
+    }
+
+    /// Returns the providers the fiber should run against, or `None` when it should not run.
+    fn target(&self, id: FiberId) -> Option<View> {
+        let fiber = &self.fibers[id];
+        if fiber.retired {
+            return None;
+        }
+        // A key has one active provider; a competing provider waits until the key is free.
+        let contested =
+            fiber.factory.provides.iter().any(|key| self.table.get(key).is_some_and(|(provider, _)| *provider != id));
+        if contested {
+            return None;
+        }
+        fiber
+            .factory
+            .deps
+            .iter()
+            .map(|key| self.table.get(key).map(|(provider, _)| (*key, *provider)))
+            .collect::<Option<Vec<_>>>()
+            .map(View)
+    }
+
+    fn is_current(&self, id: FiberId, target: Option<&View>) -> bool {
+        let fiber = &self.fibers[id];
+        match (&fiber.committed, target) {
+            (Some(committed), Some(target)) => committed.view == *target && committed.epoch == fiber.epoch,
+            _ => false,
+        }
+    }
+
+    fn settle(&mut self, id: FiberId) {
+        if !self.fibers.contains_key(id) {
+            return;
+        }
+        let target = self.target(id);
+        let current = self.is_current(id, target.as_ref());
+        let fiber = &self.fibers[id];
+        let (retired, epoch) = (fiber.retired, fiber.epoch);
+        match &fiber.state {
+            State::Inactive => match target {
+                Some(view) => self.begin(id, view),
+                None if retired => self.discard(id),
+                None => {}
+            },
+            State::Failed { view, epoch: failed_epoch, .. } => match target {
+                Some(target) if target != *view || *failed_epoch != epoch => self.begin(id, target),
+                None if retired => self.discard(id),
+                _ => {}
+            },
+            State::Loading { cancel, .. } => {
+                if !current {
+                    cancel.cancel();
+                }
+            }
+            State::Active { .. } => {
+                if !current {
+                    self.leave(id);
+                }
+            }
+            State::Leaving { .. } | State::Deactivating => {}
+        }
+    }
+
+    fn begin(&mut self, id: FiberId, view: View) {
+        for provider in view.providers() {
+            self.relied[provider] += 1;
+        }
+        let deps = view.0.iter().map(|(key, _)| (*key, self.table[key].1.clone())).collect();
+        let token = self.next_token;
+        self.next_token += 1;
+        let cancel = CancellationToken::new();
+
+        let fiber = &mut self.fibers[id];
+        let task = (fiber.factory.activate)(deps, fiber.config.clone(), self.bus.clone());
+        fiber.committed = Some(Committed { view, epoch: fiber.epoch });
+        fiber.state = State::Loading { token, cancel: cancel.clone() };
+
+        self.in_flight += 1;
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let outcome = tokio::select! {
+                result = AssertUnwindSafe(task).catch_unwind() => Some(match result {
+                    Ok(Ok(instance)) => Ok(instance),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(panic) => Err(panic_message(&*panic)),
+                }),
+                // Dropping `task` drops the locals it built so far, in reverse order.
+                () = cancel.cancelled() => None,
+            };
+            let _ = events.send(Event::Loaded { id, token, outcome });
+        });
+    }
+
+    fn loaded(&mut self, id: FiberId, token: u64, outcome: Option<Result<Box<dyn Instance>, String>>) {
+        let Some(fiber) = self.fibers.get(id) else { return };
+        if !matches!(fiber.state, State::Loading { token: loading, .. } if loading == token) {
+            return;
+        }
+        let target = self.target(id);
+        let current = self.is_current(id, target.as_ref());
+        match outcome {
+            Some(Ok(instance)) if current => self.publish(id, instance),
+            Some(Ok(instance)) => {
+                // The target moved while the last step ran; revert what it built.
+                self.fibers[id].state = State::Leaving { instance };
+                self.try_unload(id);
+            }
+            Some(Err(error)) => {
+                tracing::error!(fiber = ?id, %error, "activation failed");
+                let fiber = &mut self.fibers[id];
+                let committed = fiber.committed.take().expect("a loading fiber has a committed view");
+                fiber.state = State::Failed { view: committed.view.clone(), epoch: committed.epoch, error };
+                self.release(&committed.view);
+                self.dirty.push_back(id);
+            }
+            None => {
+                let fiber = &mut self.fibers[id];
+                let committed = fiber.committed.take().expect("a loading fiber has a committed view");
+                fiber.state = State::Inactive;
+                self.release(&committed.view);
+                self.dirty.push_back(id);
+            }
+        }
+    }
+
+    fn publish(&mut self, id: FiberId, instance: Box<dyn Instance>) {
+        for (key, value) in instance.provisions() {
+            self.table.insert(key, (id, value));
+            self.mark(key);
+        }
+        self.fibers[id].state = State::Active { instance };
+    }
+
+    fn leave(&mut self, id: FiberId) {
+        let fiber = &mut self.fibers[id];
+        let State::Active { instance } = std::mem::replace(&mut fiber.state, State::Inactive) else {
+            unreachable!("only an active fiber leaves");
+        };
+        fiber.state = State::Leaving { instance };
+        let provides = fiber.factory.provides.clone();
+        for key in provides {
+            if self.table.get(&key).is_some_and(|(provider, _)| *provider == id) {
+                self.table.remove(&key);
+                self.mark(key);
+            }
+        }
+        self.try_unload(id);
+    }
+
+    /// Runs the fiber's inverse once no committed view names it.
+    fn try_unload(&mut self, id: FiberId) {
+        if self.relied[id] > 0 || !matches!(self.fibers[id].state, State::Leaving { .. }) {
+            return;
+        }
+        let State::Leaving { instance } = std::mem::replace(&mut self.fibers[id].state, State::Deactivating) else {
+            unreachable!("checked above");
+        };
+        self.in_flight += 1;
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            if let Err(panic) = AssertUnwindSafe(instance.deactivate()).catch_unwind().await {
+                tracing::error!(fiber = ?id, panic = panic_message(&*panic), "deactivation panicked");
+            }
+            let _ = events.send(Event::Deactivated { id });
+        });
+    }
+
+    fn deactivated(&mut self, id: FiberId) {
+        let fiber = &mut self.fibers[id];
+        fiber.state = State::Inactive;
+        if let Some(committed) = fiber.committed.take() {
+            self.release(&committed.view);
+        }
+        self.dirty.push_back(id);
+    }
+
+    /// Drops one reliance on each provider in `view`, unloading providers that were waiting.
+    fn release(&mut self, view: &View) {
+        for provider in view.providers() {
+            self.relied[provider] -= 1;
+            self.try_unload(provider);
+        }
+    }
+
+    fn discard(&mut self, id: FiberId) {
+        let fiber = self.fibers.remove(id).expect("a discarded fiber exists");
+        for key in fiber.factory.deps.iter().chain(&fiber.factory.provides) {
+            if let Some(watchers) = self.watchers.get_mut(key) {
+                watchers.retain(|watcher| *watcher != id);
+            }
+        }
+        self.relied.remove(id);
+    }
+
+    fn mark(&mut self, key: KeyId) {
+        if let Some(watchers) = self.watchers.get(&key) {
+            self.dirty.extend(watchers.iter().copied());
+        }
+    }
+}
+
+fn panic_message(panic: &(dyn Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic with a non-string payload".to_owned())
+}

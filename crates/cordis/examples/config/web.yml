@@ -1,0 +1,5 @@
+# Browser application: adds a server on top of the base.
+plugins:
+  - id: server
+    use: web-server
+    config: { port: 19387 }

@@ -1,0 +1,304 @@
+# Cordis in Rust: Design
+
+This document describes a native Rust realization of the context paradigm from *A Programming Paradigm for Spatiotemporal Composability* (Shi, Zhang, Cui; arXiv:2608.25512), and an agent harness built on it. It does not aim for compatibility with the TypeScript Cordis implementation.
+
+## Thesis
+
+TypeScript Cordis enforces the paper's guarantees with runtime machinery: a `Proxy` that mediates every context access, an explicit effect accumulator, and a string-keyed event bus. In Rust, language features replace most of that machinery:
+
+- **Revertible effects** are ownership and `Drop`.
+- **Effect iterators** are `async fn`.
+- **Coeffect specifications** are associated types.
+- **Coeffect provisions** are checked coercions to `Arc<dyn Trait>`.
+- **Event names** are types, so payloads and dispatch modes are checked at compile time.
+
+The runtime keeps only what is inherently dynamic: a reactor that activates and deactivates components as providers and configuration change.
+
+Rust fixes the *vocabulary* at compile time: which service traits exist, which component types exist, and what each one declares. Configuration still decides the *composition*: which components run, with what configuration, and so which implementation serves each key.
+
+## Concept mapping
+
+| Paper concept | Rust realization |
+|---|---|
+| Key *k* with value type *V_k* | A type implementing `Key`, with `Key::Value` as *V_k* |
+| Component (*d*, *p*, *e*), Def 48 | A type implementing `Component` with associated `Deps` and `Provides` |
+| Revertible effect and inverse, §3.1 | Owning a value whose `Drop` performs the inverse |
+| Accumulator φ | The component's state value; during a cancelled activation, the future's locals |
+| Effect iterator and iteration boundaries, Def 17 | `async fn activate`; each `.await` is an iteration boundary |
+| Fiber | One configured instance of a component, owned by the reactor |
+| Target view and committed view, Def 53 | `View`: the provider fiber of each dependency key |
+| Satisfaction and `notify`, Def 22 | The reactor's settle step |
+| The "relied upon" guard, Def 54 | Per-fiber count of committed views that name the fiber |
+| Isolation, Def 24 | Realms: registry views that override selected keys |
+| Interception, Def 26 | A typed monoid (`Default + Merge`) declared per key |
+| Service multiplexing, §6.2 | Cardinality declared on the key: `one` or `many` |
+| Dependency typing and versioning, §6.6 | `TypeId` keys plus trait upcasting between interface versions |
+| Cordis events | Types implementing `Event`, dispatched through the built-in `Events` bus |
+
+## Keys
+
+A consumer and a provider never name each other. They meet at a **key**: a named slot with a declared value type.
+
+In TypeScript Cordis a key is a string (`'tools'`), and the value's type is only asserted by declaration merging. In Rust a key is a **type**. The registry is a map from the key's `TypeId` to a value of the key's declared type:
+
+```rust
+pub trait Key: 'static {
+    type Value: ?Sized + Send + Sync + 'static; // consumers receive Arc<Self::Value>
+    const NAME: &'static str;                   // configuration and diagnostics only
+}
+
+pub trait Tools: Send + Sync { fn register(&self, name: &str) -> Guard; }
+key!(dyn Tools = "tools");   // impl Key for dyn Tools { type Value = dyn Tools; ... }
+```
+
+- **The consumer names only the interface.** `cx.dep::<dyn Tools>()` returns `Arc<dyn Tools>`; which implementation stands behind it is decided at runtime.
+- **The lookup returns the declared type.** The key is the type, so user code contains no casts. The registry downcasts once internally, and that downcast cannot fail because only a provision of `K` writes under `TypeId::of::<K>()`.
+- **No collisions, no silent drift.** The `TypeId` of `dyn Tools` includes its defining crate. Unrelated crates cannot collide, and two semver-incompatible versions of one crate are two different keys.
+- **A key is not always an interface.** A marker type can name a second slot that uses the same interface:
+
+```rust
+pub struct ReplicaDb;
+impl Key for ReplicaDb { type Value = dyn Database; const NAME: &'static str = "db.replica"; }
+```
+
+`Key::NAME` appears only at the edges, where people write text: configuration and logs. The loader maps names to `TypeId`s through the table of registered keys. With isolation, the lookup key becomes `(RealmId, TypeId)`.
+
+## Components
+
+A component is a type. Its state value is its accumulator: dropping the value reverts everything the component did.
+
+```rust
+pub trait Component: Sized + Send + Sync + 'static {
+    type Config: DeserializeOwned + Send + 'static;
+    type Deps: DepSet;             // d
+    type Provides: ProvSet<Self>;  // p
+    fn activate(cx: Cx<Self>, cfg: Self::Config) -> impl Future<Output = Result<Self>> + Send;
+    fn deactivate(self) -> impl Future<Output = ()> + Send { async {} } // Drop does the rest
+}
+```
+
+```rust
+struct GrepTool { _reg: Guard }
+deps!(GrepDeps = [dyn Tools, dyn Fs]);
+
+impl Component for GrepTool {
+    type Config = GrepConfig;
+    type Deps = GrepDeps;
+    type Provides = ();
+    async fn activate(cx: Cx<Self>, cfg: GrepConfig) -> Result<Self> {
+        let fs = cx.dep::<dyn Fs>();
+        Ok(Self { _reg: cx.dep::<dyn Tools>().register(grep_tool(fs, cfg)) })
+    }
+}
+```
+
+- **Undeclared access does not compile.** `cx.dep::<K>()` requires `Deps: Has<K>`, and `deps!` implements `Has` only for the listed keys. The bound carries `#[diagnostic::on_unimplemented]`, so the error names the missing declaration.
+- **Inactive access cannot be expressed.** The reactor constructs `Cx<Self>` only when every dependency has an active provider.
+- **An attribute macro can replace the declarative forms.** `#[component(deps(...), provides(...))]` would generate the same items as `deps!` and `provides!`.
+
+### Effects
+
+- **Unloading drops the component value.** Every `Guard` field drops with it and reverts its registration.
+- **External resources already follow this pattern.** `AbortOnDropHandle`, `Command::kill_on_drop`, `TempDir`, and listener sockets release their resource on drop, which covers most of the system boundary in paper §6.1.
+- **Attribution is possession.** An effect belongs to whoever holds its guard.
+- **A guard holds a `Weak` reference to its registry**, so it never keeps its provider alive and does nothing if the registry is already gone.
+- **LIFO revert.** Dropping an `activate` future drops its locals in reverse declaration order, which realizes rule L-Divert and Theorem 16. `Vec` drops front to back, so `Guards` pops from the back.
+- **Async cleanup goes in `deactivate`.** Rust has no stable async `Drop`, so a cancelled activation receives only synchronous cleanup.
+- **Registrations made through `Cx` belong to the fiber.** The fiber holds their guards and drops them before `deactivate` runs, or when the activation is cancelled or fails.
+
+## Provision
+
+The component value is the service. `provides!` publishes `Arc<Self>` as `Arc<K::Value>` for each listed key. Generic unsizing is unstable, so the macro writes one coercion per key, and each coercion fails to compile if the component does not implement the trait. Publishing through `Provides` is the only way to bind a key, so a component binds no key outside *p* (Def 48).
+
+```rust
+struct ToolRegistry { tools: Arc<Mutex<Vec<String>>> }
+provides!(RegistryProvides for ToolRegistry = [dyn Tools]);
+impl Tools for ToolRegistry { fn register(&self, name: &str) -> Guard { /* ... */ } }
+```
+
+- **Versions.** Trait upcasting lets one provider serve several interface versions: with `trait ToolsV2: Tools`, the provider lists both `dyn ToolsV2` and `dyn Tools`.
+- **Cardinality.** A `one` key has one active provider at a time; a second provider waits and takes over when the first leaves. For a `many` key, adding or removing a provider does not reload consumers, which observe a live set instead. This gives load balancing and rolling updates (paper §6.2).
+
+## Events
+
+Events follow TypeScript Cordis: a built-in bus that every component can reach, listeners registered from any component, and the same five dispatch modes. The difference is that an event is a **type**, not a string:
+
+```rust
+pub trait Event: 'static {
+    const NAME: &'static str;          // diagnostics and the named edge
+    type Mode: Mode;                   // Emit, Bail, Parallel, Serial, or Waterfall
+    type Args: Send + Sync + 'static;
+    type Output: Send + 'static;
+}
+
+event!(pub ToolsPreExecute = "tools/pre-execute", Waterfall(ToolCall) -> ToolResult);
+```
+
+A listener registers through the component's `Cx`, and an emitter dispatches through the same bus:
+
+```rust
+// listener, in activate
+cx.on::<ToolsPreExecute>().listen(|call, next| async move {
+    if denied(&call) { return Flow::short_circuit(ToolResult::denied()) }
+    next.run(call).await
+});
+
+// emitter
+let result = cx.events().waterfall::<ToolsPreExecute>(call, |call| run_tool(call)).await;
+```
+
+| Mode | Dispatch | Listener | Result |
+|---|---|---|---|
+| `Emit` | Synchronous, in registration order | `Fn(&Args)` | none |
+| `Bail` | Synchronous, in order until one returns `Some` | `Fn(&Args) -> Option<Output>` | first `Some` |
+| `Parallel` | Awaited, all listeners concurrently | `Fn(Arc<Args>) -> impl Future<Output = ()>` | none |
+| `Serial` | Awaited, in order until one returns `Some` | `Fn(Arc<Args>) -> impl Future<Output = Option<Output>>` | first `Some` |
+| `Waterfall` | Awaited middleware around a default action | `Fn(Args, Next) -> impl Future<Output = Flow<Output>>` | the chain's output |
+
+- **Typed, like TypeScript's declaration merging.** A listener with the wrong payload, a dispatch with the wrong mode, and a listener with the wrong mode's signature do not compile, so the `@mode` tag and its catalog gate are unnecessary. Event types from different crates cannot collide, and dispatch involves no serialization or downcast.
+- **Each event has exactly one dispatch mode**, because the mode fixes the listener signature the event's listeners are checked against. The paper defines no dispatch modes, and TypeScript Cordis lets any event be dispatched by any method; the one-mode rule is the DeepSeek Harness convention (`@mode` plus its catalog gate), expressed as a type. When the same payload needs a second dispatch style, declare a second event type:
+
+  ```rust
+  event!(pub ToolsExecute = "tools/execute", Waterfall(ToolCall) -> ToolResult);
+  event!(pub ToolsExecuted = "tools/executed", Emit(ToolCall));
+  ```
+
+- **`on::<E>()` returns a registrar** whose `listen` signature depends on the event's mode. Putting the signature on a method with a direct `Fn` bound lets the compiler infer closure argument types.
+- **Registrations are effects.** `cx.on` hands its guard to the fiber, so listeners are removed when the fiber unloads, and when its activation is cancelled or fails. Host code outside a component uses `app.events().on::<E>().listen(...)`, which returns the `Guard`.
+- **Payloads move instead of being shared mutably.** A waterfall passes `Args` by value down the chain; each listener may change it before calling `next.run(args)`. Parallel and serial listeners share an `Arc<Args>`.
+- **A waterfall listener returns `Flow<Output>`**, which only `next.run()` or an explicit `Flow::short_circuit` can produce, so an accidental short circuit does not compile. `Flow::map` post-processes the downstream result.
+- **TODO: listener order.** Listeners run in registration order, and registration happens during activation, so components that activate concurrently register in an unspecified order, and a reloaded component moves to the end. TypeScript Cordis has the same behaviour and offers `prepend`; the harness uses it where position matters. Planned: an explicit priority, with ties broken by the fiber's row position, so the order is deterministic and survives reloads.
+- **Dispatch uses a snapshot** of the listener list. A registration or removal during dispatch applies to the next dispatch.
+- **Emitters and listeners stay loosely coupled**, as in TypeScript. A listener that should run only while a particular service is active declares that service in `deps`, and then unloads with it.
+- **The named edge (planned).** `Event::NAME` plus serde payloads will let WASM components, out-of-process plugins, and wildcard observers use events by name, with payloads validated where they enter. Events whose payloads hold live objects, such as an `Agent`, stay in-process.
+
+## Isolation and interception
+
+- **A realm** is a registry view that overrides selected keys and resolves the rest through its parent. It is a derived realization (Def 23): dropping the view discards it.
+- **Interception metadata** is a typed monoid declared on the dependency, merged right-biased with metadata the context carries, for example `Dep<dyn Fs, ReadOnly>`.
+
+## Configuration
+
+YAML composes the application from the components linked into the binary:
+
+```yaml
+plugins:
+  - id: prompt
+    use: system-prompt            # registered component name
+  - id: tools
+    use: tool-registry
+  - id: grep
+    use: grep-tool
+    config: { max_matches: 200 }
+```
+
+- **`use` names a registered component.** Native components are registered by name; WASM and out-of-process components name a file or endpoint.
+- **Configuration is validated at load** by deserializing into the component's `Config` type.
+- **The loader checks the whole tree before activating anything.** Every row's dependencies and provisions are static metadata, so unknown components, invalid configuration, missing providers, and dependency cycles are load errors.
+- **Reapplying a tree reconciles it.** Removed rows retire their fibers, changed configuration reloads them, and new rows insert fibers.
+- **Profiles and overlays** remain layers of plain data merged by row id before the loader sees the tree.
+- **Optional static composition.** A `compose!` macro can fix a whole application in Rust code, making missing providers and cycles compile errors. A build script can apply the same check to shipped profiles while users still layer patches at runtime.
+
+## Reactive lifecycle
+
+The reactor is one task that owns every fiber. It decides *when* a component runs; the component's types already fixed *what* it receives.
+
+### Fiber states
+
+```rust
+enum State {
+    Inactive,
+    Loading { token: u64, cancel: CancellationToken }, // activate() is running
+    Active { inst: Box<dyn Instance> },                 // its provisions are in the table
+    Leaving { inst: Box<dyn Instance> },                // out of the table; waiting until no longer relied upon
+    Deactivating,                                       // deactivate() is running
+    Failed { view: View, error: String },
+}
+```
+
+Each fiber also records its **committed view**: the provider fiber of each dependency key that it activated against. Its **target view** is computed from the table: the current provider of each dependency key, or none if a key has no active provider. Views compare providers by fiber identity, so a replaced provider changes the view even when the new value looks the same.
+
+### Rules
+
+After every command or task completion, the reactor settles each affected fiber until nothing changes:
+
+| Fiber is | Condition | Action | Paper rule |
+|---|---|---|---|
+| `Inactive` | target view exists | spawn `activate` | L-Begin |
+| `Loading` | target differs from committed | cancel the task; dropping the future reverts its partial effects | L-Divert |
+| `Loading` completes | target still matches | publish provisions to the table, become `Active`, mark dependents | L-Finish |
+| `Active` | target differs from committed | remove provisions from the table, become `Leaving`, mark dependents | L-Leave |
+| `Leaving` | no committed view names this fiber | run `deactivate`, then release its own providers | L-Unload |
+
+- **Only active fibers are in the table.** A provider value does not exist until `activate` returns it, so dependents can never see a half-built provider.
+- **Dependents are found through a reverse index** from each key to the fibers that depend on it.
+- **Configuration changes** bump a per-fiber epoch that is part of the committed view, so an update reloads the fiber through the same rules.
+- **A panic or error in `activate`** moves only that fiber to `Failed`. It retries when its target view or configuration changes.
+
+### Cascade
+
+`G` depends on `dyn Tools`, provided by `T`; `T` depends on `dyn Prompt`, provided by `P`.
+
+```text
+P active   → publish dyn Prompt → mark T
+T active   → publish dyn Tools  → mark G
+G active
+
+remove P   → P leaves: dyn Prompt out of the table → mark T
+T leaves   → dyn Tools out of the table          → mark G
+G leaves   → nothing relies on G → G deactivates → release T
+T deactivates → release P
+P deactivates
+```
+
+Activation runs in dependency order, and independent branches activate concurrently. Teardown order is never computed by sorting. It emerges from the "relied upon" guard, which keeps each provider in place until its consumers finish their own teardown (Theorem 70).
+
+### Leaks
+
+The reactor holds each instance as an `Arc<Self>`. After the guard releases, it calls `Arc::into_inner` to recover the owned value for `deactivate`. `None` means some consumer kept a clone past its own teardown. The reactor logs the leak, and `Drop` runs when the last clone is released.
+
+## Execution tiers
+
+| Tier | Code | Reload | Use |
+|---|---|---|---|
+| Native | Compiled into the binary | Configuration reconciliation | Core services |
+| WASM components | `wasmtime` + WIT | Dropping the instance retracts its code | Third-party and generated components |
+| Out of process | JSON-RPC broker (paper §6.2) | Process restart | Components in other languages |
+
+A WIT world is the paper's component triple: imports are *d*, exports are *p*, and the instance is *e*. A WASM component can reach only its imports, which supplies the sandboxing of paper §6.3.
+
+```wit
+package dsh:tool-grep@0.1.0;
+world plugin {
+  import dsh:fs/read@0.1.0;          // d
+  export dsh:tools/tool@0.1.0;       // p
+}
+```
+
+## Agent harness on top
+
+The harness is a set of crates, each a service trait plus components that provide it.
+
+| Crate | Depends on | Provides |
+|---|---|---|
+| `dsh-session` | — | `dyn Sessions` |
+| `dsh-llm` | `many dyn LlmAdapter` | `dyn Llm` |
+| `dsh-tools` | `dyn SystemPrompt` | `dyn Tools` |
+| `dsh-agent-loop` | `dyn Llm`, `dyn Tools`, `dyn Sessions` | `dyn Agents` |
+
+- **Interception points** (`agent/pre-step`, `agent/request`, `tools/*`, `agent/turn-stopping`, `session/event`) are event types declared by the crate that dispatches them.
+- **Presets and subagents** are realms that override `dyn Tools` or `dyn Fs` for one agent.
+- **Self-modification** compiles a generated component to `wasm32-wasip2` and mounts it as a fiber.
+- **Model-visible means logged.** Only the session crate can construct `Logged<T>`, and the request builder accepts only `Logged` values.
+- **Session events** are serde types registered with a decoder table. A log with an unknown event type that is not marked ignorable is refused. Format migrations are an `impl From<V1> for V2` chain.
+- **Tools** derive their JSON Schema from the argument type (`schemars`) and their description from the doc comment.
+
+## Trade-offs
+
+| Gains | Costs |
+|---|---|
+| Effect tracking is ownership | No async `Drop`: cancelled activations get synchronous cleanup only |
+| Undeclared access and invalid provisions are compile errors | Macro-heavy; readable errors depend on `#[diagnostic::on_unimplemented]` |
+| Event payloads and modes are checked at compile time | Async listeners take owned or `Arc` arguments, not borrowed ones |
+| Lifecycle transitions are serialized by one owner | No native code replacement; new code arrives through WASM or another process |
+| Versioned, collision-free keys | Width compatibility is limited to what supertraits declare |

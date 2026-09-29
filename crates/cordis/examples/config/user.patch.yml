@@ -1,0 +1,6 @@
+# The user's own patch, applied on top of whichever profile runs.
+plugins:
+  - id: server
+    config: { port: 8080 }
+  - id: approval
+    disabled: true

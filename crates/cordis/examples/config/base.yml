@@ -1,0 +1,10 @@
+# Shared first layer of every profile.
+plugins:
+  - id: sessions
+    use: jsonl-sessions
+    config: { dir: ~/.dsh/sessions }
+  - id: tools
+    use: tool-runtime
+  - id: approval
+    use: approval-policy
+    config: { mode: ask }

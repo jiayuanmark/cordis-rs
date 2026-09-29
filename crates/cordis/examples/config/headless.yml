@@ -1,0 +1,7 @@
+# One-shot runs: nothing to persist, nobody to ask.
+plugins:
+  - id: sessions
+    use: memory-sessions
+    config: null
+  - id: approval
+    config: { mode: auto }
