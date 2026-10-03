@@ -95,6 +95,7 @@ impl Component for GrepTool {
 - **One declaration, on the type.** The `#[component]` attribute implements `Manifest` and takes `config`, `deps`, and `provides` in any order, each optional. It reads the type's name and generics from the item it is attached to. The `impl Component` block then holds only behavior, so it stays ordinary, rustfmt-formatted Rust.
 - **Undeclared access does not compile.** `cx.dep::<K>()` requires `Self: Has<K>`, and `#[component]` implements `Has` only for the keys in `deps`. The bound carries `#[diagnostic::on_unimplemented]`, so the error names the missing declaration.
 - **Inactive access cannot be expressed.** The reactor constructs `Cx<Self>` only when every dependency has an active provider.
+- **Methods reach the context through a stored `Cx`.** `Cx` is a cheap clone, so a component keeps one as a field and calls `self.cx.dep::<K>()` or `self.cx.on::<E>()` from ordinary methods. Every clone registers into the fiber's own set, which is reverted when the fiber unloads; after that `cx.is_live()` is `false` and new registrations revert at once. Closing the set breaks the cycle when a listener captures a `Cx` clone.
 - **A small proc-macro crate.** `cordis-macros` holds only the attribute. A declarative `component!(Name { ... })` would avoid `syn` but has to be told the type's name, and wrapping the struct inside it would take the struct out of rustfmt's reach.
 
 ### Effects

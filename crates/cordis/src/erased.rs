@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::guard::Scope;
+use crate::guard::ScopeOwner;
 use crate::{Component, Cx, Events, Key, KeyId, Manifest, Result};
 
 pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -64,8 +64,8 @@ fn validate<C: Component>(config: &Value) -> Result<(), String> {
 fn activate<C: Component>(deps: Resolved, config: Value, events: Events) -> BoxFuture<Result<Box<dyn Instance>>> {
     Box::pin(async move {
         let config: C::Config = serde_json::from_value(config)?;
-        let scope = Scope::default();
-        let component = C::activate(Cx::new(deps, events, scope.clone()), config).await?;
+        let scope = ScopeOwner::new();
+        let component = C::activate(Cx::new(deps, events, scope.scope()), config).await?;
         Ok(Box::new(Active { component: Arc::new(component), scope }) as Box<dyn Instance>)
     })
 }
@@ -81,9 +81,9 @@ pub(crate) trait Instance: Send + Sync {
 
 struct Active<C> {
     component: Arc<C>,
-    /// Registrations made through `Cx`; dropped before `deactivate` so no listener runs
-    /// during teardown.
-    scope: Scope,
+    /// Registrations made through `Cx`, including clones the component kept; closed before
+    /// `deactivate` so no listener runs during teardown.
+    scope: ScopeOwner,
 }
 
 impl<C: Component> Instance for Active<C> {
