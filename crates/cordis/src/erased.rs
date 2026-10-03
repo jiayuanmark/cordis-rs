@@ -8,7 +8,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::guard::Scope;
-use crate::{Component, Cx, DepSet, Events, Key, KeyId, ProvSet, Result};
+use crate::{Component, Cx, Events, Key, KeyId, Manifest, Result};
 
 pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
@@ -48,7 +48,12 @@ pub(crate) struct Factory {
 
 impl Factory {
     pub(crate) fn of<C: Component>() -> Self {
-        Self { deps: C::Deps::keys(), provides: C::Provides::keys(), validate: validate::<C>, activate: activate::<C> }
+        Self {
+            deps: <C as Manifest>::deps(),
+            provides: <C as Manifest>::provides(),
+            validate: validate::<C>,
+            activate: activate::<C>,
+        }
     }
 }
 
@@ -83,7 +88,7 @@ struct Active<C> {
 
 impl<C: Component> Instance for Active<C> {
     fn provisions(&self) -> Vec<(KeyId, Erased)> {
-        C::Provides::publish(&self.component)
+        <C as Manifest>::publish(&self.component)
     }
 
     fn deactivate(self: Box<Self>) -> BoxFuture<()> {

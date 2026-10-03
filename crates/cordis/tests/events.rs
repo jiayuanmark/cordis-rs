@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cordis::{App, Component, Cx, Events, Flow, Result, Status, event};
+use cordis::{App, Component, Cx, Events, Flow, Result, Status, component, event};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -120,11 +120,9 @@ fn seen_by(label: &str) -> Vec<String> {
 
 struct Recorder;
 
-impl Component for Recorder {
-    type Config = Label;
-    type Deps = ();
-    type Provides = ();
+component!(Recorder { config: Label });
 
+impl Component for Recorder {
     async fn activate(cx: Cx<Self>, config: Label) -> Result<Self> {
         let label = config.label;
         cx.on::<Appended>().listen(move |text| SEEN.lock().unwrap().push(format!("{label} {text}")));
@@ -154,11 +152,9 @@ struct StallConfig {
 /// Registers a listener, then either fails or never finishes activating.
 struct Stall;
 
-impl Component for Stall {
-    type Config = StallConfig;
-    type Deps = ();
-    type Provides = ();
+component!(Stall { config: StallConfig });
 
+impl Component for Stall {
     async fn activate(cx: Cx<Self>, config: StallConfig) -> Result<Self> {
         let label = config.label.clone();
         cx.on::<Appended>().listen(move |text| SEEN.lock().unwrap().push(format!("{label} {text}")));

@@ -1,10 +1,10 @@
 //! Components with revertible effects and reactive dependencies.
 //!
-//! A [`Component`] declares the [`Key`]s it depends on and the keys it provides. An [`App`]
-//! runs a reactor that activates each configured component once all of its dependencies have
-//! an active provider, and deactivates it, consumers first, when that stops being true. A
-//! component's value is its accumulator: dropping it reverts every effect it holds, such as
-//! the [`Guard`]s of its registrations.
+//! A [`Component`] declares, with [`component!`], the [`Key`]s it depends on and the keys it
+//! provides. An [`App`] runs a reactor that activates each configured component once all of
+//! its dependencies have an active provider, and deactivates it, consumers first, when that
+//! stops being true. A component's value is its accumulator: dropping it reverts every effect
+//! it holds, such as the [`Guard`]s of its registrations.
 //!
 //! `design.md` at the repository root maps these types to the paper's model.
 
@@ -16,7 +16,7 @@ mod key;
 mod loader;
 mod reactor;
 
-pub use component::{Component, Cx, DepSet, Has, ProvSet};
+pub use component::{Component, Cx, Has, Manifest};
 #[doc(hidden)]
 pub use erased::Erased;
 pub use events::{DefaultAction, Detached, Event, Events, Flow, Held, Next, On, Sink, mode};

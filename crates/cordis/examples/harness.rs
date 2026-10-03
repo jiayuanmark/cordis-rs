@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use cordis::{App, Catalog, Component, Cx, Events, Flow, Loader, Result, event, key, provides};
+use cordis::{App, Catalog, Component, Cx, Events, Flow, Loader, Result, component, event, key};
 use futures::future::BoxFuture;
 use serde::Deserialize;
 
@@ -57,7 +57,6 @@ key!(dyn Tools = "tools");
 struct ToolRuntime {
     events: Events,
 }
-provides!(ToolRuntimeProvides for ToolRuntime = [dyn Tools]);
 
 impl Tools for ToolRuntime {
     fn run(&self, call: ToolCall) -> BoxFuture<'static, ToolResult> {
@@ -75,11 +74,9 @@ impl Tools for ToolRuntime {
     }
 }
 
-impl Component for ToolRuntime {
-    type Config = ();
-    type Deps = ();
-    type Provides = ToolRuntimeProvides;
+component!(ToolRuntime { provides: [dyn Tools] });
 
+impl Component for ToolRuntime {
     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
         Ok(Self { events: cx.events().clone() })
     }
@@ -95,11 +92,9 @@ struct ApprovalConfig {
 /// Denies shell commands with configured prefixes before they run.
 struct ApprovalPolicy;
 
-impl Component for ApprovalPolicy {
-    type Config = ApprovalConfig;
-    type Deps = ();
-    type Provides = ();
+component!(ApprovalPolicy { config: ApprovalConfig });
 
+impl Component for ApprovalPolicy {
     async fn activate(cx: Cx<Self>, config: ApprovalConfig) -> Result<Self> {
         let deny = Arc::new(config.deny);
         cx.on::<ToolsExecute>().listen(move |call, next| {
@@ -123,11 +118,9 @@ struct LimitConfig {
 /// Truncates tool output after the tool ran.
 struct OutputLimit;
 
-impl Component for OutputLimit {
-    type Config = LimitConfig;
-    type Deps = ();
-    type Provides = ();
+component!(OutputLimit { config: LimitConfig });
 
+impl Component for OutputLimit {
     async fn activate(cx: Cx<Self>, config: LimitConfig) -> Result<Self> {
         let max = config.max_chars;
         cx.on::<ToolsExecute>().listen(move |call, next| async move {
@@ -143,11 +136,9 @@ impl Component for OutputLimit {
 /// Prints every session event, as a transcript view would.
 struct Transcript;
 
-impl Component for Transcript {
-    type Config = ();
-    type Deps = ();
-    type Provides = ();
+component!(Transcript {});
 
+impl Component for Transcript {
     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
         cx.on::<SessionAppended>().listen(|event| println!("  session: {event:?}"));
         Ok(Self)
@@ -162,11 +153,9 @@ struct BudgetConfig {
 /// Stops a turn after a fixed number of steps.
 struct StepBudget;
 
-impl Component for StepBudget {
-    type Config = BudgetConfig;
-    type Deps = ();
-    type Provides = ();
+component!(StepBudget { config: BudgetConfig });
 
+impl Component for StepBudget {
     async fn activate(cx: Cx<Self>, config: BudgetConfig) -> Result<Self> {
         let max = config.max_steps;
         cx.on::<TurnStopping>()
