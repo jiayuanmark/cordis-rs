@@ -54,6 +54,7 @@ key!(dyn Tools = "tools");
 
 // ---- The tool runtime: owns execution and dispatches the events around it --------------
 
+#[component(provides(dyn Tools))]
 struct ToolRuntime {
     events: Events,
 }
@@ -74,8 +75,6 @@ impl Tools for ToolRuntime {
     }
 }
 
-component!(ToolRuntime { provides: [dyn Tools] });
-
 impl Component for ToolRuntime {
     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
         Ok(Self { events: cx.events().clone() })
@@ -90,9 +89,8 @@ struct ApprovalConfig {
 }
 
 /// Denies shell commands with configured prefixes before they run.
+#[component(config = ApprovalConfig)]
 struct ApprovalPolicy;
-
-component!(ApprovalPolicy { config: ApprovalConfig });
 
 impl Component for ApprovalPolicy {
     async fn activate(cx: Cx<Self>, config: ApprovalConfig) -> Result<Self> {
@@ -116,9 +114,8 @@ struct LimitConfig {
 }
 
 /// Truncates tool output after the tool ran.
+#[component(config = LimitConfig)]
 struct OutputLimit;
-
-component!(OutputLimit { config: LimitConfig });
 
 impl Component for OutputLimit {
     async fn activate(cx: Cx<Self>, config: LimitConfig) -> Result<Self> {
@@ -134,9 +131,8 @@ impl Component for OutputLimit {
 }
 
 /// Prints every session event, as a transcript view would.
+#[component]
 struct Transcript;
-
-component!(Transcript {});
 
 impl Component for Transcript {
     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
@@ -151,9 +147,8 @@ struct BudgetConfig {
 }
 
 /// Stops a turn after a fixed number of steps.
+#[component(config = BudgetConfig)]
 struct StepBudget;
-
-component!(StepBudget { config: BudgetConfig });
 
 impl Component for StepBudget {
     async fn activate(cx: Cx<Self>, config: BudgetConfig) -> Result<Self> {

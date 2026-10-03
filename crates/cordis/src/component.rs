@@ -14,9 +14,8 @@ use crate::{Erased, Event, Events, Key, KeyId, Result};
 /// A component's declarations: its configuration type, the keys it depends on, and the keys
 /// it provides.
 ///
-/// Implement it with [`component!`](crate::component!), which also implements [`Has`] for each
-/// declared dependency. Implement it by hand only for what the macro cannot express, such as a
-/// generic component.
+/// Implement it with [`#[component]`](crate::component), which also implements [`Has`] for
+/// each declared dependency.
 pub trait Manifest: Sized + 'static {
     /// Configuration deserialized from the component's configuration row.
     type Config: DeserializeOwned + Send + 'static;
@@ -54,13 +53,13 @@ pub trait Component: Manifest + Send + Sync {
     }
 }
 
-/// Marks `K` as a declared dependency of the component. [`component!`](crate::component!)
+/// Marks `K` as a declared dependency of the component. [`#[component]`](crate::component)
 /// implements it for each key in `deps`, which makes [`Cx::dep`] reject undeclared keys at
 /// compile time.
 #[diagnostic::on_unimplemented(
     message = "`{K}` is not a declared dependency of `{Self}`",
     label = "undeclared dependency",
-    note = "add `{K}` to `deps` in the `component!` declaration of `{Self}`"
+    note = "add `{K}` to `deps(...)` in the `#[component]` attribute of `{Self}`"
 )]
 pub trait Has<K: Key + ?Sized>: Manifest {}
 
@@ -103,8 +102,8 @@ impl<C: Component> Cx<C> {
     /// pub trait Fs: Send + Sync {}
     /// key!(dyn Fs = "fs");
     ///
+    /// #[component(deps(dyn Fs))]
     /// struct Reader;
-    /// component!(Reader { deps: [dyn Fs] });
     ///
     /// impl Component for Reader {
     ///     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
@@ -124,8 +123,8 @@ impl<C: Component> Cx<C> {
     /// pub trait Net: Send + Sync {}
     /// key!(dyn Net = "net");
     ///
+    /// #[component(deps(dyn Fs))]
     /// struct Reader;
-    /// component!(Reader { deps: [dyn Fs] });
     ///
     /// impl Component for Reader {
     ///     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
@@ -146,123 +145,4 @@ impl<C: Component> Cx<C> {
             .expect("the reactor resolves every declared key before activation");
         value.get::<K>()
     }
-}
-
-/// Declares a component's configuration, dependencies, and provisions by implementing
-/// [`Manifest`] and [`Has`].
-///
-/// ```
-/// use std::sync::Arc;
-///
-/// use cordis::{Component, Cx, Result, component, key};
-///
-/// pub trait Prompt: Send + Sync {}
-/// key!(dyn Prompt = "prompt");
-/// pub trait Tools: Send + Sync {}
-/// key!(dyn Tools = "tools");
-///
-/// #[derive(serde::Deserialize)]
-/// struct RegistryConfig {
-///     limit: usize,
-/// }
-///
-/// struct ToolRegistry {
-///     prompt: Arc<dyn Prompt>,
-///     limit: usize,
-/// }
-/// component!(ToolRegistry {
-///     config: RegistryConfig,
-///     deps: [dyn Prompt],
-///     provides: [dyn Tools],
-/// });
-///
-/// impl Tools for ToolRegistry {}
-///
-/// impl Component for ToolRegistry {
-///     async fn activate(cx: Cx<Self>, config: RegistryConfig) -> Result<Self> {
-///         Ok(Self { prompt: cx.dep::<dyn Prompt>(), limit: config.limit })
-///     }
-/// }
-/// ```
-///
-/// Every field is optional and they may appear in any order: `config` defaults to `()`, and
-/// `deps` and `provides` default to empty. `component!(Plain {});` declares a component with
-/// none of them.
-///
-/// - `deps` implements [`Has<K>`](Has) for each listed key, so [`Cx::dep`] compiles only for
-///   listed keys. Listing a key twice is a conflicting-impl error.
-/// - `provides` publishes the component's `Arc` as `Arc<K::Value>` for each listed key `K`. The
-///   coercion is written once per key, so it fails to compile when the component does not
-///   implement the key's value type:
-///
-/// ```compile_fail
-/// use cordis::{component, key};
-///
-/// pub trait Tools: Send + Sync {}
-/// key!(dyn Tools = "tools");
-///
-/// struct NotTools;
-/// component!(NotTools { provides: [dyn Tools] });
-/// ```
-///
-/// A field given twice is rejected:
-///
-/// ```compile_fail
-/// struct Twice;
-/// cordis::component!(Twice { config: (), config: () });
-/// ```
-#[macro_export]
-macro_rules! component {
-    ($component:ty { $($fields:tt)* }) => {
-        $crate::component!(@parse $component; config []; deps []; provides []; $($fields)*);
-    };
-
-    (@parse $component:ty; config []; deps $deps:tt; provides $provides:tt;
-        config: $config:ty $(, $($rest:tt)*)?) => {
-        $crate::component!(@parse $component; config [$config]; deps $deps; provides $provides; $($($rest)*)?);
-    };
-    (@parse $component:ty; config $config:tt; deps []; provides $provides:tt;
-        deps: [$($key:ty),* $(,)?] $(, $($rest:tt)*)?) => {
-        $crate::component!(@parse $component; config $config; deps [[$($key),*]]; provides $provides; $($($rest)*)?);
-    };
-    (@parse $component:ty; config $config:tt; deps $deps:tt; provides [];
-        provides: [$($key:ty),* $(,)?] $(, $($rest:tt)*)?) => {
-        $crate::component!(@parse $component; config $config; deps $deps; provides [[$($key),*]]; $($($rest)*)?);
-    };
-    (@parse $component:ty; config $config:tt; deps $deps:tt; provides $provides:tt;
-        $field:ident $($rest:tt)*) => {
-        ::std::compile_error!(::std::concat!(
-            "`", ::std::stringify!($field), "` is given twice or is not a `component!` field; ",
-            "expected each of `config`, `deps`, and `provides` at most once",
-        ));
-    };
-
-    (@parse $component:ty; config [$($config:ty)?]; deps [$([$($dep:ty),*])?]; provides [$([$($prov:ty),*])?];) => {
-        impl $crate::Manifest for $component {
-            type Config = $crate::component!(@config $($config)?);
-
-            fn deps() -> ::std::vec::Vec<$crate::KeyId> {
-                ::std::vec![$($($crate::KeyId::of::<$dep>()),*)?]
-            }
-
-            fn provides() -> ::std::vec::Vec<$crate::KeyId> {
-                ::std::vec![$($($crate::KeyId::of::<$prov>()),*)?]
-            }
-
-            #[allow(unused_variables)]
-            fn publish(
-                component: &::std::sync::Arc<Self>,
-            ) -> ::std::vec::Vec<($crate::KeyId, $crate::Erased)> {
-                ::std::vec![$($({
-                    let value: ::std::sync::Arc<<$prov as $crate::Key>::Value> = component.clone();
-                    ($crate::KeyId::of::<$prov>(), $crate::Erased::new::<$prov>(value))
-                }),*)?]
-            }
-        }
-
-        $($(impl $crate::Has<$dep> for $component {})*)?
-    };
-
-    (@config) => { () };
-    (@config $config:ty) => { $config };
 }

@@ -46,6 +46,7 @@ struct PromptConfig {
     text: String,
 }
 
+#[component(config = PromptConfig, provides(dyn Prompt))]
 struct StaticPrompt {
     tag: String,
     text: String,
@@ -56,8 +57,6 @@ impl Prompt for StaticPrompt {
         self.text.clone()
     }
 }
-
-component!(StaticPrompt { config: PromptConfig, provides: [dyn Prompt] });
 
 impl Component for StaticPrompt {
     async fn activate(_: Cx<Self>, config: PromptConfig) -> Result<Self> {
@@ -72,6 +71,7 @@ impl Drop for StaticPrompt {
     }
 }
 
+#[component(config = Tag, deps(dyn Prompt), provides(dyn Tools))]
 struct ToolRegistry {
     tag: String,
     _prompt: Arc<dyn Prompt>,
@@ -95,8 +95,6 @@ impl Tools for ToolRegistry {
     }
 }
 
-component!(ToolRegistry { config: Tag, deps: [dyn Prompt], provides: [dyn Tools] });
-
 impl Component for ToolRegistry {
     async fn activate(cx: Cx<Self>, config: Tag) -> Result<Self> {
         let prompt = cx.dep::<dyn Prompt>();
@@ -111,12 +109,11 @@ impl Drop for ToolRegistry {
     }
 }
 
+#[component(config = Tag, deps(dyn Tools))]
 struct GrepTool {
     tag: String,
     _registration: Guard,
 }
-
-component!(GrepTool { config: Tag, deps: [dyn Tools] });
 
 impl Component for GrepTool {
     async fn activate(cx: Cx<Self>, config: Tag) -> Result<Self> {
@@ -216,9 +213,8 @@ struct FlakyConfig {
     fail: bool,
 }
 
+#[component(config = FlakyConfig)]
 struct Flaky;
-
-component!(Flaky { config: FlakyConfig });
 
 impl Component for Flaky {
     async fn activate(_: Cx<Self>, config: FlakyConfig) -> Result<Self> {
@@ -240,9 +236,8 @@ async fn a_failed_activation_is_isolated_and_retried_after_a_configuration_chang
     assert_eq!(app.status(flaky).await, Some(Status::Active));
 }
 
+#[component(config = Tag, deps(dyn Prompt))]
 struct Slow;
-
-component!(Slow { config: Tag, deps: [dyn Prompt] });
 
 impl Component for Slow {
     async fn activate(_: Cx<Self>, config: Tag) -> Result<Self> {
@@ -274,6 +269,7 @@ async fn losing_a_dependency_cancels_an_activation_and_reverts_its_partial_effec
 }
 
 // A prompt derived from tools closes a cycle with ToolRegistry.
+#[component(deps(dyn Tools), provides(dyn Prompt))]
 struct ToolsPrompt;
 
 impl Prompt for ToolsPrompt {
@@ -281,8 +277,6 @@ impl Prompt for ToolsPrompt {
         String::new()
     }
 }
-
-component!(ToolsPrompt { deps: [dyn Tools], provides: [dyn Prompt] });
 
 impl Component for ToolsPrompt {
     async fn activate(_: Cx<Self>, _: ()) -> Result<Self> {

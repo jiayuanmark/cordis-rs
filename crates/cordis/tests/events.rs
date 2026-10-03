@@ -118,9 +118,8 @@ fn seen_by(label: &str) -> Vec<String> {
     SEEN.lock().unwrap().iter().filter(|entry| entry.starts_with(label)).cloned().collect()
 }
 
+#[component(config = Label)]
 struct Recorder;
-
-component!(Recorder { config: Label });
 
 impl Component for Recorder {
     async fn activate(cx: Cx<Self>, config: Label) -> Result<Self> {
@@ -150,9 +149,8 @@ struct StallConfig {
 }
 
 /// Registers a listener, then either fails or never finishes activating.
+#[component(config = StallConfig)]
 struct Stall;
-
-component!(Stall { config: StallConfig });
 
 impl Component for Stall {
     async fn activate(cx: Cx<Self>, config: StallConfig) -> Result<Self> {

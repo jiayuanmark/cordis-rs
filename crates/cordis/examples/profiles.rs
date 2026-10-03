@@ -12,12 +12,9 @@ key!(dyn Sessions = "sessions");
 pub trait Tools: Send + Sync {}
 key!(dyn Tools = "tools");
 
-/// Defines a component that prints when it activates and when it is dropped.
+/// Makes a component print when it activates and when it is dropped.
 macro_rules! printing {
-    ($name:ident { $($fields:tt)* }, $describe:expr) => {
-        struct $name(String);
-        component!($name { $($fields)* });
-
+    ($name:ident, $describe:expr) => {
         impl Component for $name {
             async fn activate(_: Cx<Self>, config: Self::Config) -> Result<Self> {
                 let describe: fn(&<Self as Manifest>::Config) -> String = $describe;
@@ -50,11 +47,26 @@ struct Port {
     port: u16,
 }
 
-printing!(JsonlSessions { config: Dir, provides: [dyn Sessions] }, |c| format!("(dir {})", c.dir));
-printing!(MemorySessions { provides: [dyn Sessions] }, |_| String::new());
-printing!(ToolRuntime { deps: [dyn Sessions], provides: [dyn Tools] }, |_| String::new());
-printing!(ApprovalPolicy { config: Approval, deps: [dyn Tools] }, |c| format!("(mode {})", c.mode));
-printing!(WebServer { config: Port, deps: [dyn Sessions, dyn Tools] }, |c| format!("(port {})", c.port));
+#[component(config = Dir, provides(dyn Sessions))]
+struct JsonlSessions(String);
+
+#[component(provides(dyn Sessions))]
+struct MemorySessions(String);
+
+#[component(deps(dyn Sessions), provides(dyn Tools))]
+struct ToolRuntime(String);
+
+#[component(config = Approval, deps(dyn Tools))]
+struct ApprovalPolicy(String);
+
+#[component(config = Port, deps(dyn Sessions, dyn Tools))]
+struct WebServer(String);
+
+printing!(JsonlSessions, |c| format!("(dir {})", c.dir));
+printing!(MemorySessions, |_| String::new());
+printing!(ToolRuntime, |_| String::new());
+printing!(ApprovalPolicy, |c| format!("(mode {})", c.mode));
+printing!(WebServer, |c| format!("(port {})", c.port));
 
 impl Sessions for JsonlSessions {}
 impl Sessions for MemorySessions {}
