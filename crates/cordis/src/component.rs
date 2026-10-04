@@ -7,11 +7,10 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::erased::Factory;
 use crate::events::{Held, On};
-use crate::guard::Scope;
+use crate::guard::Registrations;
 use crate::reactor::Control;
-use crate::{Erased, Event, Events, Fiber, FiberId, KeyId, Result};
+use crate::{Erased, Event, Events, Fiber, FiberId, Key, KeyId, Realm, Resolve, Result, Scope};
 
 /// A component's declarations: its configuration type, the keys it depends on, and the keys
 /// it provides.
@@ -34,7 +33,7 @@ pub trait Manifest: Sized + 'static {
 
     /// Builds [`Deps`](Manifest::Deps) from the provider value of each declared key.
     #[doc(hidden)]
-    fn resolve(resolved: &[(KeyId, Erased)]) -> Self::Deps;
+    fn resolve(resolved: &Resolve<'_>) -> Self::Deps;
 
     /// Coerces the component to the value type of each provided key.
     #[doc(hidden)]
@@ -62,11 +61,6 @@ pub trait Component: Manifest + Send + Sync {
         async move { drop(self) }
     }
 }
-
-/// The error of [`Cx::plugin`] on a context whose activation has ended.
-#[derive(Debug, thiserror::Error)]
-#[error("the fiber's activation has ended, so it cannot instantiate children")]
-struct Ended;
 
 /// The context of one fiber of `C`: its resolved dependencies, the event bus, and the
 /// registrations the fiber owns.
@@ -108,7 +102,7 @@ struct Ended;
 pub struct Cx<C: Component> {
     deps: Arc<C::Deps>,
     events: Events,
-    scope: Scope,
+    registrations: Registrations,
     control: Control,
     _component: PhantomData<fn() -> C>,
 }
@@ -118,7 +112,7 @@ impl<C: Component> Clone for Cx<C> {
         Self {
             deps: self.deps.clone(),
             events: self.events.clone(),
-            scope: self.scope.clone(),
+            registrations: self.registrations.clone(),
             control: self.control.clone(),
             _component: PhantomData,
         }
@@ -126,8 +120,8 @@ impl<C: Component> Clone for Cx<C> {
 }
 
 impl<C: Component> Cx<C> {
-    pub(crate) fn new(deps: Arc<C::Deps>, events: Events, scope: Scope, control: Control) -> Self {
-        Self { deps, events, scope, control, _component: PhantomData }
+    pub(crate) fn new(deps: Arc<C::Deps>, events: Events, registrations: Registrations, control: Control) -> Self {
+        Self { deps, events, registrations, control, _component: PhantomData }
     }
 
     /// Returns the id of the fiber this context belongs to.
@@ -183,11 +177,63 @@ impl<C: Component> Cx<C> {
     /// activation has ended (see [`is_live`](Cx::is_live)), or when the app has stopped. In
     /// each case no child runs.
     pub async fn plugin<D: Component>(&self, config: impl Serialize) -> Result<Fiber> {
-        let config = serde_json::to_value(config)?;
-        if !self.is_live() {
-            return Err(Ended.into());
-        }
-        self.control.insert_child(Arc::new(Factory::of::<D>()), config).await.ok_or_else(|| Ended.into())
+        self.control.scope().plugin::<D>(config).await
+    }
+
+    /// Returns a scope where `K` resolves in a fresh realm, for children that share a private
+    /// provider of `K`.
+    ///
+    /// Children instantiated through the scope, and their descendants, depend on and provide
+    /// `K` in that realm: they see only a provider of `K` instantiated inside, and nothing
+    /// outside sees it. Every other key resolves as it does for this fiber. This is the paper's
+    /// `isolate` (Def 25), realized as a derived context.
+    ///
+    /// ```
+    /// use cordis::{Component, Cx, Result, component, key};
+    ///
+    /// pub trait Tools: Send + Sync {}
+    /// key!(dyn Tools = "tools");
+    ///
+    /// #[component(provides(dyn Tools))]
+    /// struct Registry;
+    /// impl Tools for Registry {}
+    /// # impl Component for Registry {
+    /// #     async fn activate(_: Cx<Self>, _: ()) -> Result<Self> { Ok(Registry) }
+    /// # }
+    ///
+    /// #[component(deps(tools: dyn Tools))]
+    /// struct Agent;
+    /// # impl Component for Agent {
+    /// #     async fn activate(_: Cx<Self>, _: ()) -> Result<Self> { Ok(Agent) }
+    /// # }
+    ///
+    /// #[component]
+    /// struct Reviewer;
+    ///
+    /// impl Component for Reviewer {
+    ///     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+    ///         // The agent sees this registry, not the app's.
+    ///         let sub = cx.isolate::<dyn Tools>();
+    ///         sub.plugin::<Registry>(()).await?;
+    ///         sub.plugin::<Agent>(()).await?;
+    ///         Ok(Reviewer)
+    ///     }
+    /// }
+    /// ```
+    pub fn isolate<K: Key + ?Sized>(&self) -> Scope {
+        self.control.scope().isolate::<K>()
+    }
+
+    /// Returns a scope where `K` resolves in `realm`, which other scopes and fibers may name
+    /// as well. See [`Scope::isolate_in`].
+    pub fn isolate_in<K: Key + ?Sized>(&self, realm: &Realm) -> Scope {
+        self.control.scope().isolate_in::<K>(realm)
+    }
+
+    /// Returns a scope whose children receive `K` with `meta` applied, merged onto the
+    /// metadata this fiber's context carries for `K`. See [`Scope::intercept`].
+    pub fn intercept<K: Key + ?Sized>(&self, meta: K::Meta) -> Scope {
+        self.control.scope().intercept::<K>(meta)
     }
 
     /// Returns the resolved dependencies, one typed field per key in `deps(...)`.
@@ -245,7 +291,7 @@ impl<C: Component> Cx<C> {
     /// activation is cancelled or fails. A component that outlives its fiber, for example
     /// through an `Arc` a consumer kept, can use it to stop work that needs the fiber.
     pub fn is_live(&self) -> bool {
-        self.scope.is_open()
+        self.registrations.is_open()
     }
 
     /// Returns the event bus, for dispatching events.
@@ -261,6 +307,6 @@ impl<C: Component> Cx<C> {
     /// the registration and removes it when the fiber unloads or its activation is cancelled
     /// or fails. Registering after that removes the listener at once.
     pub fn on<E: Event>(&self) -> On<'_, E, E::Mode, Held<'_>> {
-        On { events: &self.events, sink: Held(&self.scope), _event: PhantomData }
+        On { events: &self.events, sink: Held(&self.registrations), _event: PhantomData }
     }
 }

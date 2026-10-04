@@ -7,9 +7,10 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::guard::ScopeOwner;
+use crate::guard::RegistrationsOwner;
 use crate::reactor::Control;
-use crate::{Component, Cx, Events, Key, KeyId, Manifest, Result};
+use crate::realm::Env;
+use crate::{Component, Cx, Events, Key, KeyId, Manifest, Merge, Result};
 
 pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
@@ -37,18 +38,40 @@ impl Erased {
             .expect("an Erased value is read only under the key that wrote it")
             .clone()
     }
+}
 
-    /// Returns the value resolved for `K`, which the reactor resolves before activation.
+/// The provider values resolved for one activation, and the context they are read under.
+///
+/// Passed to the code `#[component]` generates for [`Manifest::resolve`].
+#[doc(hidden)]
+pub struct Resolve<'a> {
+    values: &'a [(KeyId, Erased)],
+    env: &'a Env,
+}
+
+impl Resolve<'_> {
+    /// Returns the provider of `K`, with interception metadata applied.
     ///
-    /// Called by the code `#[component]` generates for [`Manifest::resolve`].
-    pub fn find<K: Key + ?Sized>(resolved: &[(KeyId, Erased)]) -> Arc<K::Value> {
+    /// The metadata is `declared` merged with what the context carries for `K`, the context
+    /// taking priority (Def 27). Without either, the provider value is returned as is.
+    pub fn get<K: Key + ?Sized>(&self, declared: Option<K::Meta>) -> Arc<K::Value> {
         let id = KeyId::of::<K>();
-        resolved
+        let value = self
+            .values
             .iter()
             .find(|(key, _)| *key == id)
             .expect("the reactor resolves every declared key before activation")
             .1
-            .get::<K>()
+            .get::<K>();
+        let carried = self.env.meta::<K>();
+        if declared.is_none() && carried.is_none() {
+            return value;
+        }
+        let mut meta = declared.unwrap_or_default();
+        if let Some(carried) = carried {
+            meta.merge(carried.clone());
+        }
+        K::bind(value, &meta)
     }
 }
 
@@ -83,10 +106,10 @@ fn activate<C: Component>(
 ) -> BoxFuture<Result<Box<dyn Instance>>> {
     Box::pin(async move {
         let config: C::Config = serde_json::from_value(config)?;
-        let scope = ScopeOwner::new();
-        let deps = Arc::new(C::resolve(&deps));
-        let component = C::activate(Cx::new(deps, events, scope.scope(), control), config).await?;
-        Ok(Box::new(Active { component: Arc::new(component), scope }) as Box<dyn Instance>)
+        let registrations = RegistrationsOwner::new();
+        let deps = Arc::new(C::resolve(&Resolve { values: &deps, env: control.env() }));
+        let component = C::activate(Cx::new(deps, events, registrations.registrations(), control), config).await?;
+        Ok(Box::new(Active { component: Arc::new(component), registrations }) as Box<dyn Instance>)
     })
 }
 
@@ -103,7 +126,7 @@ struct Active<C> {
     component: Arc<C>,
     /// Registrations made through `Cx`, including clones the component kept; closed before
     /// `deactivate` so no listener runs during teardown.
-    scope: ScopeOwner,
+    registrations: RegistrationsOwner,
 }
 
 impl<C: Component> Instance for Active<C> {
@@ -112,8 +135,8 @@ impl<C: Component> Instance for Active<C> {
     }
 
     fn deactivate(self: Box<Self>) -> BoxFuture<()> {
-        let Active { component, scope } = *self;
-        drop(scope);
+        let Active { component, registrations } = *self;
+        drop(registrations);
         match Arc::into_inner(component) {
             Some(component) => Box::pin(component.deactivate()),
             None => {

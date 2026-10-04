@@ -13,11 +13,13 @@ A Rust realization of the context paradigm from *A Programming Paradigm for Spat
 | `crates/cordis/src/events.rs` | `Event`, `Events`, the five dispatch modes, `event!` |
 | `crates/cordis/src/erased.rs` | Type-erased values and component operations |
 | `crates/cordis/src/reactor.rs` | `App` and the reactor |
+| `crates/cordis/src/realm.rs` | `Realm` and `Scope`: isolation and interception |
 | `crates/cordis/src/loader.rs` | `Catalog`, `Loader`, YAML trees and layers |
 | `crates/cordis/tests/lifecycle.rs` | Lifecycle behavior tests |
 | `crates/cordis/tests/component.rs` | `#[component]` on generic and plain types |
 | `crates/cordis/tests/events.rs` | Event bus behavior tests |
 | `crates/cordis/tests/layers.rs` | Layer merge tests |
+| `crates/cordis/tests/realms.rs` | Isolation and interception tests |
 | `crates/cordis/examples/harness.rs` | A miniature agent harness built on events (`cargo run --example harness`) |
 | `crates/cordis/examples/profiles.rs` | Profiles composed from YAML layers in `examples/config/` (`cargo run --example profiles`) |
 
@@ -46,8 +48,11 @@ Implemented:
 - Typed events with `Emit`, `Bail`, `Parallel`, `Serial`, and `Waterfall` dispatch; listeners registered through `Cx` are removed when their fiber unloads or its activation is cancelled or fails.
 - Layered configuration: `Tree::layered` merges YAML layers by row id (override set fields, replace `config` whole, toggle `disabled`, append new rows).
 - A YAML loader that validates a whole tree (unknown components, invalid configuration, missing providers, cycles) before reconciling it.
+- Child fibers instantiated through `cx.plugin`, retired with the activation that made them.
+- Realms: `cx.isolate::<K>()` gives a subtree its own provider of `K`, in a fresh or named realm, and rows can name realms with `isolate`.
+- Interception: `cx.intercept::<K>(meta)` and `deps(k: K = meta)` attach typed `Merge` metadata that `Key::bind` applies to the provider a consumer receives.
 
-Not yet implemented: `many` keys, realms, interception metadata, listener ordering beyond registration order, the named event edge, `compose!`, and WASM components.
+Not yet implemented: `many` keys, loader-managed local realms and interception in configuration, listener ordering beyond registration order, the named event edge, `compose!`, and WASM components.
 
 ## Commands
 

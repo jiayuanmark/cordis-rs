@@ -11,7 +11,7 @@ use futures::future::join_all;
 
 use crate::Guard;
 use crate::erased::BoxFuture;
-use crate::guard::Scope;
+use crate::guard::Registrations;
 
 /// An event type: its name, dispatch mode, payload, and result.
 ///
@@ -276,7 +276,7 @@ impl Sink for Detached {
 }
 
 /// Hands the guard to the registering fiber, which drops it when the fiber unloads.
-pub struct Held<'a>(pub(crate) &'a Scope);
+pub struct Held<'a>(pub(crate) &'a Registrations);
 
 impl Sink for Held<'_> {
     type Out = ();

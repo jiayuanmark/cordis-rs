@@ -1,13 +1,14 @@
 //! Configuration trees: validate them, then reconcile them against a running [`App`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::erased::Factory;
-use crate::{App, Component, FiberId, KeyId};
+use crate::realm::{Env, Slot};
+use crate::{App, Component, FiberId, KeyId, Realm};
 
 /// Component types available to configuration, by name.
 #[derive(Clone, Default)]
@@ -29,6 +30,16 @@ impl Catalog {
     pub fn register<C: Component>(&mut self, name: &str) -> &mut Self {
         self.entries.insert(name.to_owned(), Arc::new(Factory::of::<C>()));
         self
+    }
+
+    /// Returns the key whose configuration name is `name`, among the keys registered
+    /// components depend on or provide.
+    fn key(&self, name: &str) -> Option<KeyId> {
+        self.entries
+            .values()
+            .flat_map(|factory| factory.deps.iter().chain(&factory.provides))
+            .copied()
+            .find(|key| key.name() == name)
     }
 }
 
@@ -55,13 +66,17 @@ pub struct Row {
     /// Keeps the row in the tree without mounting it.
     #[serde(default)]
     pub disabled: bool,
+    /// Realms by key name: the row depends on and provides each listed key in the named realm,
+    /// which every row naming it shares. Other keys resolve in the shared realm.
+    #[serde(default)]
+    pub isolate: BTreeMap<String, String>,
 }
 
 impl Tree {
     /// Merges layers, lowest first, into one tree.
     ///
     /// A layer row whose id already exists overrides only the fields it sets: `use`, `config`
-    /// (replaced whole, never deep-merged), and `disabled`. A row with a new id is appended and
+    /// and `isolate` (each replaced whole, never deep-merged), and `disabled`. A row with a new id is appended and
     /// must set `use`. Switching a row's `use` usually needs a new `config` as well; the merged
     /// tree is validated when it is applied.
     ///
@@ -88,6 +103,9 @@ impl Tree {
                         if let Some(disabled) = patch.disabled {
                             row.disabled = disabled;
                         }
+                        if let Some(isolate) = &patch.isolate {
+                            row.isolate = isolate.clone();
+                        }
                     }
                     None => {
                         let component = patch.component.clone().ok_or_else(|| LoadError::NewRowWithoutUse {
@@ -99,6 +117,7 @@ impl Tree {
                             component,
                             config: patch.config.clone().unwrap_or(Value::Null),
                             disabled: patch.disabled.unwrap_or(false),
+                            isolate: patch.isolate.clone().unwrap_or_default(),
                         });
                     }
                 }
@@ -131,6 +150,7 @@ struct LayerRow {
     #[serde(default, deserialize_with = "present")]
     config: Option<Value>,
     disabled: Option<bool>,
+    isolate: Option<BTreeMap<String, String>>,
 }
 
 fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Value>, D::Error> {
@@ -181,27 +201,44 @@ pub enum LoadError {
     /// A row's configuration does not deserialize into its component's `Config`.
     #[error("row `{row}` has invalid config: {message}")]
     InvalidConfig { row: String, message: String },
-    /// A row depends on a key that no enabled row provides.
-    #[error("row `{row}` depends on `{key}`, which no enabled row provides")]
-    MissingProvider { row: String, key: &'static str },
+    /// A row depends on a key that no enabled row provides in the realm the row resolves it in.
+    #[error("row `{row}` depends on `{key}`{}, which no enabled row provides there", in_realm(.realm))]
+    MissingProvider {
+        row: String,
+        key: &'static str,
+        /// The realm the row's `isolate` names for the key, or `None` for the shared realm.
+        realm: Option<String>,
+    },
+    /// A row isolates a key that no registered component depends on or provides.
+    #[error("row `{row}` isolates unknown key `{key}`")]
+    UnknownKey { row: String, key: String },
     /// Enabled rows depend on each other in a cycle, so none of them could activate.
     #[error("dependency cycle: {}", .0.join(" -> "))]
     Cycle(Vec<String>),
 }
 
+fn in_realm(realm: &Option<String>) -> String {
+    realm.as_ref().map(|realm| format!(" in realm `{realm}`")).unwrap_or_default()
+}
+
 /// Applies configuration trees to an [`App`].
 ///
 /// Each application validates the whole tree first. It then retires fibers whose rows are
-/// gone, disabled, or switched to another component; updates fibers whose configuration
-/// changed; and inserts fibers for new rows.
+/// gone, disabled, switched to another component, or moved to other realms; updates fibers
+/// whose configuration changed; and inserts fibers for new rows. A row's realms are fixed when
+/// its fiber is inserted, so moving a row rebuilds its fiber, and its dependents follow.
 pub struct Loader {
     app: App,
     catalog: Catalog,
     mounted: HashMap<String, Mounted>,
 }
 
+/// An enabled row with its component and the context its fiber is inserted under.
+type Checked<'t> = (&'t Row, Arc<Factory>, Env);
+
 struct Mounted {
     component: String,
+    isolate: BTreeMap<String, String>,
     config: Value,
     fiber: FiberId,
 }
@@ -231,13 +268,15 @@ impl Loader {
         let rows = self.check(tree)?;
         let app = &self.app;
         self.mounted.retain(|id, mounted| {
-            let kept = rows.iter().any(|(row, _)| row.id == *id && row.component == mounted.component);
+            let kept = rows
+                .iter()
+                .any(|(row, ..)| row.id == *id && row.component == mounted.component && row.isolate == mounted.isolate);
             if !kept {
                 app.remove(mounted.fiber);
             }
             kept
         });
-        for (row, factory) in rows {
+        for (row, factory, env) in rows {
             match self.mounted.get_mut(&row.id) {
                 Some(mounted) if mounted.config != row.config => {
                     self.app.update(mounted.fiber, row.config.clone());
@@ -245,8 +284,13 @@ impl Loader {
                 }
                 Some(_) => {}
                 None => {
-                    let fiber = self.app.insert_factory(factory, row.config.clone()).await;
-                    let mounted = Mounted { component: row.component.clone(), config: row.config.clone(), fiber };
+                    let fiber = self.app.insert_factory(factory, row.config.clone(), env).await;
+                    let mounted = Mounted {
+                        component: row.component.clone(),
+                        isolate: row.isolate.clone(),
+                        config: row.config.clone(),
+                        fiber,
+                    };
                     self.mounted.insert(row.id.clone(), mounted);
                 }
             }
@@ -259,7 +303,7 @@ impl Loader {
         self.mounted.get(row).map(|mounted| mounted.fiber)
     }
 
-    fn check<'t>(&self, tree: &'t Tree) -> Result<Vec<(&'t Row, Arc<Factory>)>, LoadError> {
+    fn check<'t>(&self, tree: &'t Tree) -> Result<Vec<Checked<'t>>, LoadError> {
         let mut ids = HashSet::new();
         let mut rows = Vec::new();
         for row in &tree.plugins {
@@ -276,22 +320,32 @@ impl Loader {
                 .ok_or_else(|| LoadError::UnknownComponent { row: row.id.clone(), component: row.component.clone() })?;
             (factory.validate)(&row.config)
                 .map_err(|message| LoadError::InvalidConfig { row: row.id.clone(), message })?;
-            rows.push((row, factory.clone()));
+            let mut env = Env::default();
+            for (key, realm) in &row.isolate {
+                let key = self
+                    .catalog
+                    .key(key)
+                    .ok_or_else(|| LoadError::UnknownKey { row: row.id.clone(), key: key.clone() })?;
+                env.isolate(key, Realm::named(realm));
+            }
+            rows.push((row, factory.clone(), env));
         }
 
-        let mut providers: HashMap<KeyId, Vec<usize>> = HashMap::new();
-        for (index, (_, factory)) in rows.iter().enumerate() {
+        let mut providers: HashMap<Slot, Vec<usize>> = HashMap::new();
+        for (index, (_, factory, env)) in rows.iter().enumerate() {
             for key in &factory.provides {
-                providers.entry(*key).or_default().push(index);
+                providers.entry(env.slot(*key)).or_default().push(index);
             }
         }
         let mut edges = Vec::with_capacity(rows.len());
-        for (row, factory) in &rows {
+        for (row, factory, env) in &rows {
             let mut targets = Vec::new();
             for key in &factory.deps {
-                let provided_by = providers
-                    .get(key)
-                    .ok_or_else(|| LoadError::MissingProvider { row: row.id.clone(), key: key.name() })?;
+                let provided_by = providers.get(&env.slot(*key)).ok_or_else(|| LoadError::MissingProvider {
+                    row: row.id.clone(),
+                    key: key.name(),
+                    realm: row.isolate.get(key.name()).cloned(),
+                })?;
                 targets.extend(provided_by);
             }
             edges.push(targets);
