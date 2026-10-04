@@ -173,11 +173,60 @@ impl Control {
     }
 
     /// Inserts a child of this activation. The reactor retires it when the activation ends.
-    pub(crate) async fn insert_child(&self, factory: Arc<Factory>, config: Value) -> Option<FiberId> {
+    pub(crate) async fn insert_child(&self, factory: Arc<Factory>, config: Value) -> Option<Fiber> {
         let commands: UnboundedSender<Command> = self.commands.upgrade()?;
         let (reply, answer) = oneshot::channel();
         commands.send(Command::Insert { factory, config, parent: Some(self.owner), reply }).ok()?;
+        let id = answer.await.ok().flatten()?;
+        Some(Fiber { id, commands: self.commands.clone() })
+    }
+}
+
+/// A view of a child fiber, returned by [`Cx::plugin`](crate::Cx::plugin).
+///
+/// The handle does not own the fiber: dropping it changes nothing, and the parent's activation
+/// retires the child when it ends. Use [`dispose`](Fiber::dispose) to retire it sooner, for
+/// example when an agent finishes its task. Clones refer to the same fiber, and the handle does
+/// not keep the app running.
+#[derive(Clone, Debug)]
+pub struct Fiber {
+    id: FiberId,
+    commands: WeakUnboundedSender<Command>,
+}
+
+impl Fiber {
+    /// Returns the fiber's id, for use with [`App`].
+    pub fn id(&self) -> FiberId {
+        self.id
+    }
+
+    /// Returns the fiber's state, or `None` once it has been discarded or the app has stopped.
+    pub async fn status(&self) -> Option<Status> {
+        let (reply, answer) = oneshot::channel();
+        self.send(Command::Status { id: self.id, reply });
         answer.await.ok().flatten()
+    }
+
+    /// Replaces the fiber's configuration; an active fiber reloads, and its consumers with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `config` fails to serialize.
+    pub fn update(&self, config: impl serde::Serialize) -> crate::Result<()> {
+        let config = serde_json::to_value(config)?;
+        self.send(Command::Update { id: self.id, config });
+        Ok(())
+    }
+
+    /// Retires the fiber now. It deactivates after its consumers, then is discarded.
+    pub fn dispose(&self) {
+        self.send(Command::Remove { id: self.id });
+    }
+
+    fn send(&self, command: Command) {
+        if let Some(commands) = self.commands.upgrade() {
+            let _ = commands.send(command);
+        }
     }
 }
 
@@ -232,7 +281,7 @@ impl State {
     }
 }
 
-struct Fiber {
+struct Entry {
     factory: Arc<Factory>,
     config: Value,
     /// The activation this fiber was instantiated under, or `None` for a root fiber.
@@ -248,7 +297,7 @@ struct Fiber {
 
 struct Reactor {
     commands: WeakUnboundedSender<Command>,
-    fibers: SlotMap<FiberId, Fiber>,
+    fibers: SlotMap<FiberId, Entry>,
     /// Active provisions. Only `Active` fibers appear here.
     table: HashMap<KeyId, (FiberId, Erased)>,
     /// Fibers to settle when a key's provider changes: dependents and competing providers.
@@ -309,7 +358,7 @@ impl Reactor {
                     return;
                 }
                 let watched: Vec<KeyId> = factory.deps.iter().chain(&factory.provides).copied().collect();
-                let id = self.fibers.insert(Fiber {
+                let id = self.fibers.insert(Entry {
                     factory,
                     config,
                     parent,
@@ -358,8 +407,13 @@ impl Reactor {
         }
     }
 
+    /// Whether `owner` may instantiate children: its activation is current and the fiber is
+    /// still starting or running. A leaving fiber has stopped performing effects, as in the
+    /// paper's `Unloading` state.
     fn owns_children(&self, owner: Owner) -> bool {
-        self.fibers.get(owner.id).is_some_and(|fiber| fiber.owner == Some(owner.token))
+        self.fibers.get(owner.id).is_some_and(|fiber| {
+            fiber.owner == Some(owner.token) && matches!(fiber.state, State::Loading { .. } | State::Active { .. })
+        })
     }
 
     /// Ends the fiber's ownership of its children and retires them (rule O-Retire, applied by

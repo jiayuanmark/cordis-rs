@@ -11,7 +11,7 @@ use crate::erased::Factory;
 use crate::events::{Held, On};
 use crate::guard::Scope;
 use crate::reactor::Control;
-use crate::{Erased, Event, Events, FiberId, Key, KeyId, Result};
+use crate::{Erased, Event, Events, Fiber, FiberId, Key, KeyId, Result};
 
 /// A component's declarations: its configuration type, the keys it depends on, and the keys
 /// it provides.
@@ -154,12 +154,13 @@ impl<C: Component> Cx<C> {
     ///
     /// The child is an effect of this fiber's current activation: the reactor retires it when
     /// that activation ends, whether the fiber unloads, its activation is cancelled, or it
-    /// fails. Like a root fiber, the child activates once its own dependencies have providers,
-    /// reloads when they change, and can be updated or removed through [`App`](crate::App)
-    /// with the returned id. The parent does not wait for its children to finish unloading.
+    /// fails. Like a root fiber, the child activates once its own dependencies have providers
+    /// and reloads when they change. The returned [`Fiber`] reads its status, updates its
+    /// configuration, or disposes of it early. The parent does not wait for its children to
+    /// finish unloading.
     ///
     /// ```
-    /// use cordis::{App, Component, Cx, Result, Status, component};
+    /// use cordis::{Component, Cx, Result, component};
     ///
     /// #[component]
     /// struct Agent;
@@ -176,8 +177,11 @@ impl<C: Component> Cx<C> {
     /// }
     ///
     /// impl Server {
-    ///     async fn accept(&self) -> Result<cordis::FiberId> {
-    ///         self.cx.plugin::<Agent>(()).await
+    ///     async fn accept(&self) -> Result<()> {
+    ///         let agent = self.cx.plugin::<Agent>(()).await?;
+    ///         // ... and once the agent's work is done, before the server unloads:
+    ///         agent.dispose();
+    ///         Ok(())
     ///     }
     /// }
     ///
@@ -190,9 +194,10 @@ impl<C: Component> Cx<C> {
     ///
     /// # Errors
     ///
-    /// Returns an error when `config` fails to serialize, or when this activation has already
-    /// ended (see [`is_live`](Cx::is_live)) or the app has stopped, in which case no child runs.
-    pub async fn plugin<D: Component>(&self, config: impl Serialize) -> Result<FiberId> {
+    /// Returns an error when `config` fails to serialize, when this fiber is leaving or its
+    /// activation has ended (see [`is_live`](Cx::is_live)), or when the app has stopped. In
+    /// each case no child runs.
+    pub async fn plugin<D: Component>(&self, config: impl Serialize) -> Result<Fiber> {
         let config = serde_json::to_value(config)?;
         if !self.is_live() {
             return Err(Ended.into());
