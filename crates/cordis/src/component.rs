@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
 
-use crate::erased::Resolved;
 use crate::events::{Held, On};
 use crate::guard::Scope;
 use crate::{Erased, Event, Events, Key, KeyId, Result};
@@ -14,17 +13,25 @@ use crate::{Erased, Event, Events, Key, KeyId, Result};
 /// A component's declarations: its configuration type, the keys it depends on, and the keys
 /// it provides.
 ///
-/// Implement it with [`#[component]`](crate::component), which also implements [`Has`] for
-/// each declared dependency.
+/// Implement it with [`#[component]`](crate::component), which also generates the
+/// [`Deps`](Manifest::Deps) struct and implements [`Has`] for each declared dependency.
 pub trait Manifest: Sized + 'static {
     /// Configuration deserialized from the component's configuration row.
     type Config: DeserializeOwned + Send + 'static;
+
+    /// The resolved dependencies, with one typed field per declared key. `()` when the
+    /// component declares none.
+    type Deps: Send + Sync + 'static;
 
     /// Returns the declared dependency keys in declaration order.
     fn deps() -> Vec<KeyId>;
 
     /// Returns the provided keys.
     fn provides() -> Vec<KeyId>;
+
+    /// Builds [`Deps`](Manifest::Deps) from the provider value of each declared key.
+    #[doc(hidden)]
+    fn resolve(resolved: &[(KeyId, Erased)]) -> Self::Deps;
 
     /// Coerces the component to the value type of each provided key.
     #[doc(hidden)]
@@ -53,15 +60,19 @@ pub trait Component: Manifest + Send + Sync {
     }
 }
 
-/// Marks `K` as a declared dependency of the component. [`#[component]`](crate::component)
-/// implements it for each key in `deps`, which makes [`Cx::dep`] reject undeclared keys at
-/// compile time.
+/// Marks `K` as a declared dependency of the component and locates its field in
+/// [`Manifest::Deps`]. [`#[component]`](crate::component) implements it for each key in
+/// `deps`, which makes [`Cx::dep`] reject undeclared keys at compile time.
 #[diagnostic::on_unimplemented(
     message = "`{K}` is not a declared dependency of `{Self}`",
     label = "undeclared dependency",
     note = "add `{K}` to `deps(...)` in the `#[component]` attribute of `{Self}`"
 )]
-pub trait Has<K: Key + ?Sized>: Manifest {}
+pub trait Has<K: Key + ?Sized>: Manifest {
+    /// Returns the field of `deps` that holds the provider of `K`.
+    #[doc(hidden)]
+    fn dep(deps: &Self::Deps) -> &Arc<K::Value>;
+}
 
 /// The context of one fiber of `C`: its resolved dependencies, the event bus, and the
 /// registrations the fiber owns.
@@ -79,14 +90,14 @@ pub trait Has<K: Key + ?Sized>: Manifest {}
 /// }
 /// key!(dyn Fs = "fs");
 ///
-/// #[component(deps(dyn Fs))]
+/// #[component(deps(fs: dyn Fs))]
 /// struct Reader {
 ///     cx: Cx<Self>,
 /// }
 ///
 /// impl Reader {
 ///     fn read(&self, path: &str) -> String {
-///         self.cx.dep::<dyn Fs>().read(path)
+///         self.cx.deps().fs.read(path)
 ///     }
 /// }
 ///
@@ -102,7 +113,7 @@ pub trait Has<K: Key + ?Sized>: Manifest {}
 /// returns `false` and a new registration is reverted immediately. A listener may capture a
 /// clone of the `Cx` that registered it; the fiber still removes it, so the cycle cannot leak.
 pub struct Cx<C: Component> {
-    deps: Arc<[(KeyId, Erased)]>,
+    deps: Arc<C::Deps>,
     events: Events,
     scope: Scope,
     _component: PhantomData<fn() -> C>,
@@ -120,8 +131,38 @@ impl<C: Component> Clone for Cx<C> {
 }
 
 impl<C: Component> Cx<C> {
-    pub(crate) fn new(deps: Resolved, events: Events, scope: Scope) -> Self {
-        Self { deps: deps.into(), events, scope, _component: PhantomData }
+    pub(crate) fn new(deps: Arc<C::Deps>, events: Events, scope: Scope) -> Self {
+        Self { deps, events, scope, _component: PhantomData }
+    }
+
+    /// Returns the resolved dependencies, one typed field per key in `deps(...)`.
+    ///
+    /// ```
+    /// use cordis::{Component, Cx, Result, component, key};
+    ///
+    /// pub trait Fs: Send + Sync {
+    ///     fn read(&self, path: &str) -> String;
+    /// }
+    /// key!(dyn Fs = "fs");
+    ///
+    /// #[component(deps(fs: dyn Fs))]
+    /// struct Reader {
+    ///     cx: Cx<Self>,
+    /// }
+    ///
+    /// impl Reader {
+    ///     fn read(&self, path: &str) -> String {
+    ///         self.cx.deps().fs.read(path)
+    ///     }
+    /// }
+    /// # impl Component for Reader {
+    /// #     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+    /// #         Ok(Reader { cx })
+    /// #     }
+    /// # }
+    /// ```
+    pub fn deps(&self) -> &C::Deps {
+        &self.deps
     }
 
     /// Returns whether the fiber still owns registrations made through this context.
@@ -151,13 +192,16 @@ impl<C: Component> Cx<C> {
 
     /// Returns the active provider of `K`, which must be a declared dependency.
     ///
+    /// The same value as the field of [`deps`](Cx::deps) declared for `K`, for code that
+    /// names the key rather than the field.
+    ///
     /// ```
     /// use cordis::{Component, Cx, Result, component, key};
     ///
     /// pub trait Fs: Send + Sync {}
     /// key!(dyn Fs = "fs");
     ///
-    /// #[component(deps(dyn Fs))]
+    /// #[component(deps(fs: dyn Fs))]
     /// struct Reader;
     ///
     /// impl Component for Reader {
@@ -178,7 +222,7 @@ impl<C: Component> Cx<C> {
     /// pub trait Net: Send + Sync {}
     /// key!(dyn Net = "net");
     ///
-    /// #[component(deps(dyn Fs))]
+    /// #[component(deps(fs: dyn Fs))]
     /// struct Reader;
     ///
     /// impl Component for Reader {
@@ -192,12 +236,6 @@ impl<C: Component> Cx<C> {
     where
         C: Has<K>,
     {
-        let id = KeyId::of::<K>();
-        let (_, value) = self
-            .deps
-            .iter()
-            .find(|(key, _)| *key == id)
-            .expect("the reactor resolves every declared key before activation");
-        value.get::<K>()
+        C::dep(&self.deps).clone()
     }
 }

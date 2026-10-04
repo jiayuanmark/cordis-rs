@@ -71,7 +71,7 @@ impl Drop for StaticPrompt {
     }
 }
 
-#[component(config = Tag, deps(dyn Prompt), provides(dyn Tools))]
+#[component(config = Tag, deps(prompt: dyn Prompt), provides(dyn Tools))]
 struct ToolRegistry {
     tag: String,
     _prompt: Arc<dyn Prompt>,
@@ -97,7 +97,7 @@ impl Tools for ToolRegistry {
 
 impl Component for ToolRegistry {
     async fn activate(cx: Cx<Self>, config: Tag) -> Result<Self> {
-        let prompt = cx.dep::<dyn Prompt>();
+        let prompt = cx.deps().prompt.clone();
         record(&config.tag, format!("activate tools with {}", prompt.text()));
         Ok(Self { tag: config.tag, _prompt: prompt, names: Arc::default() })
     }
@@ -109,7 +109,7 @@ impl Drop for ToolRegistry {
     }
 }
 
-#[component(config = Tag, deps(dyn Tools))]
+#[component(config = Tag, deps(tools: dyn Tools))]
 struct GrepTool {
     tag: String,
     _registration: Guard,
@@ -118,7 +118,7 @@ struct GrepTool {
 impl Component for GrepTool {
     async fn activate(cx: Cx<Self>, config: Tag) -> Result<Self> {
         record(&config.tag, "activate grep");
-        Ok(Self { tag: config.tag, _registration: cx.dep::<dyn Tools>().register("grep") })
+        Ok(Self { tag: config.tag, _registration: cx.deps().tools.register("grep") })
     }
 }
 
@@ -236,7 +236,7 @@ async fn a_failed_activation_is_isolated_and_retried_after_a_configuration_chang
     assert_eq!(app.status(flaky).await, Some(Status::Active));
 }
 
-#[component(config = Tag, deps(dyn Prompt))]
+#[component(config = Tag, deps(prompt: dyn Prompt))]
 struct Slow;
 
 impl Component for Slow {
@@ -269,7 +269,7 @@ async fn losing_a_dependency_cancels_an_activation_and_reverts_its_partial_effec
 }
 
 // A prompt derived from tools closes a cycle with ToolRegistry.
-#[component(deps(dyn Tools), provides(dyn Prompt))]
+#[component(deps(tools: dyn Tools), provides(dyn Prompt))]
 struct ToolsPrompt;
 
 impl Prompt for ToolsPrompt {

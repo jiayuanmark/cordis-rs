@@ -18,7 +18,8 @@ mod reactor;
 
 pub use component::{Component, Cx, Has, Manifest};
 /// Declares a component's configuration, dependencies, and provisions by implementing
-/// [`Manifest`] and [`Has`] for the type it is attached to.
+/// [`Manifest`] and [`Has`] for the type it is attached to, and generates a struct of its
+/// resolved dependencies.
 ///
 /// ```
 /// use std::sync::Arc;
@@ -35,7 +36,7 @@ pub use component::{Component, Cx, Has, Manifest};
 ///     limit: usize,
 /// }
 ///
-/// #[component(config = RegistryConfig, deps(dyn Prompt), provides(dyn Tools))]
+/// #[component(config = RegistryConfig, deps(prompt: dyn Prompt), provides(dyn Tools))]
 /// struct ToolRegistry {
 ///     prompt: Arc<dyn Prompt>,
 ///     limit: usize,
@@ -45,9 +46,12 @@ pub use component::{Component, Cx, Has, Manifest};
 ///
 /// impl Component for ToolRegistry {
 ///     async fn activate(cx: Cx<Self>, config: RegistryConfig) -> Result<Self> {
-///         Ok(Self { prompt: cx.dep::<dyn Prompt>(), limit: config.limit })
+///         Ok(Self { prompt: cx.deps().prompt.clone(), limit: config.limit })
 ///     }
 /// }
+///
+/// // Generated alongside the impls:
+/// let _: fn(&ToolRegistryDeps) -> &Arc<dyn Prompt> = |deps| &deps.prompt;
 /// ```
 ///
 /// Every argument is optional and they may appear in any order: `config` defaults to `()`, and
@@ -55,8 +59,13 @@ pub use component::{Component, Cx, Has, Manifest};
 /// Generic types are supported; the generated impls carry the type's generics and `where`
 /// clause.
 ///
-/// - `deps(...)` implements [`Has<K>`](Has) for each listed key, so [`Cx::dep`] compiles only
-///   for listed keys. Listing a key twice is a conflicting-impl error.
+/// - `deps(name: Key, ...)` generates `{Type}Deps`, a struct with one `pub name: Arc<Key::Value>`
+///   field per entry and the visibility of the component type, and sets it as
+///   [`Manifest::Deps`]. The reactor resolves it once before activation, and components read
+///   it through [`Cx::deps`]. It also implements [`Has<K>`](Has) for each listed key, so
+///   [`Cx::dep`] compiles only for listed keys. Listing a key twice is a conflicting-impl
+///   error. Without `deps`, `Manifest::Deps` is `()` and no struct is generated. The struct
+///   is not generic, so on a generic component the keys may not name its type parameters.
 /// - `provides(...)` publishes the component's `Arc` as `Arc<K::Value>` for each listed key
 ///   `K`. The coercion is written once per key, so it fails to compile when the component
 ///   does not implement the key's value type:
@@ -69,6 +78,18 @@ pub use component::{Component, Cx, Has, Manifest};
 ///
 /// #[component(provides(dyn Tools))]
 /// struct NotTools;
+/// ```
+///
+/// A dependency without a field name is rejected:
+///
+/// ```compile_fail
+/// use cordis::{component, key};
+///
+/// pub trait Fs: Send + Sync {}
+/// key!(dyn Fs = "fs");
+///
+/// #[component(deps(dyn Fs))]
+/// struct Unnamed;
 /// ```
 ///
 /// An argument given twice, or an unknown one, is rejected:

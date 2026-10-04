@@ -27,12 +27,12 @@ A Rust realization of the context paradigm from *A Programming Paradigm for Spat
 pub trait Tools: Send + Sync { fn register(&self, name: &str) -> Guard; }
 key!(dyn Tools = "tools");
 
-#[component(deps(dyn Tools))]
+#[component(deps(tools: dyn Tools))]
 struct GrepTool { _registration: Guard }
 
 impl Component for GrepTool {
     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
-        Ok(Self { _registration: cx.dep::<dyn Tools>().register("grep") })
+        Ok(Self { _registration: cx.deps().tools.register("grep") })
     }
 }
 ```

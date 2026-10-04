@@ -51,7 +51,7 @@ pub trait Tools: Send + Sync { fn register(&self, name: &str) -> Guard; }
 key!(dyn Tools = "tools");   // impl Key for dyn Tools { type Value = dyn Tools; ... }
 ```
 
-- **The consumer names only the interface.** `cx.dep::<dyn Tools>()` returns `Arc<dyn Tools>`; which implementation stands behind it is decided at runtime.
+- **The consumer names only the interface.** `cx.deps().tools` is an `Arc<dyn Tools>`; which implementation stands behind it is decided at runtime.
 - **The lookup returns the declared type.** The key is the type, so user code contains no casts. The registry downcasts once internally, and that downcast cannot fail because only a provision of `K` writes under `TypeId::of::<K>()`.
 - **No collisions, no silent drift.** The `TypeId` of `dyn Tools` includes its defining crate. Unrelated crates cannot collide, and two semver-incompatible versions of one crate are two different keys.
 - **A key is not always an interface.** A marker type can name a second slot that uses the same interface:
@@ -70,6 +70,7 @@ A component is a type. Its state value is its accumulator: dropping the value re
 ```rust
 pub trait Manifest: Sized + 'static {
     type Config: DeserializeOwned + Send + 'static;
+    type Deps: Send + Sync + 'static; // one typed field per key in d
     fn deps() -> Vec<KeyId>;      // d
     fn provides() -> Vec<KeyId>;  // p
 }
@@ -81,21 +82,25 @@ pub trait Component: Manifest + Send + Sync {
 ```
 
 ```rust
-#[component(config = GrepConfig, deps(dyn Tools, dyn Fs))]
+#[component(config = GrepConfig, deps(tools: dyn Tools, fs: dyn Fs))]
 struct GrepTool { _reg: Guard }
+
+// generated:
+// struct GrepToolDeps { pub tools: Arc<dyn Tools>, pub fs: Arc<dyn Fs> }
 
 impl Component for GrepTool {
     async fn activate(cx: Cx<Self>, cfg: GrepConfig) -> Result<Self> {
-        let fs = cx.dep::<dyn Fs>();
-        Ok(Self { _reg: cx.dep::<dyn Tools>().register(grep_tool(fs, cfg)) })
+        let GrepToolDeps { tools, fs } = cx.deps();
+        Ok(Self { _reg: tools.register(grep_tool(fs.clone(), cfg)) })
     }
 }
 ```
 
 - **One declaration, on the type.** The `#[component]` attribute implements `Manifest` and takes `config`, `deps`, and `provides` in any order, each optional. It reads the type's name and generics from the item it is attached to. The `impl Component` block then holds only behavior, so it stays ordinary, rustfmt-formatted Rust.
-- **Undeclared access does not compile.** `cx.dep::<K>()` requires `Self: Has<K>`, and `#[component]` implements `Has` only for the keys in `deps`. The bound carries `#[diagnostic::on_unimplemented]`, so the error names the missing declaration.
+- **Dependencies are a typed struct.** `deps(name: Key, ...)` generates `{Type}Deps` with one `Arc<Key::Value>` field per entry and sets it as `Manifest::Deps`. The registry stays type-erased, because configuration decides at runtime which fiber provides each key; generated code downcasts each entry once, before `activate`, and `Cx<Self>` holds the resulting `Arc<Self::Deps>`. After that, reading a dependency is a field access, with no lookup or cast. This is the pattern of Bevy's `SystemParam` and axum's extractors: the compiler checks the declaration and the runtime only fills it in.
+- **Undeclared access does not compile.** A field that is not declared does not exist. `cx.dep::<K>()`, which reads the same field by key, requires `Self: Has<K>`, and `#[component]` implements `Has` only for the keys in `deps`. The bound carries `#[diagnostic::on_unimplemented]`, so the error names the missing declaration.
 - **Inactive access cannot be expressed.** The reactor constructs `Cx<Self>` only when every dependency has an active provider.
-- **Methods reach the context through a stored `Cx`.** `Cx` is a cheap clone, so a component keeps one as a field and calls `self.cx.dep::<K>()` or `self.cx.on::<E>()` from ordinary methods. Every clone registers into the fiber's own set, which is reverted when the fiber unloads; after that `cx.is_live()` is `false` and new registrations revert at once. Closing the set breaks the cycle when a listener captures a `Cx` clone.
+- **Methods reach the context through a stored `Cx`.** `Cx` is a cheap clone, so a component keeps one as a field and calls `self.cx.deps()` or `self.cx.on::<E>()` from ordinary methods. Every clone registers into the fiber's own set, which is reverted when the fiber unloads; after that `cx.is_live()` is `false` and new registrations revert at once. Closing the set breaks the cycle when a listener captures a `Cx` clone.
 - **A small proc-macro crate.** `cordis-macros` holds only the attribute. A declarative `component!(Name { ... })` would avoid `syn` but has to be told the type's name, and wrapping the struct inside it would take the struct out of rustfmt's reach.
 
 ### Effects
