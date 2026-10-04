@@ -6,6 +6,11 @@
 //! stops being true. A component's value is its accumulator: dropping it reverts every effect
 //! it holds, such as the [`Guard`]s of its registrations.
 //!
+//! A [`Scope`], derived from a fiber's [`Cx`] or from the [`App`], changes how keys resolve for
+//! the fibers instantiated through it: [`Cx::isolate`] moves a key into another [`Realm`], so
+//! a subtree gets its own provider, and [`Cx::intercept`] attaches [`Merge`] metadata that
+//! adjusts how its consumers use the provider they reach.
+//!
 //! `design.md` at the repository root maps these types to the paper's model.
 
 mod component;
@@ -15,6 +20,7 @@ mod guard;
 mod key;
 mod loader;
 mod reactor;
+mod realm;
 
 pub use component::{Component, Cx, Manifest};
 /// Declares a component's configuration, dependencies, and provisions by implementing
@@ -65,6 +71,10 @@ pub use component::{Component, Cx, Manifest};
 ///   it through [`Cx::deps`]. Only listed keys have a field, so reading an undeclared key does
 ///   not compile, and listing a key twice is rejected. Without `deps`, `Manifest::Deps` is `()` and no struct is generated. The struct
 ///   is not generic, so on a generic component the keys may not name its type parameters.
+/// - `deps(name: Key = meta, ...)` also declares interception metadata for the key, an
+///   expression of type `Key::Meta`. The reactor merges the metadata the fiber's context
+///   carries onto it, the context taking priority, and hands the provider value through
+///   [`Key::bind`]. See [`Scope::intercept`].
 /// - `provides(...)` publishes the component's `Arc` as `Arc<K::Value>` for each listed key
 ///   `K`. The coercion is written once per key, so it fails to compile when the component
 ///   does not implement the key's value type:
@@ -113,12 +123,13 @@ pub use component::{Component, Cx, Manifest};
 /// The generated code names the crate as `::cordis`, so depend on it under that name.
 pub use cordis_macros::component;
 #[doc(hidden)]
-pub use erased::Erased;
+pub use erased::{Erased, Resolve};
 pub use events::{DefaultAction, Detached, Event, Events, Flow, Held, Next, On, Sink, mode};
 pub use guard::{Guard, Guards};
-pub use key::{Key, KeyId};
+pub use key::{Key, KeyId, Merge};
 pub use loader::{Catalog, Layer, LoadError, Loader, Row, Tree};
 pub use reactor::{App, Fiber, FiberId, Status};
+pub use realm::{Realm, Scope};
 
 /// Error returned by component activation.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;

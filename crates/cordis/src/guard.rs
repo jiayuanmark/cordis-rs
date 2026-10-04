@@ -67,14 +67,14 @@ impl Drop for Guards {
 /// Guards of the registrations a fiber made through its `Cx`. Clones share one set.
 ///
 /// The set is open while the fiber's activation runs and while the fiber is active; any `Cx`
-/// clone, including one stored in the component, registers into it. [`ScopeOwner`] closes it
+/// clone, including one stored in the component, registers into it. [`RegistrationsOwner`] closes it
 /// when the activation is cancelled or fails, or when the fiber unloads. Closing reverts every
 /// held guard, and a guard handed to a closed scope reverts at once, so a registration can
 /// never outlive its fiber, even when a listener captures a clone of the `Cx` that owns it.
 #[derive(Clone)]
-pub(crate) struct Scope(Arc<Mutex<Option<Guards>>>);
+pub(crate) struct Registrations(Arc<Mutex<Option<Guards>>>);
 
-impl Scope {
+impl Registrations {
     pub(crate) fn hold(&self, guard: Guard) {
         let mut guards = self.0.lock().unwrap();
         match guards.as_mut() {
@@ -97,23 +97,23 @@ impl Scope {
     }
 }
 
-/// Owns a fiber's [`Scope`] and closes it on drop.
+/// Owns a fiber's [`Registrations`] and closes it on drop.
 ///
 /// The activation task holds it, so a cancelled or failed activation reverts the registrations
 /// made so far; a successful one moves it into the fiber's instance.
-pub(crate) struct ScopeOwner(Scope);
+pub(crate) struct RegistrationsOwner(Registrations);
 
-impl ScopeOwner {
+impl RegistrationsOwner {
     pub(crate) fn new() -> Self {
-        Self(Scope(Arc::new(Mutex::new(Some(Guards::new())))))
+        Self(Registrations(Arc::new(Mutex::new(Some(Guards::new())))))
     }
 
-    pub(crate) fn scope(&self) -> Scope {
+    pub(crate) fn registrations(&self) -> Registrations {
         self.0.clone()
     }
 }
 
-impl Drop for ScopeOwner {
+impl Drop for RegistrationsOwner {
     fn drop(&mut self) {
         self.0.close();
     }
@@ -143,15 +143,15 @@ mod tests {
             let reverted = reverted.clone();
             Guard::new(move || reverted.lock().unwrap().push(name))
         };
-        let owner = ScopeOwner::new();
-        let scope = owner.scope();
-        scope.hold(guard("early"));
-        assert!(scope.is_open());
+        let owner = RegistrationsOwner::new();
+        let registrations = owner.registrations();
+        registrations.hold(guard("early"));
+        assert!(registrations.is_open());
 
         drop(owner);
-        assert!(!scope.is_open());
+        assert!(!registrations.is_open());
         assert_eq!(*reverted.lock().unwrap(), ["early"]);
-        scope.hold(guard("late"));
+        registrations.hold(guard("late"));
         assert_eq!(*reverted.lock().unwrap(), ["early", "late"]);
     }
 }

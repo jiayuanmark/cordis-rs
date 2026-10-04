@@ -13,7 +13,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::erased::{Factory, Instance};
-use crate::{Component, Erased, Events, Key, KeyId};
+use crate::realm::{Env, Slot};
+use crate::{Component, Erased, Events, Key, KeyId, Realm, Scope};
 
 new_key_type! {
     /// Identity of a fiber: one configured instance of a component.
@@ -74,13 +75,33 @@ impl App {
     ///
     /// The new fiber's id. The fiber activates once its dependencies are available.
     pub async fn insert<C: Component>(&self, config: Value) -> FiberId {
-        self.insert_factory(Arc::new(Factory::of::<C>()), config).await
+        self.insert_factory(Arc::new(Factory::of::<C>()), config, Env::default()).await
     }
 
-    pub(crate) async fn insert_factory(&self, factory: Arc<Factory>, config: Value) -> FiberId {
+    pub(crate) async fn insert_factory(&self, factory: Arc<Factory>, config: Value, env: Env) -> FiberId {
         let (reply, answer) = oneshot::channel();
-        self.send(Command::Insert { factory, config, parent: None, reply });
+        self.send(Command::Insert { factory, config, env, parent: None, reply });
         answer.await.expect("the reactor replies to every command").expect("a root fiber is always inserted")
+    }
+
+    /// Returns a scope where `K` resolves in a fresh realm, for inserting root fibers that
+    /// share a private provider of `K`. See [`Scope::isolate`].
+    pub fn isolate<K: Key + ?Sized>(&self) -> Scope {
+        self.scope().isolate::<K>()
+    }
+
+    /// Returns a scope where `K` resolves in `realm`. See [`Scope::isolate_in`].
+    pub fn isolate_in<K: Key + ?Sized>(&self, realm: &Realm) -> Scope {
+        self.scope().isolate_in::<K>(realm)
+    }
+
+    /// Returns a scope that carries interception metadata for `K`. See [`Scope::intercept`].
+    pub fn intercept<K: Key + ?Sized>(&self, meta: K::Meta) -> Scope {
+        self.scope().intercept::<K>(meta)
+    }
+
+    fn scope(&self) -> Scope {
+        Scope::new(Env::default(), Spawner::App(self.commands.downgrade()))
     }
 
     /// Replaces a fiber's configuration; an active fiber reloads, and its consumers with it.
@@ -108,10 +129,10 @@ impl App {
         answer.await.expect("the reactor replies to every command")
     }
 
-    /// Returns the current active provider of `K`, if any.
+    /// Returns the current active provider of `K` in the shared realm, if any.
     pub async fn get<K: Key + ?Sized>(&self) -> Option<Arc<K::Value>> {
         let (reply, answer) = oneshot::channel();
-        self.send(Command::Get { key: KeyId::of::<K>(), reply });
+        self.send(Command::Get { slot: Env::default().slot(KeyId::of::<K>()), reply });
         let value = answer.await.expect("the reactor replies to every command");
         value.map(|value| value.get::<K>())
     }
@@ -141,14 +162,36 @@ impl Default for App {
 }
 
 pub(crate) enum Command {
-    Insert { factory: Arc<Factory>, config: Value, parent: Option<Owner>, reply: oneshot::Sender<Option<FiberId>> },
-    Update { id: FiberId, config: Value },
-    Remove { id: FiberId },
+    Insert {
+        factory: Arc<Factory>,
+        config: Value,
+        env: Env,
+        parent: Option<Owner>,
+        reply: oneshot::Sender<Option<FiberId>>,
+    },
+    Update {
+        id: FiberId,
+        config: Value,
+    },
+    Remove {
+        id: FiberId,
+    },
     RemoveAll,
-    Status { id: FiberId, reply: oneshot::Sender<Option<Status>> },
-    Parent { id: FiberId, reply: oneshot::Sender<Option<FiberId>> },
-    Get { key: KeyId, reply: oneshot::Sender<Option<Erased>> },
-    Settled { reply: oneshot::Sender<()> },
+    Status {
+        id: FiberId,
+        reply: oneshot::Sender<Option<Status>>,
+    },
+    Parent {
+        id: FiberId,
+        reply: oneshot::Sender<Option<FiberId>>,
+    },
+    Get {
+        slot: Slot,
+        reply: oneshot::Sender<Option<Erased>>,
+    },
+    Settled {
+        reply: oneshot::Sender<()>,
+    },
 }
 
 /// One activation of a fiber, which owns the children it instantiates until it unloads.
@@ -165,6 +208,8 @@ pub(crate) struct Owner {
 pub(crate) struct Control {
     commands: WeakUnboundedSender<Command>,
     owner: Owner,
+    /// The context the fiber was inserted under, which its children inherit.
+    env: Env,
 }
 
 impl Control {
@@ -172,13 +217,51 @@ impl Control {
         self.owner.id
     }
 
-    /// Inserts a child of this activation. The reactor retires it when the activation ends.
-    pub(crate) async fn insert_child(&self, factory: Arc<Factory>, config: Value) -> Option<Fiber> {
-        let commands: UnboundedSender<Command> = self.commands.upgrade()?;
+    pub(crate) fn env(&self) -> &Env {
+        &self.env
+    }
+
+    /// Returns the fiber's own context, from which its children derive theirs.
+    pub(crate) fn scope(&self) -> Scope {
+        Scope::new(self.env.clone(), Spawner::Fiber(self.clone()))
+    }
+}
+
+/// Where a [`Scope`] inserts fibers: as root fibers of the app, or as children of one
+/// activation, which the reactor retires when that activation ends.
+#[derive(Clone)]
+pub(crate) enum Spawner {
+    App(WeakUnboundedSender<Command>),
+    Fiber(Control),
+}
+
+/// Why a [`Scope`] inserted no fiber.
+#[derive(Debug, thiserror::Error)]
+enum Refused {
+    #[error("the fiber's activation has ended, so it cannot instantiate children")]
+    Ended,
+    #[error("the app has stopped")]
+    Stopped,
+}
+
+impl Spawner {
+    pub(crate) fn commands(&self) -> Option<UnboundedSender<Command>> {
+        match self {
+            Spawner::App(commands) => commands.upgrade(),
+            Spawner::Fiber(control) => control.commands.upgrade(),
+        }
+    }
+
+    pub(crate) async fn insert(&self, factory: Arc<Factory>, config: Value, env: Env) -> crate::Result<Fiber> {
+        let commands = self.commands().ok_or(Refused::Stopped)?;
+        let parent = match self {
+            Spawner::App(_) => None,
+            Spawner::Fiber(control) => Some(control.owner),
+        };
         let (reply, answer) = oneshot::channel();
-        commands.send(Command::Insert { factory, config, parent: Some(self.owner), reply }).ok()?;
-        let id = answer.await.ok().flatten()?;
-        Some(Fiber { id, commands: self.commands.clone() })
+        commands.send(Command::Insert { factory, config, env, parent, reply }).map_err(|_| Refused::Stopped)?;
+        let id = answer.await.map_err(|_| Refused::Stopped)?.ok_or(Refused::Ended)?;
+        Ok(Fiber { id, commands: commands.downgrade() })
     }
 }
 
@@ -242,10 +325,10 @@ enum Event {
     },
 }
 
-/// The provider fiber of each dependency key, in declaration order. Providers are compared
-/// by identity, so a replaced provider changes the view.
+/// The provider fiber of each dependency, in declaration order. Providers are compared by
+/// identity, so a replaced provider changes the view.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct View(Vec<(KeyId, FiberId)>);
+struct View(Vec<(Slot, FiberId)>);
 
 impl View {
     fn providers(&self) -> impl Iterator<Item = FiberId> + '_ {
@@ -284,6 +367,12 @@ impl State {
 struct Entry {
     factory: Arc<Factory>,
     config: Value,
+    /// The context the fiber was inserted under.
+    env: Env,
+    /// Where each dependency key resolves under `env`, in declaration order.
+    deps: Vec<Slot>,
+    /// Where each provided key is published under `env`.
+    provides: Vec<Slot>,
     /// The activation this fiber was instantiated under, or `None` for a root fiber.
     parent: Option<Owner>,
     /// The activation that owns children created through this fiber's `Cx`: set when an
@@ -298,10 +387,10 @@ struct Entry {
 struct Reactor {
     commands: WeakUnboundedSender<Command>,
     fibers: SlotMap<FiberId, Entry>,
-    /// Active provisions. Only `Active` fibers appear here.
-    table: HashMap<KeyId, (FiberId, Erased)>,
-    /// Fibers to settle when a key's provider changes: dependents and competing providers.
-    watchers: HashMap<KeyId, Vec<FiberId>>,
+    /// Active provisions, by key and realm. Only `Active` fibers appear here.
+    table: HashMap<Slot, (FiberId, Erased)>,
+    /// Fibers to settle when a slot's provider changes: dependents and competing providers.
+    watchers: HashMap<Slot, Vec<FiberId>>,
     /// Number of committed views that name each fiber.
     relied: SecondaryMap<FiberId, u32>,
     dirty: VecDeque<FiberId>,
@@ -351,16 +440,21 @@ impl Reactor {
 
     fn command(&mut self, command: Command) {
         match command {
-            Command::Insert { factory, config, parent, reply } => {
+            Command::Insert { factory, config, env, parent, reply } => {
                 // A child requested by an activation that has already ended is not inserted.
                 if parent.is_some_and(|parent| !self.owns_children(parent)) {
                     let _ = reply.send(None);
                     return;
                 }
-                let watched: Vec<KeyId> = factory.deps.iter().chain(&factory.provides).copied().collect();
+                let deps: Vec<Slot> = factory.deps.iter().map(|key| env.slot(*key)).collect();
+                let provides: Vec<Slot> = factory.provides.iter().map(|key| env.slot(*key)).collect();
+                let watched: Vec<Slot> = deps.iter().chain(&provides).cloned().collect();
                 let id = self.fibers.insert(Entry {
                     factory,
                     config,
+                    env,
+                    deps,
+                    provides,
                     parent,
                     owner: None,
                     epoch: 0,
@@ -400,8 +494,8 @@ impl Reactor {
             Command::Parent { id, reply } => {
                 let _ = reply.send(self.fibers.get(id).and_then(|fiber| fiber.parent).map(|parent| parent.id));
             }
-            Command::Get { key, reply } => {
-                let _ = reply.send(self.table.get(&key).map(|(_, value)| value.clone()));
+            Command::Get { slot, reply } => {
+                let _ = reply.send(self.table.get(&slot).map(|(_, value)| value.clone()));
             }
             Command::Settled { reply } => self.waiters.push(reply),
         }
@@ -443,17 +537,16 @@ impl Reactor {
         if fiber.retired {
             return None;
         }
-        // A key has one active provider; a competing provider waits until the key is free.
+        // A key has one active provider per realm; a competing provider waits until it is free.
         let contested =
-            fiber.factory.provides.iter().any(|key| self.table.get(key).is_some_and(|(provider, _)| *provider != id));
+            fiber.provides.iter().any(|slot| self.table.get(slot).is_some_and(|(provider, _)| *provider != id));
         if contested {
             return None;
         }
         fiber
-            .factory
             .deps
             .iter()
-            .map(|key| self.table.get(key).map(|(provider, _)| (*key, *provider)))
+            .map(|slot| self.table.get(slot).map(|(provider, _)| (slot.clone(), *provider)))
             .collect::<Option<Vec<_>>>()
             .map(View)
     }
@@ -503,13 +596,13 @@ impl Reactor {
         for provider in view.providers() {
             self.relied[provider] += 1;
         }
-        let deps = view.0.iter().map(|(key, _)| (*key, self.table[key].1.clone())).collect();
+        let deps = view.0.iter().map(|(slot, _)| (slot.key, self.table[slot].1.clone())).collect();
         let token = self.next_token;
         self.next_token += 1;
         let cancel = CancellationToken::new();
 
-        let control = Control { commands: self.commands.clone(), owner: Owner { id, token } };
         let fiber = &mut self.fibers[id];
+        let control = Control { commands: self.commands.clone(), owner: Owner { id, token }, env: fiber.env.clone() };
         let task = (fiber.factory.activate)(deps, fiber.config.clone(), self.bus.clone(), control);
         fiber.committed = Some(Committed { view, epoch: fiber.epoch });
         fiber.owner = Some(token);
@@ -566,9 +659,12 @@ impl Reactor {
     }
 
     fn publish(&mut self, id: FiberId, instance: Box<dyn Instance>) {
-        for (key, value) in instance.provisions() {
-            self.table.insert(key, (id, value));
-            self.mark(key);
+        let fiber = &self.fibers[id];
+        let provisions: Vec<(Slot, Erased)> =
+            instance.provisions().into_iter().map(|(key, value)| (fiber.env.slot(key), value)).collect();
+        for (slot, value) in provisions {
+            self.table.insert(slot.clone(), (id, value));
+            self.mark(&slot);
         }
         self.fibers[id].state = State::Active { instance };
     }
@@ -579,11 +675,11 @@ impl Reactor {
             unreachable!("only an active fiber leaves");
         };
         fiber.state = State::Leaving { instance };
-        let provides = fiber.factory.provides.clone();
-        for key in provides {
-            if self.table.get(&key).is_some_and(|(provider, _)| *provider == id) {
-                self.table.remove(&key);
-                self.mark(key);
+        let provides = fiber.provides.clone();
+        for slot in provides {
+            if self.table.get(&slot).is_some_and(|(provider, _)| *provider == id) {
+                self.table.remove(&slot);
+                self.mark(&slot);
             }
         }
         self.try_unload(id);
@@ -627,16 +723,20 @@ impl Reactor {
 
     fn discard(&mut self, id: FiberId) {
         let fiber = self.fibers.remove(id).expect("a discarded fiber exists");
-        for key in fiber.factory.deps.iter().chain(&fiber.factory.provides) {
-            if let Some(watchers) = self.watchers.get_mut(key) {
+        for slot in fiber.deps.iter().chain(&fiber.provides) {
+            if let Some(watchers) = self.watchers.get_mut(slot) {
                 watchers.retain(|watcher| *watcher != id);
+                if watchers.is_empty() {
+                    // Realms come and go with the fibers in them.
+                    self.watchers.remove(slot);
+                }
             }
         }
         self.relied.remove(id);
     }
 
-    fn mark(&mut self, key: KeyId) {
-        if let Some(watchers) = self.watchers.get(&key) {
+    fn mark(&mut self, slot: &Slot) {
+        if let Some(watchers) = self.watchers.get(slot) {
             self.dirty.extend(watchers.iter().copied());
         }
     }

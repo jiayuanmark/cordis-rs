@@ -30,8 +30,9 @@ Rust fixes the *vocabulary* at compile time: which service traits exist, which c
 | Target view and committed view, Def 53 | `View`: the provider fiber of each dependency key |
 | Satisfaction and `notify`, Def 22 | The reactor's settle step |
 | The "relied upon" guard, Def 54 | Per-fiber count of committed views that name the fiber |
-| Isolation, Def 24 | Realms: registry views that override selected keys |
-| Interception, Def 26 | A typed monoid (`Default + Merge`) declared per key |
+| Derived realization, Def 23 | `Scope`: a context derived from a `Cx` or the `App`, discarded by dropping it |
+| Isolation, Defs 24 and 25 | `cx.isolate::<K>()`: the table is keyed by (key, `Realm`), and a fiber's realms are fixed at insertion |
+| Interception, Defs 26 and 27 | `Key::Meta`, a `Merge` monoid; `cx.intercept::<K>(meta)` and `deps(k: K = meta)`, applied by `Key::bind` |
 | Service multiplexing, §6.2 | Cardinality declared on the key: `one` or `many` |
 | Dependency typing and versioning, §6.6 | `TypeId` keys plus trait upcasting between interface versions |
 | Cordis events | Types implementing `Event`, dispatched through the built-in `Events` bus |
@@ -62,7 +63,7 @@ pub struct ReplicaDb;
 impl Key for ReplicaDb { type Value = dyn Database; const NAME: &'static str = "db.replica"; }
 ```
 
-`Key::NAME` appears only at the edges, where people write text: configuration and logs. The loader maps names to `TypeId`s through the table of registered keys. With isolation, the lookup key becomes `(RealmId, TypeId)`.
+`Key::NAME` appears only at the edges, where people write text: configuration and logs. The loader maps names to `TypeId`s through the keys its registered components declare. With isolation, the lookup key becomes `(TypeId, Realm)`.
 
 ## Components
 
@@ -182,8 +183,35 @@ let result = cx.events().waterfall::<ToolsPreExecute>(call, |call| run_tool(call
 
 ## Isolation and interception
 
-- **A realm** is a registry view that overrides selected keys and resolves the rest through its parent. It is a derived realization (Def 23): dropping the view discards it.
-- **Interception metadata** is a typed monoid declared on the dependency, merged right-biased with metadata the context carries, for example `Dep<dyn Fs, ReadOnly>`.
+Both adjust how keys resolve for part of the fiber tree without touching the shared table, so both are **derived contexts** (Def 23): `cx.isolate` and `cx.intercept` return a `Scope`, a new context that leaves the `Cx` it came from as it was. Dropping a scope has nothing to revert. Fibers instantiated through it, with `scope.plugin::<C>(config)`, run under it, and their own `Cx`, and so their children, inherit it. `App` offers the same three methods for root fibers.
+
+```rust
+// A reviewer runs its own tool registry; the agent inside sees it, nothing outside does.
+let sub = cx.isolate::<dyn Tools>();
+sub.plugin::<ToolRegistry>(()).await?;
+sub.plugin::<AgentLoop>(json!({ "role": "reviewer" })).await?;
+
+// A sandboxed agent receives a read-only file system without being changed.
+cx.intercept::<dyn Fs>(FsMeta { read_only: Some(true), ..Default::default() })
+    .plugin::<AgentLoop>(config)
+    .await?;
+```
+
+### Realms
+
+- **The table is keyed by key and realm.** A context carries the paper's realm table ρ: the `Realm` of each isolated key, every other key resolving in the shared realm. A fiber depends on and provides each key `k` at `(k, ρ(k))`. This is §4.4's reading of isolation as the same calculus over pairs: one provider per key *per realm*, and a consumer sees only the provider in its own realm.
+- **Realms are fixed when a fiber is inserted**, again following §4.4: a fiber whose realms change is a different fiber. The loader rebuilds a row whose `isolate` changes.
+- **Three kinds of realm.** `isolate::<K>()` makes a fresh one, private to the scope's subtree. `Realm::named("tenant-a")` is shared by every scope that names it, from anywhere in the tree. `Realm::shared()` undoes an inherited isolation, which matches Def 25's "a key already isolated is reassigned rather than refused".
+- **A realm holds several keys, never one binding for two.** In TypeScript Cordis two keys isolated to the same symbol share a store slot. Here a binding is typed by its key, so `(dyn Tools, r)` and `(dyn Fs, r)` are separate slots; a named realm works as a tenant namespace instead.
+- **Configuration** names realms per key: `isolate: { tools: sandbox }` places the row's `dyn Tools` in the realm `sandbox`, shared with every row naming it. The loader checks providers within each realm. TypeScript's local realms (`isolate: { tools: true }`) are private to an entry and its group; this loader has no groups yet, so it accepts names only.
+
+### Interception
+
+- **Metadata is typed per key.** `Key::Meta` is a `Merge` monoid: `Default` is the identity, and `merge` is associative and right-biased. `()` is the metadata of a key that takes none, and `Option<T>` merges as a scalar that the right side overwrites when set.
+- **The provider function is `Key::bind`.** The paper binds each key to a function from metadata to value (Def 26). Here the key declares that function, `bind(value, &meta) -> Arc<Value>`; it can wrap the value or call a method of the service trait, which lets each provider decide how to honour the metadata.
+- **Declared, then carried.** A component declares metadata with `deps(fs: dyn Fs = expr)`. The reactor computes `declared ⊕ carried` once per activation, so the context wins (Def 27), and resolves the field to `K::bind(provider, &merged)`. Without either, `bind` is not called and the consumer receives the provider value itself.
+- **Successive intercepts merge.** `scope.intercept::<K>(a).intercept::<K>(b)` carries `a ⊕ b`.
+- **Fixed per activation.** TypeScript Cordis reads metadata at every access through its context proxy, so updating it needs no reload. Here a consumer holds the bound value in its `Deps`, so metadata is fixed when the fiber is inserted, like its realms. Interception does not affect the reactor's rules: it changes how a binding is used, not which fiber provides it (§4.4).
 
 ## Configuration
 
