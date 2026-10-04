@@ -25,7 +25,8 @@ Rust fixes the *vocabulary* at compile time: which service traits exist, which c
 | Revertible effect and inverse, §3.1 | Owning a value whose `Drop` performs the inverse |
 | Accumulator φ | The component's state value; during a cancelled activation, the future's locals |
 | Effect iterator and iteration boundaries, Def 17 | `async fn activate`; each `.await` is an iteration boundary |
-| Fiber | One configured instance of a component, owned by the reactor |
+| Fiber and fiber tree, Defs 49 and 50 | One configured instance of a component, owned by the reactor; a child records the activation it was instantiated under |
+| Instantiation and retirement, Def 52 | `cx.plugin::<C>(config)`; the reactor retires a child when its parent's activation ends (O-Retire) |
 | Target view and committed view, Def 53 | `View`: the provider fiber of each dependency key |
 | Satisfaction and `notify`, Def 22 | The reactor's settle step |
 | The "relied upon" guard, Def 54 | Per-fiber count of committed views that name the fiber |
@@ -259,6 +260,16 @@ P deactivates
 ```
 
 Activation runs in dependency order, and independent branches activate concurrently. Teardown order is never computed by sorting. It emerges from the "relied upon" guard, which keeps each provider in place until its consumers finish their own teardown (Theorem 70).
+
+### Fiber tree
+
+A component instantiates a child fiber with `cx.plugin::<C>(config)`, from `activate` or from any method of a value that keeps its `Cx`. The child is an effect of the parent's current activation:
+
+- **The reactor owns the link.** Each fiber records the activation it was instantiated under (`parent: Option<Owner>`, an id plus the activation token). The parent's `Cx` carries a weak sender to the reactor, so a kept `Cx` never keeps the reactor alive.
+- **Retirement follows the parent's activation.** When that activation ends, whether it is cancelled, fails, or unloads (at the start of `deactivate`), the reactor sets the retirement flag on each of its children. A reload is an unload and a fresh activation, so a reloaded parent gets fresh children.
+- **The parent does not wait.** As in the paper's O-Retire, retirement is unconditional, and a parent may finish unloading while a child is still unloading (§4.2.1). Children do not count toward the parent's "relied upon" guard.
+- **A child is an ordinary fiber otherwise.** It activates when its own dependencies have providers, reloads when they change, and `App::update`, `App::remove`, `App::status`, and `App::parent` work on its id.
+- **Late requests are refused.** A `Cx` whose activation has ended gets an error from `plugin`, and the reactor rejects an insert for an ended activation, so a race cannot leave an orphan.
 
 ### Leaks
 

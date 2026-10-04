@@ -8,6 +8,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::guard::ScopeOwner;
+use crate::reactor::Control;
 use crate::{Component, Cx, Events, Key, KeyId, Manifest, Result};
 
 pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -15,7 +16,7 @@ pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// The provider value of each dependency key, resolved for one activation.
 pub(crate) type Resolved = Vec<(KeyId, Erased)>;
 
-type Activate = fn(Resolved, Value, Events) -> BoxFuture<Result<Box<dyn Instance>>>;
+type Activate = fn(Resolved, Value, Events, Control) -> BoxFuture<Result<Box<dyn Instance>>>;
 
 /// A provided value with its type erased.
 ///
@@ -74,12 +75,17 @@ fn validate<C: Component>(config: &Value) -> Result<(), String> {
     serde_json::from_value::<C::Config>(config.clone()).map(drop).map_err(|error| error.to_string())
 }
 
-fn activate<C: Component>(deps: Resolved, config: Value, events: Events) -> BoxFuture<Result<Box<dyn Instance>>> {
+fn activate<C: Component>(
+    deps: Resolved,
+    config: Value,
+    events: Events,
+    control: Control,
+) -> BoxFuture<Result<Box<dyn Instance>>> {
     Box::pin(async move {
         let config: C::Config = serde_json::from_value(config)?;
         let scope = ScopeOwner::new();
         let deps = Arc::new(C::resolve(&deps));
-        let component = C::activate(Cx::new(deps, events, scope.scope()), config).await?;
+        let component = C::activate(Cx::new(deps, events, scope.scope(), control), config).await?;
         Ok(Box::new(Active { component: Arc::new(component), scope }) as Box<dyn Instance>)
     })
 }
