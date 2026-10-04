@@ -36,6 +36,19 @@ impl Erased {
             .expect("an Erased value is read only under the key that wrote it")
             .clone()
     }
+
+    /// Returns the value resolved for `K`, which the reactor resolves before activation.
+    ///
+    /// Called by the code `#[component]` generates for [`Manifest::resolve`].
+    pub fn find<K: Key + ?Sized>(resolved: &[(KeyId, Erased)]) -> Arc<K::Value> {
+        let id = KeyId::of::<K>();
+        resolved
+            .iter()
+            .find(|(key, _)| *key == id)
+            .expect("the reactor resolves every declared key before activation")
+            .1
+            .get::<K>()
+    }
 }
 
 /// The operations of one component type, with the type erased.
@@ -65,6 +78,7 @@ fn activate<C: Component>(deps: Resolved, config: Value, events: Events) -> BoxF
     Box::pin(async move {
         let config: C::Config = serde_json::from_value(config)?;
         let scope = ScopeOwner::new();
+        let deps = Arc::new(C::resolve(&deps));
         let component = C::activate(Cx::new(deps, events, scope.scope()), config).await?;
         Ok(Box::new(Active { component: Arc::new(component), scope }) as Box<dyn Instance>)
     })

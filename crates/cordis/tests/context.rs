@@ -50,7 +50,7 @@ impl Component for Salute {
 }
 
 /// Keeps its `Cx` and uses it from trait methods called by consumers.
-#[component(deps(dyn Salutation), provides(dyn Greet))]
+#[component(deps(salutation: dyn Salutation), provides(dyn Greet))]
 struct Greeter {
     cx: Cx<Self>,
 }
@@ -60,7 +60,7 @@ static LEFTOVER: Mutex<Option<Cx<Greeter>>> = Mutex::new(None);
 
 impl Greet for Greeter {
     fn greet(&self, name: &str) -> String {
-        format!("{} {name}", self.cx.dep::<dyn Salutation>().text())
+        format!("{} {name}", self.cx.deps().salutation.text())
     }
 
     fn greet_everyone_named(&self) {
@@ -83,12 +83,12 @@ impl Drop for Greeter {
     }
 }
 
-#[component(deps(dyn Greet))]
+#[component(deps(greeter: dyn Greet))]
 struct Caller;
 
 impl Component for Caller {
     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
-        let greeter = cx.dep::<dyn Greet>();
+        let greeter = cx.deps().greeter.clone();
         record(greeter.greet("caller"));
         greeter.greet_everyone_named();
         Ok(Caller)

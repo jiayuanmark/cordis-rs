@@ -1,6 +1,7 @@
 //! The `#[component]` attribute on generic and plain types.
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use cordis::{App, Component, Cx, KeyId, Manifest, Result, Status, component, key};
 use serde_json::json;
@@ -43,11 +44,59 @@ impl Component for Bare {
     }
 }
 
+pub trait Counter: Send + Sync {
+    fn count(&self) -> usize;
+}
+key!(dyn Counter = "counter");
+
+#[component(provides(dyn Counter))]
+struct Seven;
+
+impl Counter for Seven {
+    fn count(&self) -> usize {
+        7
+    }
+}
+
+impl Component for Seven {
+    async fn activate(_: Cx<Self>, _: ()) -> Result<Self> {
+        Ok(Seven)
+    }
+}
+
+pub trait Report: Send + Sync {
+    fn describe(&self) -> String;
+}
+key!(dyn Report = "report");
+
+#[component(deps(named: dyn Named, counter: dyn Counter), provides(dyn Report))]
+struct Consumer {
+    cx: Cx<Self>,
+}
+
+impl Report for Consumer {
+    fn describe(&self) -> String {
+        let ConsumerDeps { named, counter } = self.cx.deps();
+        format!("{} {}", named.name(), counter.count())
+    }
+}
+
+impl Component for Consumer {
+    async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+        // The key-addressed accessor reads the same field.
+        assert!(Arc::ptr_eq(&cx.dep::<dyn Counter>(), &cx.deps().counter));
+        assert_eq!(cx.dep::<dyn Named>().name(), cx.deps().named.name());
+        Ok(Self { cx })
+    }
+}
+
 #[test]
 fn the_attribute_declares_keys_in_order() {
     assert_eq!(Provider::<Alpha>::provides(), [KeyId::of::<dyn Named>()]);
     assert!(Provider::<Alpha>::deps().is_empty());
     assert!(Bare::deps().is_empty() && Bare::provides().is_empty());
+    assert_eq!(Consumer::deps(), [KeyId::of::<dyn Named>(), KeyId::of::<dyn Counter>()]);
+    let _: <Bare as Manifest>::Deps = ();
 }
 
 #[tokio::test]
@@ -59,4 +108,15 @@ async fn a_generic_component_provides_through_its_declared_key() {
     assert_eq!(app.status(provider).await, Some(Status::Active));
     assert_eq!(app.status(bare).await, Some(Status::Active));
     assert_eq!(app.get::<dyn Named>().await.unwrap().name(), "alpha");
+}
+
+#[tokio::test]
+async fn deps_resolve_into_the_generated_struct() {
+    let app = App::new();
+    let consumer = app.insert::<Consumer>(json!(null)).await;
+    app.insert::<Provider<Alpha>>(json!(null)).await;
+    app.insert::<Seven>(json!(null)).await;
+    app.settled().await;
+    assert_eq!(app.status(consumer).await, Some(Status::Active));
+    assert_eq!(app.get::<dyn Report>().await.unwrap().describe(), "alpha 7");
 }

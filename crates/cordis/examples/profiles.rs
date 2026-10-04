@@ -53,13 +53,13 @@ struct JsonlSessions(String);
 #[component(provides(dyn Sessions))]
 struct MemorySessions(String);
 
-#[component(deps(dyn Sessions), provides(dyn Tools))]
+#[component(deps(sessions: dyn Sessions), provides(dyn Tools))]
 struct ToolRuntime(String);
 
-#[component(config = Approval, deps(dyn Tools))]
+#[component(config = Approval, deps(tools: dyn Tools))]
 struct ApprovalPolicy(String);
 
-#[component(config = Port, deps(dyn Sessions, dyn Tools))]
+#[component(config = Port, deps(sessions: dyn Sessions, tools: dyn Tools))]
 struct WebServer(String);
 
 printing!(JsonlSessions, |c| format!("(dir {})", c.dir));
