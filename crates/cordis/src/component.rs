@@ -4,11 +4,14 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::erased::Factory;
 use crate::events::{Held, On};
 use crate::guard::Scope;
-use crate::{Erased, Event, Events, Key, KeyId, Result};
+use crate::reactor::Control;
+use crate::{Erased, Event, Events, FiberId, Key, KeyId, Result};
 
 /// A component's declarations: its configuration type, the keys it depends on, and the keys
 /// it provides.
@@ -59,6 +62,11 @@ pub trait Component: Manifest + Send + Sync {
         async move { drop(self) }
     }
 }
+
+/// The error of [`Cx::plugin`] on a context whose activation has ended.
+#[derive(Debug, thiserror::Error)]
+#[error("the fiber's activation has ended, so it cannot instantiate children")]
+struct Ended;
 
 /// Marks `K` as a declared dependency of the component and locates its field in
 /// [`Manifest::Deps`]. [`#[component]`](crate::component) implements it for each key in
@@ -116,6 +124,7 @@ pub struct Cx<C: Component> {
     deps: Arc<C::Deps>,
     events: Events,
     scope: Scope,
+    control: Control,
     _component: PhantomData<fn() -> C>,
 }
 
@@ -125,14 +134,70 @@ impl<C: Component> Clone for Cx<C> {
             deps: self.deps.clone(),
             events: self.events.clone(),
             scope: self.scope.clone(),
+            control: self.control.clone(),
             _component: PhantomData,
         }
     }
 }
 
 impl<C: Component> Cx<C> {
-    pub(crate) fn new(deps: Arc<C::Deps>, events: Events, scope: Scope) -> Self {
-        Self { deps, events, scope, _component: PhantomData }
+    pub(crate) fn new(deps: Arc<C::Deps>, events: Events, scope: Scope, control: Control) -> Self {
+        Self { deps, events, scope, control, _component: PhantomData }
+    }
+
+    /// Returns the id of the fiber this context belongs to.
+    pub fn id(&self) -> FiberId {
+        self.control.id()
+    }
+
+    /// Instantiates a child fiber of component `D` under this fiber, with `config`.
+    ///
+    /// The child is an effect of this fiber's current activation: the reactor retires it when
+    /// that activation ends, whether the fiber unloads, its activation is cancelled, or it
+    /// fails. Like a root fiber, the child activates once its own dependencies have providers,
+    /// reloads when they change, and can be updated or removed through [`App`](crate::App)
+    /// with the returned id. The parent does not wait for its children to finish unloading.
+    ///
+    /// ```
+    /// use cordis::{App, Component, Cx, Result, Status, component};
+    ///
+    /// #[component]
+    /// struct Agent;
+    ///
+    /// impl Component for Agent {
+    ///     async fn activate(_: Cx<Self>, _: ()) -> Result<Self> {
+    ///         Ok(Agent)
+    ///     }
+    /// }
+    ///
+    /// #[component]
+    /// struct Server {
+    ///     cx: Cx<Self>,
+    /// }
+    ///
+    /// impl Server {
+    ///     async fn accept(&self) -> Result<cordis::FiberId> {
+    ///         self.cx.plugin::<Agent>(()).await
+    ///     }
+    /// }
+    ///
+    /// impl Component for Server {
+    ///     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+    ///         Ok(Server { cx })
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `config` fails to serialize, or when this activation has already
+    /// ended (see [`is_live`](Cx::is_live)) or the app has stopped, in which case no child runs.
+    pub async fn plugin<D: Component>(&self, config: impl Serialize) -> Result<FiberId> {
+        let config = serde_json::to_value(config)?;
+        if !self.is_live() {
+            return Err(Ended.into());
+        }
+        self.control.insert_child(Arc::new(Factory::of::<D>()), config).await.ok_or_else(|| Ended.into())
     }
 
     /// Returns the resolved dependencies, one typed field per key in `deps(...)`.

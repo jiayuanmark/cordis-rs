@@ -8,6 +8,7 @@ use std::sync::Arc;
 use futures::FutureExt;
 use serde_json::Value;
 use slotmap::{SecondaryMap, SlotMap, new_key_type};
+use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -57,7 +58,8 @@ impl App {
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (reactor_events, event_rx) = mpsc::unbounded_channel();
         let events = Events::default();
-        tokio::spawn(Reactor::new(reactor_events, events.clone()).run(command_rx, event_rx));
+        let reactor = Reactor::new(commands.downgrade(), reactor_events, events.clone());
+        tokio::spawn(reactor.run(command_rx, event_rx));
         Self { commands, events }
     }
 
@@ -77,8 +79,8 @@ impl App {
 
     pub(crate) async fn insert_factory(&self, factory: Arc<Factory>, config: Value) -> FiberId {
         let (reply, answer) = oneshot::channel();
-        self.send(Command::Insert { factory, config, reply });
-        answer.await.expect("the reactor replies to every command")
+        self.send(Command::Insert { factory, config, parent: None, reply });
+        answer.await.expect("the reactor replies to every command").expect("a root fiber is always inserted")
     }
 
     /// Replaces a fiber's configuration; an active fiber reloads, and its consumers with it.
@@ -95,6 +97,14 @@ impl App {
     pub async fn status(&self, id: FiberId) -> Option<Status> {
         let (reply, answer) = oneshot::channel();
         self.send(Command::Status { id, reply });
+        answer.await.expect("the reactor replies to every command")
+    }
+
+    /// Returns the fiber a fiber was instantiated under, or `None` for a root fiber and once
+    /// the fiber has been discarded.
+    pub async fn parent(&self, id: FiberId) -> Option<FiberId> {
+        let (reply, answer) = oneshot::channel();
+        self.send(Command::Parent { id, reply });
         answer.await.expect("the reactor replies to every command")
     }
 
@@ -130,14 +140,45 @@ impl Default for App {
     }
 }
 
-enum Command {
-    Insert { factory: Arc<Factory>, config: Value, reply: oneshot::Sender<FiberId> },
+pub(crate) enum Command {
+    Insert { factory: Arc<Factory>, config: Value, parent: Option<Owner>, reply: oneshot::Sender<Option<FiberId>> },
     Update { id: FiberId, config: Value },
     Remove { id: FiberId },
     RemoveAll,
     Status { id: FiberId, reply: oneshot::Sender<Option<Status>> },
+    Parent { id: FiberId, reply: oneshot::Sender<Option<FiberId>> },
     Get { key: KeyId, reply: oneshot::Sender<Option<Erased>> },
     Settled { reply: oneshot::Sender<()> },
+}
+
+/// One activation of a fiber, which owns the children it instantiates until it unloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Owner {
+    pub(crate) id: FiberId,
+    token: u64,
+}
+
+/// A fiber's handle to the reactor, carried by its `Cx`.
+///
+/// The sender is weak, so a `Cx` a component keeps does not keep the reactor running.
+#[derive(Clone)]
+pub(crate) struct Control {
+    commands: WeakUnboundedSender<Command>,
+    owner: Owner,
+}
+
+impl Control {
+    pub(crate) fn id(&self) -> FiberId {
+        self.owner.id
+    }
+
+    /// Inserts a child of this activation. The reactor retires it when the activation ends.
+    pub(crate) async fn insert_child(&self, factory: Arc<Factory>, config: Value) -> Option<FiberId> {
+        let commands: UnboundedSender<Command> = self.commands.upgrade()?;
+        let (reply, answer) = oneshot::channel();
+        commands.send(Command::Insert { factory, config, parent: Some(self.owner), reply }).ok()?;
+        answer.await.ok().flatten()
+    }
 }
 
 enum Event {
@@ -194,6 +235,11 @@ impl State {
 struct Fiber {
     factory: Arc<Factory>,
     config: Value,
+    /// The activation this fiber was instantiated under, or `None` for a root fiber.
+    parent: Option<Owner>,
+    /// The activation that owns children created through this fiber's `Cx`: set when an
+    /// activation begins, cleared when it ends and its children are retired.
+    owner: Option<u64>,
     epoch: u64,
     retired: bool,
     committed: Option<Committed>,
@@ -201,6 +247,7 @@ struct Fiber {
 }
 
 struct Reactor {
+    commands: WeakUnboundedSender<Command>,
     fibers: SlotMap<FiberId, Fiber>,
     /// Active provisions. Only `Active` fibers appear here.
     table: HashMap<KeyId, (FiberId, Erased)>,
@@ -217,8 +264,9 @@ struct Reactor {
 }
 
 impl Reactor {
-    fn new(events: mpsc::UnboundedSender<Event>, bus: Events) -> Self {
+    fn new(commands: WeakUnboundedSender<Command>, events: mpsc::UnboundedSender<Event>, bus: Events) -> Self {
         Self {
+            commands,
             fibers: SlotMap::with_key(),
             table: HashMap::new(),
             watchers: HashMap::new(),
@@ -254,11 +302,18 @@ impl Reactor {
 
     fn command(&mut self, command: Command) {
         match command {
-            Command::Insert { factory, config, reply } => {
+            Command::Insert { factory, config, parent, reply } => {
+                // A child requested by an activation that has already ended is not inserted.
+                if parent.is_some_and(|parent| !self.owns_children(parent)) {
+                    let _ = reply.send(None);
+                    return;
+                }
                 let watched: Vec<KeyId> = factory.deps.iter().chain(&factory.provides).copied().collect();
                 let id = self.fibers.insert(Fiber {
                     factory,
                     config,
+                    parent,
+                    owner: None,
                     epoch: 0,
                     retired: false,
                     committed: None,
@@ -269,7 +324,7 @@ impl Reactor {
                 }
                 self.relied.insert(id, 0);
                 self.dirty.push_back(id);
-                let _ = reply.send(id);
+                let _ = reply.send(Some(id));
             }
             Command::Update { id, config } => {
                 if let Some(fiber) = self.fibers.get_mut(id) {
@@ -293,10 +348,30 @@ impl Reactor {
             Command::Status { id, reply } => {
                 let _ = reply.send(self.fibers.get(id).map(|fiber| fiber.state.status()));
             }
+            Command::Parent { id, reply } => {
+                let _ = reply.send(self.fibers.get(id).and_then(|fiber| fiber.parent).map(|parent| parent.id));
+            }
             Command::Get { key, reply } => {
                 let _ = reply.send(self.table.get(&key).map(|(_, value)| value.clone()));
             }
             Command::Settled { reply } => self.waiters.push(reply),
+        }
+    }
+
+    fn owns_children(&self, owner: Owner) -> bool {
+        self.fibers.get(owner.id).is_some_and(|fiber| fiber.owner == Some(owner.token))
+    }
+
+    /// Ends the fiber's ownership of its children and retires them (rule O-Retire, applied by
+    /// the parent's accumulator). The parent does not wait for them to leave.
+    fn retire_children(&mut self, id: FiberId) {
+        let Some(token) = self.fibers[id].owner.take() else { return };
+        let owner = Owner { id, token };
+        for (child, fiber) in &mut self.fibers {
+            if fiber.parent == Some(owner) && !fiber.retired {
+                fiber.retired = true;
+                self.dirty.push_back(child);
+            }
         }
     }
 
@@ -379,9 +454,11 @@ impl Reactor {
         self.next_token += 1;
         let cancel = CancellationToken::new();
 
+        let control = Control { commands: self.commands.clone(), owner: Owner { id, token } };
         let fiber = &mut self.fibers[id];
-        let task = (fiber.factory.activate)(deps, fiber.config.clone(), self.bus.clone());
+        let task = (fiber.factory.activate)(deps, fiber.config.clone(), self.bus.clone(), control);
         fiber.committed = Some(Committed { view, epoch: fiber.epoch });
+        fiber.owner = Some(token);
         fiber.state = State::Loading { token, cancel: cancel.clone() };
 
         self.in_flight += 1;
@@ -416,6 +493,7 @@ impl Reactor {
             }
             Some(Err(error)) => {
                 tracing::error!(fiber = ?id, %error, "activation failed");
+                self.retire_children(id);
                 let fiber = &mut self.fibers[id];
                 let committed = fiber.committed.take().expect("a loading fiber has a committed view");
                 fiber.state = State::Failed { view: committed.view.clone(), epoch: committed.epoch, error };
@@ -423,6 +501,7 @@ impl Reactor {
                 self.dirty.push_back(id);
             }
             None => {
+                self.retire_children(id);
                 let fiber = &mut self.fibers[id];
                 let committed = fiber.committed.take().expect("a loading fiber has a committed view");
                 fiber.state = State::Inactive;
@@ -464,6 +543,7 @@ impl Reactor {
         let State::Leaving { instance } = std::mem::replace(&mut self.fibers[id].state, State::Deactivating) else {
             unreachable!("checked above");
         };
+        self.retire_children(id);
         self.in_flight += 1;
         let events = self.events.clone();
         tokio::spawn(async move {
