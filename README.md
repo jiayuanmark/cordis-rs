@@ -8,12 +8,14 @@ A Rust realization of the context paradigm from *A Programming Paradigm for Spat
 |---|---|
 | `crates/cordis/src/key.rs` | `Key`, `KeyId`, `key!` |
 | `crates/cordis/src/guard.rs` | `Guard`, `Guards` |
-| `crates/cordis/src/component.rs` | `Component`, `Cx`, `deps!`, `provides!` |
+| `crates/cordis/src/component.rs` | `Manifest`, `Component`, `Cx` |
+| `crates/cordis-macros/src/lib.rs` | The `#[component]` attribute, re-exported as `cordis::component` |
 | `crates/cordis/src/events.rs` | `Event`, `Events`, the five dispatch modes, `event!` |
 | `crates/cordis/src/erased.rs` | Type-erased values and component operations |
 | `crates/cordis/src/reactor.rs` | `App` and the reactor |
 | `crates/cordis/src/loader.rs` | `Catalog`, `Loader`, YAML trees and layers |
 | `crates/cordis/tests/lifecycle.rs` | Lifecycle behavior tests |
+| `crates/cordis/tests/component.rs` | `#[component]` on generic and plain types |
 | `crates/cordis/tests/events.rs` | Event bus behavior tests |
 | `crates/cordis/tests/layers.rs` | Layer merge tests |
 | `crates/cordis/examples/harness.rs` | A miniature agent harness built on events (`cargo run --example harness`) |
@@ -25,13 +27,10 @@ A Rust realization of the context paradigm from *A Programming Paradigm for Spat
 pub trait Tools: Send + Sync { fn register(&self, name: &str) -> Guard; }
 key!(dyn Tools = "tools");
 
+#[component(deps(dyn Tools))]
 struct GrepTool { _registration: Guard }
-deps!(GrepToolDeps = [dyn Tools]);
 
 impl Component for GrepTool {
-    type Config = ();
-    type Deps = GrepToolDeps;
-    type Provides = ();
     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
         Ok(Self { _registration: cx.dep::<dyn Tools>().register("grep") })
     }
@@ -48,7 +47,7 @@ Implemented:
 - Layered configuration: `Tree::layered` merges YAML layers by row id (override set fields, replace `config` whole, toggle `disabled`, append new rows).
 - A YAML loader that validates a whole tree (unknown components, invalid configuration, missing providers, cycles) before reconciling it.
 
-Not yet implemented: `many` keys, realms, interception metadata, listener ordering beyond registration order, the named event edge, the `#[component]` attribute macro, `compose!`, and WASM components.
+Not yet implemented: `many` keys, realms, interception metadata, listener ordering beyond registration order, the named event edge, `compose!`, and WASM components.
 
 ## Commands
 

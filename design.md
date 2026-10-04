@@ -21,7 +21,7 @@ Rust fixes the *vocabulary* at compile time: which service traits exist, which c
 | Paper concept | Rust realization |
 |---|---|
 | Key *k* with value type *V_k* | A type implementing `Key`, with `Key::Value` as *V_k* |
-| Component (*d*, *p*, *e*), Def 48 | A type implementing `Component` with associated `Deps` and `Provides` |
+| Component (*d*, *p*, *e*), Def 48 | A type implementing `Component`, with *d* and *p* declared by `#[component]` |
 | Revertible effect and inverse, §3.1 | Owning a value whose `Drop` performs the inverse |
 | Accumulator φ | The component's state value; during a cancelled activation, the future's locals |
 | Effect iterator and iteration boundaries, Def 17 | `async fn activate`; each `.await` is an iteration boundary |
@@ -68,23 +68,23 @@ impl Key for ReplicaDb { type Value = dyn Database; const NAME: &'static str = "
 A component is a type. Its state value is its accumulator: dropping the value reverts everything the component did.
 
 ```rust
-pub trait Component: Sized + Send + Sync + 'static {
+pub trait Manifest: Sized + 'static {
     type Config: DeserializeOwned + Send + 'static;
-    type Deps: DepSet;             // d
-    type Provides: ProvSet<Self>;  // p
+    fn deps() -> Vec<KeyId>;      // d
+    fn provides() -> Vec<KeyId>;  // p
+}
+
+pub trait Component: Manifest + Send + Sync {
     fn activate(cx: Cx<Self>, cfg: Self::Config) -> impl Future<Output = Result<Self>> + Send;
     fn deactivate(self) -> impl Future<Output = ()> + Send { async {} } // Drop does the rest
 }
 ```
 
 ```rust
+#[component(config = GrepConfig, deps(dyn Tools, dyn Fs))]
 struct GrepTool { _reg: Guard }
-deps!(GrepDeps = [dyn Tools, dyn Fs]);
 
 impl Component for GrepTool {
-    type Config = GrepConfig;
-    type Deps = GrepDeps;
-    type Provides = ();
     async fn activate(cx: Cx<Self>, cfg: GrepConfig) -> Result<Self> {
         let fs = cx.dep::<dyn Fs>();
         Ok(Self { _reg: cx.dep::<dyn Tools>().register(grep_tool(fs, cfg)) })
@@ -92,9 +92,10 @@ impl Component for GrepTool {
 }
 ```
 
-- **Undeclared access does not compile.** `cx.dep::<K>()` requires `Deps: Has<K>`, and `deps!` implements `Has` only for the listed keys. The bound carries `#[diagnostic::on_unimplemented]`, so the error names the missing declaration.
+- **One declaration, on the type.** The `#[component]` attribute implements `Manifest` and takes `config`, `deps`, and `provides` in any order, each optional. It reads the type's name and generics from the item it is attached to. The `impl Component` block then holds only behavior, so it stays ordinary, rustfmt-formatted Rust.
+- **Undeclared access does not compile.** `cx.dep::<K>()` requires `Self: Has<K>`, and `#[component]` implements `Has` only for the keys in `deps`. The bound carries `#[diagnostic::on_unimplemented]`, so the error names the missing declaration.
 - **Inactive access cannot be expressed.** The reactor constructs `Cx<Self>` only when every dependency has an active provider.
-- **An attribute macro can replace the declarative forms.** `#[component(deps(...), provides(...))]` would generate the same items as `deps!` and `provides!`.
+- **A small proc-macro crate.** `cordis-macros` holds only the attribute. A declarative `component!(Name { ... })` would avoid `syn` but has to be told the type's name, and wrapping the struct inside it would take the struct out of rustfmt's reach.
 
 ### Effects
 
@@ -108,11 +109,11 @@ impl Component for GrepTool {
 
 ## Provision
 
-The component value is the service. `provides!` publishes `Arc<Self>` as `Arc<K::Value>` for each listed key. Generic unsizing is unstable, so the macro writes one coercion per key, and each coercion fails to compile if the component does not implement the trait. Publishing through `Provides` is the only way to bind a key, so a component binds no key outside *p* (Def 48).
+The component value is the service. `#[component(provides(...))]` publishes `Arc<Self>` as `Arc<K::Value>` for each listed key. Generic unsizing is unstable, so the macro writes one coercion per key, and each coercion fails to compile if the component does not implement the trait. Publishing through `Manifest::publish` is the only way to bind a key, so a component binds no key outside *p* (Def 48).
 
 ```rust
+#[component(provides(dyn Tools))]
 struct ToolRegistry { tools: Arc<Mutex<Vec<String>>> }
-provides!(RegistryProvides for ToolRegistry = [dyn Tools]);
 impl Tools for ToolRegistry { fn register(&self, name: &str) -> Guard { /* ... */ } }
 ```
 

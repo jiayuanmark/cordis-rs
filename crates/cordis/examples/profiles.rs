@@ -3,7 +3,7 @@
 //!
 //! Run with `cargo run --example profiles`.
 
-use cordis::{App, Catalog, Component, Cx, Layer, Loader, Result, Tree, deps, key, provides};
+use cordis::{App, Catalog, Component, Cx, Layer, Loader, Manifest, Result, Tree, component, key};
 use serde::Deserialize;
 
 pub trait Sessions: Send + Sync {}
@@ -12,18 +12,12 @@ key!(dyn Sessions = "sessions");
 pub trait Tools: Send + Sync {}
 key!(dyn Tools = "tools");
 
-/// Declares a component that prints when it activates and when it is dropped.
-macro_rules! component {
-    ($name:ident, $config:ty, $deps:ty, $provides:ty, $describe:expr) => {
-        struct $name(String);
-
+/// Makes a component print when it activates and when it is dropped.
+macro_rules! printing {
+    ($name:ident, $describe:expr) => {
         impl Component for $name {
-            type Config = $config;
-            type Deps = $deps;
-            type Provides = $provides;
-
-            async fn activate(_: Cx<Self>, config: $config) -> Result<Self> {
-                let describe: fn(&$config) -> String = $describe;
+            async fn activate(_: Cx<Self>, config: Self::Config) -> Result<Self> {
+                let describe: fn(&<Self as Manifest>::Config) -> String = $describe;
                 let label = format!("{} {}", stringify!($name), describe(&config)).trim_end().to_owned();
                 println!("  + {label}");
                 Ok(Self(label))
@@ -53,18 +47,26 @@ struct Port {
     port: u16,
 }
 
-provides!(JsonlSessionsProvides for JsonlSessions = [dyn Sessions]);
-provides!(MemorySessionsProvides for MemorySessions = [dyn Sessions]);
-provides!(ToolRuntimeProvides for ToolRuntime = [dyn Tools]);
-deps!(ToolRuntimeDeps = [dyn Sessions]);
-deps!(ApprovalDeps = [dyn Tools]);
-deps!(ServerDeps = [dyn Sessions, dyn Tools]);
+#[component(config = Dir, provides(dyn Sessions))]
+struct JsonlSessions(String);
 
-component!(JsonlSessions, Dir, (), JsonlSessionsProvides, |c| format!("(dir {})", c.dir));
-component!(MemorySessions, (), (), MemorySessionsProvides, |_| String::new());
-component!(ToolRuntime, (), ToolRuntimeDeps, ToolRuntimeProvides, |_| String::new());
-component!(ApprovalPolicy, Approval, ApprovalDeps, (), |c| format!("(mode {})", c.mode));
-component!(WebServer, Port, ServerDeps, (), |c| format!("(port {})", c.port));
+#[component(provides(dyn Sessions))]
+struct MemorySessions(String);
+
+#[component(deps(dyn Sessions), provides(dyn Tools))]
+struct ToolRuntime(String);
+
+#[component(config = Approval, deps(dyn Tools))]
+struct ApprovalPolicy(String);
+
+#[component(config = Port, deps(dyn Sessions, dyn Tools))]
+struct WebServer(String);
+
+printing!(JsonlSessions, |c| format!("(dir {})", c.dir));
+printing!(MemorySessions, |_| String::new());
+printing!(ToolRuntime, |_| String::new());
+printing!(ApprovalPolicy, |c| format!("(mode {})", c.mode));
+printing!(WebServer, |c| format!("(port {})", c.port));
 
 impl Sessions for JsonlSessions {}
 impl Sessions for MemorySessions {}

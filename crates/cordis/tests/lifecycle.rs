@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use cordis::{App, Catalog, Component, Cx, FiberId, Guard, LoadError, Loader, Result, Status, deps, key, provides};
+use cordis::{App, Catalog, Component, Cx, FiberId, Guard, LoadError, Loader, Result, Status, component, key};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -46,11 +46,11 @@ struct PromptConfig {
     text: String,
 }
 
+#[component(config = PromptConfig, provides(dyn Prompt))]
 struct StaticPrompt {
     tag: String,
     text: String,
 }
-provides!(StaticPromptProvides for StaticPrompt = [dyn Prompt]);
 
 impl Prompt for StaticPrompt {
     fn text(&self) -> String {
@@ -59,10 +59,6 @@ impl Prompt for StaticPrompt {
 }
 
 impl Component for StaticPrompt {
-    type Config = PromptConfig;
-    type Deps = ();
-    type Provides = StaticPromptProvides;
-
     async fn activate(_: Cx<Self>, config: PromptConfig) -> Result<Self> {
         record(&config.tag, format!("activate prompt {}", config.text));
         Ok(Self { tag: config.tag, text: config.text })
@@ -75,13 +71,12 @@ impl Drop for StaticPrompt {
     }
 }
 
+#[component(config = Tag, deps(dyn Prompt), provides(dyn Tools))]
 struct ToolRegistry {
     tag: String,
     _prompt: Arc<dyn Prompt>,
     names: Arc<Mutex<Vec<String>>>,
 }
-deps!(ToolRegistryDeps = [dyn Prompt]);
-provides!(ToolRegistryProvides for ToolRegistry = [dyn Tools]);
 
 impl Tools for ToolRegistry {
     fn register(&self, name: &str) -> Guard {
@@ -101,10 +96,6 @@ impl Tools for ToolRegistry {
 }
 
 impl Component for ToolRegistry {
-    type Config = Tag;
-    type Deps = ToolRegistryDeps;
-    type Provides = ToolRegistryProvides;
-
     async fn activate(cx: Cx<Self>, config: Tag) -> Result<Self> {
         let prompt = cx.dep::<dyn Prompt>();
         record(&config.tag, format!("activate tools with {}", prompt.text()));
@@ -118,17 +109,13 @@ impl Drop for ToolRegistry {
     }
 }
 
+#[component(config = Tag, deps(dyn Tools))]
 struct GrepTool {
     tag: String,
     _registration: Guard,
 }
-deps!(GrepToolDeps = [dyn Tools]);
 
 impl Component for GrepTool {
-    type Config = Tag;
-    type Deps = GrepToolDeps;
-    type Provides = ();
-
     async fn activate(cx: Cx<Self>, config: Tag) -> Result<Self> {
         record(&config.tag, "activate grep");
         Ok(Self { tag: config.tag, _registration: cx.dep::<dyn Tools>().register("grep") })
@@ -226,13 +213,10 @@ struct FlakyConfig {
     fail: bool,
 }
 
+#[component(config = FlakyConfig)]
 struct Flaky;
 
 impl Component for Flaky {
-    type Config = FlakyConfig;
-    type Deps = ();
-    type Provides = ();
-
     async fn activate(_: Cx<Self>, config: FlakyConfig) -> Result<Self> {
         if config.fail { Err("configured to fail".into()) } else { Ok(Flaky) }
     }
@@ -252,14 +236,10 @@ async fn a_failed_activation_is_isolated_and_retried_after_a_configuration_chang
     assert_eq!(app.status(flaky).await, Some(Status::Active));
 }
 
+#[component(config = Tag, deps(dyn Prompt))]
 struct Slow;
-deps!(SlowDeps = [dyn Prompt]);
 
 impl Component for Slow {
-    type Config = Tag;
-    type Deps = SlowDeps;
-    type Provides = ();
-
     async fn activate(_: Cx<Self>, config: Tag) -> Result<Self> {
         let tag = config.tag.clone();
         let _partial = Guard::new(move || record(&tag, "revert partial activation"));
@@ -289,9 +269,8 @@ async fn losing_a_dependency_cancels_an_activation_and_reverts_its_partial_effec
 }
 
 // A prompt derived from tools closes a cycle with ToolRegistry.
+#[component(deps(dyn Tools), provides(dyn Prompt))]
 struct ToolsPrompt;
-deps!(ToolsPromptDeps = [dyn Tools]);
-provides!(ToolsPromptProvides for ToolsPrompt = [dyn Prompt]);
 
 impl Prompt for ToolsPrompt {
     fn text(&self) -> String {
@@ -300,10 +279,6 @@ impl Prompt for ToolsPrompt {
 }
 
 impl Component for ToolsPrompt {
-    type Config = ();
-    type Deps = ToolsPromptDeps;
-    type Provides = ToolsPromptProvides;
-
     async fn activate(_: Cx<Self>, _: ()) -> Result<Self> {
         Ok(ToolsPrompt)
     }
