@@ -107,7 +107,7 @@ pub use events::{DefaultAction, Detached, Event, Events, Flow, Held, Next, On, S
 pub use guard::{Guard, Guards};
 pub use key::{Key, KeyId};
 pub use loader::{Catalog, Layer, LoadError, Loader, Row, Tree};
-pub use reactor::{App, FiberId, Status};
+pub use reactor::{App, Fiber, FiberId, Status};
 
 /// Error returned by component activation.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;

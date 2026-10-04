@@ -88,11 +88,33 @@ struct ParentConfig {
     slow_child: bool,
 }
 
+pub trait Marker: Send + Sync {}
+key!(dyn Marker = "marker");
+
 /// Instantiates a child named after the prompt text, then follows `then`. Keeps its `Cx` in
 /// `CONTEXTS` so tests can instantiate more children from outside `activate`.
-#[component(config = ParentConfig, deps(prompt: dyn Prompt))]
+#[component(config = ParentConfig, deps(prompt: dyn Prompt), provides(dyn Marker))]
 struct Parent {
     tag: String,
+}
+
+impl Marker for Parent {}
+
+/// Consumes the parent's `Marker`; its `deactivate` waits for `WATCH_GATE`, which holds the
+/// parent in `Leaving`.
+#[component(deps(marker: dyn Marker))]
+struct Watcher;
+
+static WATCH_GATE: Notify = Notify::const_new();
+
+impl Component for Watcher {
+    async fn activate(_: Cx<Self>, _: ()) -> Result<Self> {
+        Ok(Watcher)
+    }
+
+    async fn deactivate(self) {
+        WATCH_GATE.notified().await;
+    }
 }
 
 static CONTEXTS: Mutex<Option<HashMap<String, Cx<Parent>>>> = Mutex::new(None);
@@ -153,14 +175,14 @@ async fn a_child_is_retired_when_its_parent_unloads() {
         .await
         .unwrap();
     app.settled().await;
-    assert_eq!(app.parent(extra).await, Some(parent));
+    assert_eq!(app.parent(extra.id()).await, Some(parent));
     assert_eq!(app.parent(parent).await, None);
-    assert_eq!(app.status(extra).await, Some(Status::Active));
+    assert_eq!(extra.status().await, Some(Status::Active));
 
     app.remove(parent);
     app.settled().await;
     assert_eq!(app.status(parent).await, None);
-    assert_eq!(app.status(extra).await, None);
+    assert_eq!(extra.status().await, None);
     let mut entries = journal("unload");
     entries.sort();
     assert_eq!(entries, ["extra down", "extra up", "first down", "first up", "parent down"]);
@@ -227,4 +249,40 @@ async fn a_context_kept_past_its_activation_cannot_instantiate_children() {
     assert!(late.is_err());
     app.settled().await;
     assert_eq!(journal("late"), ["first up", "parent down", "first down"]);
+}
+
+#[tokio::test]
+async fn a_child_handle_disposes_the_child_early() {
+    let (app, _, parent) = start("dispose", json!({})).await;
+    let child = context("dispose")
+        .plugin::<Child>(ChildConfig { tag: "dispose".into(), name: "agent".into(), slow: false })
+        .await
+        .unwrap();
+    app.settled().await;
+    assert_eq!(child.status().await, Some(Status::Active));
+
+    child.dispose();
+    app.settled().await;
+    assert_eq!(child.status().await, None);
+    assert_eq!(app.status(parent).await, Some(Status::Active));
+    assert_eq!(journal("dispose"), ["first up", "agent up", "agent down"]);
+}
+
+#[tokio::test]
+async fn a_leaving_fiber_cannot_instantiate_children() {
+    let (app, _, parent) = start("leaving", json!({})).await;
+    app.insert::<Watcher>(json!(null)).await;
+    app.settled().await;
+
+    // The watcher's teardown holds the parent in `Leaving`.
+    app.remove(parent);
+    until(async || app.status(parent).await == Some(Status::Leaving)).await;
+    let late = context("leaving")
+        .plugin::<Child>(ChildConfig { tag: "leaving".into(), name: "late".into(), slow: false })
+        .await;
+    assert!(late.is_err());
+
+    WATCH_GATE.notify_one();
+    app.settled().await;
+    assert_eq!(journal("leaving"), ["first up", "parent down", "first down"]);
 }
