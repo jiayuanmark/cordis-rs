@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::guard::RegistrationsOwner;
 use crate::reactor::Control;
 use crate::realm::Env;
-use crate::{Component, Cx, Events, Key, KeyId, Manifest, Merge, Result};
+use crate::{Component, Cx, Events, Intercept, Key, KeyId, Manifest, Merge, Result};
 
 pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
@@ -50,28 +50,30 @@ pub struct Resolve<'a> {
 }
 
 impl Resolve<'_> {
-    /// Returns the provider of `K`, with interception metadata applied.
-    ///
-    /// The metadata is `declared` merged with what the context carries for `K`, the context
-    /// taking priority (Def 27). Without either, the provider value is returned as is.
-    pub fn get<K: Key + ?Sized>(&self, declared: Option<K::Meta>) -> Arc<K::Value> {
-        let id = KeyId::of::<K>();
-        let value = self
+    fn find(&self, id: KeyId) -> &Erased {
+        &self
             .values
             .iter()
             .find(|(key, _)| *key == id)
             .expect("the reactor resolves every declared key before activation")
             .1
-            .get::<K>();
-        let carried = self.env.meta::<K>();
-        if declared.is_none() && carried.is_none() {
-            return value;
-        }
-        let mut meta = declared.unwrap_or_default();
-        if let Some(carried) = carried {
+    }
+
+    /// Returns the provider of `K`, with the metadata the context carries for `K` applied, if
+    /// it carries any.
+    pub fn get<K: Key + ?Sized>(&self) -> Arc<K::Value> {
+        let id = KeyId::of::<K>();
+        self.env.bind(id, self.find(id).clone()).get::<K>()
+    }
+
+    /// Returns the provider of `K` with `declared` merged with what the context carries for
+    /// `K` applied, the context taking priority (Def 27).
+    pub fn get_with<K: Intercept + ?Sized>(&self, declared: K::Meta) -> Arc<K::Value> {
+        let mut meta = declared;
+        if let Some(carried) = self.env.meta::<K>() {
             meta.merge(carried.clone());
         }
-        K::bind(value, &meta)
+        K::bind(self.find(KeyId::of::<K>()).get::<K>(), &meta)
     }
 }
 

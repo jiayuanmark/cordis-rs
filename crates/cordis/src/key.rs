@@ -18,29 +18,43 @@ use std::sync::Arc;
 /// pub struct ReplicaDb;
 /// impl Key for ReplicaDb {
 ///     type Value = dyn Database;
-///     type Meta = ();
 ///     const NAME: &'static str = "db.replica";
 /// }
 /// ```
 pub trait Key: 'static {
     /// The type consumers receive behind an `Arc`.
     type Value: ?Sized + Send + Sync + 'static;
-    /// Interception metadata: how a consumer uses the provider, as opposed to which provider it
-    /// reaches. `()` for a key that takes none.
-    type Meta: Merge;
     /// Name used by configuration and diagnostics. Lookups use the key's `TypeId`.
     const NAME: &'static str;
+}
 
-    /// Applies interception metadata to the provider value a consumer receives.
+/// A key that accepts interception metadata: how a consumer uses the provider, as opposed to
+/// which provider it reaches.
+///
+/// Opt-in: only a key that implements it can be passed to [`intercept`](crate::Cx::intercept)
+/// or given metadata in `deps(...)`. [`key!`](crate::key!) implements it with
+/// `meta = Type, bind = function`. Intercepting any other key does not compile:
+///
+/// ```compile_fail
+/// pub trait Tools: Send + Sync {}
+/// cordis::key!(dyn Tools = "tools");
+///
+/// async fn sandbox(app: cordis::App) {
+///     app.intercept::<dyn Tools>(());
+/// }
+/// ```
+pub trait Intercept: Key {
+    /// The metadata, merged right-biased (see [`Merge`]).
+    type Meta: Merge;
+
+    /// Applies metadata to the provider value a consumer receives.
     ///
     /// The paper's provider function from metadata to value (Def 26). The reactor calls it once
     /// per activation of a consumer, and only when the consumer declares metadata for the key
     /// or the context it was instantiated in carries some; otherwise the consumer receives the
-    /// provider value as is. The default ignores the metadata, which suits `Meta = ()`.
-    fn bind(value: Arc<Self::Value>, meta: &Self::Meta) -> Arc<Self::Value> {
-        let _ = meta;
-        value
-    }
+    /// provider value as is. It can wrap the value, or call a method of the service trait so
+    /// each provider decides how to honour the metadata.
+    fn bind(value: Arc<Self::Value>, meta: &Self::Meta) -> Arc<Self::Value>;
 }
 
 /// Interception metadata: a monoid with [`Default`] as its identity.
@@ -100,8 +114,8 @@ impl fmt::Debug for KeyId {
 /// assert_eq!(cordis::KeyId::of::<dyn Tools>().name(), "tools");
 /// ```
 ///
-/// A key that takes interception metadata names its [`Merge`] type and the function that
-/// applies it, [`Key::bind`]:
+/// A key that takes interception metadata also implements [`Intercept`], naming its [`Merge`]
+/// type and the function that applies it:
 ///
 /// ```
 /// use std::sync::Arc;
@@ -137,15 +151,14 @@ macro_rules! key {
     (dyn $service:path = $name:literal) => {
         impl $crate::Key for dyn $service {
             type Value = dyn $service;
-            type Meta = ();
             const NAME: &'static str = $name;
         }
     };
     (dyn $service:path = $name:literal, meta = $meta:ty, bind = $bind:expr $(,)?) => {
-        impl $crate::Key for dyn $service {
-            type Value = dyn $service;
+        $crate::key!(dyn $service = $name);
+
+        impl $crate::Intercept for dyn $service {
             type Meta = $meta;
-            const NAME: &'static str = $name;
 
             fn bind(value: ::std::sync::Arc<dyn $service>, meta: &$meta) -> ::std::sync::Arc<dyn $service> {
                 let bind: fn(::std::sync::Arc<dyn $service>, &$meta) -> ::std::sync::Arc<dyn $service> = $bind;

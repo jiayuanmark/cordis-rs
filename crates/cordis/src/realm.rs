@@ -10,9 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::Serialize;
 use tokio::sync::oneshot;
 
+use crate::erased::Erased;
 use crate::erased::Factory;
 use crate::reactor::{Command, Spawner};
-use crate::{Component, Fiber, Key, KeyId, Merge, Result};
+use crate::{Component, Fiber, Intercept, Key, KeyId, Merge, Result};
 
 /// A namespace of provisions.
 ///
@@ -88,7 +89,20 @@ impl fmt::Debug for Slot {
 #[derive(Clone, Default)]
 pub(crate) struct Env {
     realms: Arc<HashMap<KeyId, Realm>>,
-    meta: Arc<HashMap<KeyId, Arc<dyn Any + Send + Sync>>>,
+    meta: Arc<HashMap<KeyId, Carried>>,
+}
+
+/// Metadata a context carries for one key, with the key's binder, so a consumer that declares
+/// no metadata of its own can apply it without naming [`Intercept`].
+#[derive(Clone)]
+struct Carried {
+    meta: Arc<dyn Any + Send + Sync>,
+    bind: fn(&Erased, &(dyn Any + Send + Sync)) -> Erased,
+}
+
+fn bind_erased<K: Intercept + ?Sized>(value: &Erased, meta: &(dyn Any + Send + Sync)) -> Erased {
+    let meta = meta.downcast_ref::<K::Meta>().expect("metadata is stored only under its own key");
+    Erased::new::<K>(K::bind(value.get::<K>(), meta))
 }
 
 impl Env {
@@ -98,9 +112,17 @@ impl Env {
     }
 
     /// Returns the metadata this context carries for `K`, if any.
-    pub(crate) fn meta<K: Key + ?Sized>(&self) -> Option<&K::Meta> {
-        let meta = self.meta.get(&KeyId::of::<K>())?;
-        Some(meta.downcast_ref().expect("metadata is stored only under its own key"))
+    pub(crate) fn meta<K: Intercept + ?Sized>(&self) -> Option<&K::Meta> {
+        let carried = self.meta.get(&KeyId::of::<K>())?;
+        Some(carried.meta.downcast_ref().expect("metadata is stored only under its own key"))
+    }
+
+    /// Applies the metadata this context carries for `key`, if any, to a provider value.
+    pub(crate) fn bind(&self, key: KeyId, value: Erased) -> Erased {
+        match self.meta.get(&key) {
+            Some(carried) => (carried.bind)(&value, &*carried.meta),
+            None => value,
+        }
     }
 
     pub(crate) fn isolate(&mut self, key: KeyId, realm: Realm) {
@@ -112,10 +134,11 @@ impl Env {
         }
     }
 
-    fn intercept<K: Key + ?Sized>(&mut self, meta: K::Meta) {
+    fn intercept<K: Intercept + ?Sized>(&mut self, meta: K::Meta) {
         let mut merged = self.meta::<K>().cloned().unwrap_or_default();
         merged.merge(meta);
-        Arc::make_mut(&mut self.meta).insert(KeyId::of::<K>(), Arc::new(merged));
+        let carried = Carried { meta: Arc::new(merged), bind: bind_erased::<K> };
+        Arc::make_mut(&mut self.meta).insert(KeyId::of::<K>(), carried);
     }
 }
 
@@ -163,10 +186,10 @@ impl Scope {
     /// taking priority over it.
     ///
     /// A consumer of `K` instantiated through the scope receives the provider value with the
-    /// metadata applied by [`Key::bind`]. The context's metadata takes priority over what the
+    /// metadata applied by [`Intercept::bind`]. The context's metadata takes priority over what the
     /// consumer declares in `deps(...)`, so an enclosing component can constrain how a
     /// component uses a key without changing that component.
-    pub fn intercept<K: Key + ?Sized>(&self, meta: K::Meta) -> Scope {
+    pub fn intercept<K: Intercept + ?Sized>(&self, meta: K::Meta) -> Scope {
         let mut env = self.env.clone();
         env.intercept::<K>(meta);
         Scope { env, spawner: self.spawner.clone() }

@@ -94,12 +94,9 @@ impl Declaration {
             };
             (quote!(#deps_name), struct_def)
         };
-        let resolve = deps.iter().map(|Dep { name, key, meta }| {
-            let meta = match meta {
-                Some(meta) => quote_spanned! {meta.span()=> ::std::option::Option::Some(#meta) },
-                None => quote!(::std::option::Option::None),
-            };
-            quote! { #name: resolved.get::<#key>(#meta) }
+        let resolve = deps.iter().map(|Dep { name, key, meta }| match meta {
+            Some(meta) => quote_spanned! {meta.span()=> #name: resolved.get_with::<#key>(#meta) },
+            None => quote! { #name: resolved.get::<#key>() },
         });
         let resolve = if deps.is_empty() { quote!() } else { quote!(#deps_type { #(#resolve),* }) };
         let keys = deps.iter().map(|dep| &dep.key);
