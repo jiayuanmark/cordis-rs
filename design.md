@@ -12,7 +12,7 @@ TypeScript Cordis enforces the paper's guarantees with runtime machinery: a `Pro
 - **Coeffect provisions** are checked coercions to `Arc<dyn Trait>`.
 - **Event names** are types, so payloads and dispatch modes are checked at compile time.
 
-The runtime keeps only what is inherently dynamic: a reactor that activates and deactivates components as providers and configuration change.
+The runtime keeps only what is inherently dynamic: an orchestrator that activates and deactivates components as providers and configuration change.
 
 Rust fixes the *vocabulary* at compile time: which service traits exist, which component types exist, and what each one declares. Configuration still decides the *composition*: which components run, with what configuration, and so which implementation serves each key.
 
@@ -25,10 +25,10 @@ Rust fixes the *vocabulary* at compile time: which service traits exist, which c
 | Revertible effect and inverse, §3.1 | Owning a value whose `Drop` performs the inverse |
 | Accumulator φ | The component's state value; during a cancelled activation, the future's locals |
 | Effect iterator and iteration boundaries, Def 17 | `async fn activate`; each `.await` is an iteration boundary |
-| Fiber and fiber tree, Defs 49 and 50 | One configured instance of a component, owned by the reactor; a child records the activation it was instantiated under |
-| Instantiation and retirement, Def 52 | `cx.plugin::<C>(config)`; the reactor retires a child when its parent's activation ends (O-Retire) |
+| Fiber and fiber tree, Defs 49 and 50 | One configured instance of a component, owned by the orchestrator; a child records the activation it was instantiated under |
+| Instantiation and retirement, Def 52 | `cx.plugin::<C>(config)`; the orchestrator retires a child when its parent's activation ends (O-Retire) |
 | Target view and committed view, Def 53 | `View`: the provider fiber of each dependency key |
-| Satisfaction and `notify`, Def 22 | The reactor's settle step |
+| Satisfaction and `notify`, Def 22 | The orchestrator's settle step |
 | The "relied upon" guard, Def 54 | Per-fiber count of committed views that name the fiber |
 | Derived realization, Def 23 | `Scope`: a context derived from a `Cx` or the `App`, discarded by dropping it |
 | Isolation, Defs 24 and 25 | `cx.isolate::<K>()`: the table is keyed by (key, `Realm`), and a fiber's realms are fixed at insertion |
@@ -101,7 +101,7 @@ impl Component for GrepTool {
 - **One declaration, on the type.** The `#[component]` attribute implements `Manifest` and takes `config`, `deps`, and `provides` in any order, each optional. It reads the type's name and generics from the item it is attached to. The `impl Component` block then holds only behavior, so it stays ordinary, rustfmt-formatted Rust.
 - **Dependencies are a typed struct.** `deps(name: Key, ...)` generates `{Type}Deps` with one `Arc<Key::Value>` field per entry and sets it as `Manifest::Deps`. The registry stays type-erased, because configuration decides at runtime which fiber provides each key; generated code downcasts each entry once, before `activate`, and `Cx<Self>` holds the resulting `Arc<Self::Deps>`. After that, reading a dependency is a field access, with no lookup or cast. This is the pattern of Bevy's `SystemParam` and axum's extractors: the compiler checks the declaration and the runtime only fills it in.
 - **Undeclared access does not compile.** Only declared keys have a field in `{Type}Deps`, so `cx.deps()` is the one way to read a dependency, and reading anything else is a missing-field error. `#[component]` also rejects a key listed twice.
-- **Inactive access cannot be expressed.** The reactor constructs `Cx<Self>` only when every dependency has an active provider.
+- **Inactive access cannot be expressed.** The orchestrator constructs `Cx<Self>` only when every dependency has an active provider.
 - **Methods reach the context through a stored `Cx`.** `Cx` is a cheap clone, so a component keeps one as a field and calls `self.cx.deps()` or `self.cx.on::<E>()` from ordinary methods. Every clone registers into the fiber's own set, which is reverted when the fiber unloads; after that `cx.is_live()` is `false` and new registrations revert at once. Closing the set breaks the cycle when a listener captures a `Cx` clone.
 - **A small proc-macro crate.** `cordis-macros` holds only the attribute. A declarative `component!(Name { ... })` would avoid `syn` but has to be told the type's name, and wrapping the struct inside it would take the struct out of rustfmt's reach.
 
@@ -210,7 +210,7 @@ cx.intercept::<dyn Fs>(|fs| Arc::new(ReadOnly(fs)))
 - **A closure that remaps the value.** `cx.intercept::<K>(remap)` takes `Fn(Arc<K::Value>) -> Arc<K::Value>`. A consumer instantiated under the scope receives `remap(provider)` in its `cx.deps()` instead of the provider. Usually the closure wraps the provider in a type that implements the same trait and forwards to it (`|fs| Arc::new(ReadOnly(fs))`). Whoever intercepts writes that wrapper; the provider's author needs to know nothing about interception, and any key can be intercepted. If a trait already has a method that returns a view, the closure can call it instead. The cost of a wrapper is forwarding every method of the trait.
 - **The shared provider is untouched.** Consumers hold the provider through `Arc`, which only hands out `&self`, so the closure cannot change it in place. It returns a new value, usually a wrapper that delegates to the provider, and only consumers under the scope see that value. Everyone else, including `scope.get::<K>()`, still sees the provider itself.
 - **Nested intercepts apply outermost first.** `scope.intercept::<K>(a).intercept::<K>(b)` hands consumers `b(a(provider))`, and a fiber's children inherit its intercepts, so an enclosing component's constraint is applied before the one a nested component adds.
-- **Fixed per activation.** The closure runs once each time a consumer activates, and its result is stored in that consumer's `Deps`. TypeScript Cordis reads interception metadata at every call through its context proxy, so changing it needs no restart; here a consumer must restart to see a different remap. Interception does not affect the reactor's rules: it changes what a consumer receives, not which fiber provides the key (§4.4).
+- **Fixed per activation.** The closure runs once each time a consumer activates, and its result is stored in that consumer's `Deps`. TypeScript Cordis reads interception metadata at every call through its context proxy, so changing it needs no restart; here a consumer must restart to see a different remap. Interception does not affect the orchestrator's rules: it changes what a consumer receives, not which fiber provides the key (§4.4).
 - **Why a closure and not metadata.** The paper binds each key to a function from metadata to value (Def 26), and TypeScript passes metadata that each service reads. In Rust the remap itself is the natural unit: it is typed by the key, needs no merge rules or per-key metadata type, and leaves the provider in charge of what views it offers through its trait.
 
 ## Configuration
@@ -237,7 +237,7 @@ plugins:
 
 ## Reactive lifecycle
 
-The reactor is one task that owns every fiber. It decides *when* a component runs; the component's types already fixed *what* it receives.
+The orchestrator is one task that owns every fiber. It decides *when* a component runs; the component's types already fixed *what* it receives.
 
 ### Fiber states
 
@@ -256,7 +256,7 @@ Each fiber also records its **committed view**: the provider fiber of each depen
 
 ### Rules
 
-After every command or task completion, the reactor settles each affected fiber until nothing changes:
+After every command or task completion, the orchestrator settles each affected fiber until nothing changes:
 
 | Fiber is | Condition | Action | Paper rule |
 |---|---|---|---|
@@ -293,15 +293,15 @@ Activation runs in dependency order, and independent branches activate concurren
 
 A component instantiates a child fiber with `cx.plugin::<C>(config)`, from `activate` or from any method of a value that keeps its `Cx`. The child is an effect of the parent's current activation:
 
-- **The reactor owns the link.** Each fiber records the activation it was instantiated under (`parent: Option<Owner>`, an id plus the activation token). The parent's `Cx` carries a weak sender to the reactor, so a kept `Cx` never keeps the reactor alive.
-- **Retirement follows the parent's activation.** When that activation ends, whether it is cancelled, fails, or unloads (at the start of `deactivate`), the reactor sets the retirement flag on each of its children. A reload is an unload and a fresh activation, so a reloaded parent gets fresh children.
+- **The orchestrator owns the link.** Each fiber records the activation it was instantiated under (`parent: Option<Owner>`, an id plus the activation token). The parent's `Cx` carries a weak sender to the orchestrator, so a kept `Cx` never keeps the orchestrator alive.
+- **Retirement follows the parent's activation.** When that activation ends, whether it is cancelled, fails, or unloads (at the start of `deactivate`), the orchestrator sets the retirement flag on each of its children. A reload is an unload and a fresh activation, so a reloaded parent gets fresh children.
 - **The parent does not wait.** As in the paper's O-Retire, retirement is unconditional, and a parent may finish unloading while a child is still unloading (§4.2.1). Children do not count toward the parent's "relied upon" guard.
 - **A child is an ordinary fiber otherwise.** It activates when its own dependencies have providers and reloads when they change. `plugin` returns a `Fiber` handle with `status`, `update`, and `dispose`, so a parent can retire a child early, such as an agent that finished its task. Like a TS fiber, the handle is a view: dropping it changes nothing. `App::parent` reports the link.
-- **Late requests are refused.** A fiber that is leaving or whose activation has ended gets an error from `plugin`; in the paper's `Unloading` state a fiber performs no more effects. The reactor makes the check, so a race cannot leave an orphan.
+- **Late requests are refused.** A fiber that is leaving or whose activation has ended gets an error from `plugin`; in the paper's `Unloading` state a fiber performs no more effects. The orchestrator makes the check, so a race cannot leave an orphan.
 
 ### Leaks
 
-The reactor holds each instance as an `Arc<Self>`. After the guard releases, it calls `Arc::into_inner` to recover the owned value for `deactivate`. `None` means some consumer kept a clone past its own teardown. The reactor logs the leak, and `Drop` runs when the last clone is released.
+The orchestrator holds each instance as an `Arc<Self>`. After the guard releases, it calls `Arc::into_inner` to recover the owned value for `deactivate`. `None` means some consumer kept a clone past its own teardown. The orchestrator logs the leak, and `Drop` runs when the last clone is released.
 
 ## Execution tiers
 

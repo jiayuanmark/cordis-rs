@@ -11,7 +11,7 @@ use tokio::sync::oneshot;
 
 use crate::erased::Erased;
 use crate::erased::Factory;
-use crate::reactor::{Command, Spawner};
+use crate::orchestrator::{Command, Spawner};
 use crate::{Component, Fiber, Key, KeyId, Result};
 
 /// A namespace of provisions.

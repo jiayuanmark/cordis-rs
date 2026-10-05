@@ -1,4 +1,4 @@
-//! Type-erased values and component operations used by the reactor.
+//! Type-erased values and component operations used by the orchestrator.
 
 use std::any::{Any, type_name};
 use std::future::Future;
@@ -8,7 +8,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::guard::RegistrationsOwner;
-use crate::reactor::Control;
+use crate::orchestrator::Control;
 use crate::realm::Env;
 use crate::{Component, Cx, Events, Key, KeyId, Manifest, Result};
 
@@ -55,7 +55,7 @@ impl Resolve<'_> {
             .values
             .iter()
             .find(|(key, _)| *key == id)
-            .expect("the reactor resolves every declared key before activation")
+            .expect("the orchestrator resolves every declared key before activation")
             .1
     }
 

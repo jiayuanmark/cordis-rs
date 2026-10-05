@@ -1,6 +1,6 @@
 # cordis-rs
 
-A Rust realization of the context paradigm from *A Programming Paradigm for Spatiotemporal Composability* (arXiv:2608.25512): components whose effects revert when they unload, and a reactor that activates and deactivates them as their dependencies come and go. [design.md](design.md) describes the model.
+A Rust realization of the context paradigm from *A Programming Paradigm for Spatiotemporal Composability* (arXiv:2608.25512): components whose effects revert when they unload, and an orchestrator that activates and deactivates them as their dependencies come and go. [design.md](design.md) describes the model.
 
 ## Layout
 
@@ -12,7 +12,7 @@ A Rust realization of the context paradigm from *A Programming Paradigm for Spat
 | `crates/cordis-macros/src/lib.rs` | The `#[component]` attribute, re-exported as `cordis::component` |
 | `crates/cordis/src/events.rs` | `Event`, `Events`, the five dispatch modes, `event!` |
 | `crates/cordis/src/erased.rs` | Type-erased values and component operations |
-| `crates/cordis/src/reactor.rs` | `App` and the reactor |
+| `crates/cordis/src/orchestrator.rs` | `App` and the orchestrator |
 | `crates/cordis/src/realm.rs` | `Realm` and `Scope`: isolation and interception |
 | `crates/cordis/src/loader.rs` | `Catalog`, `Loader`, YAML trees and layers |
 | `crates/cordis/tests/lifecycle.rs` | Lifecycle behavior tests |
