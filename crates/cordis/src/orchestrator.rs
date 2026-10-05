@@ -393,6 +393,9 @@ struct Orchestrator {
     fibers: SlotMap<FiberId, Entry>,
     /// Active provisions, by key and realm. Only `Active` fibers appear here.
     table: HashMap<Slot, (FiberId, Erased)>,
+    /// The fiber that holds each provided slot, from the start of its activation until it has
+    /// fully stopped. A slot has at most one holder, so two providers never run at once.
+    holders: HashMap<Slot, FiberId>,
     /// Fibers to settle when a slot's provider changes: dependents and competing providers.
     watchers: HashMap<Slot, Vec<FiberId>>,
     /// Number of committed views that name each fiber.
@@ -411,6 +414,7 @@ impl Orchestrator {
             commands,
             fibers: SlotMap::with_key(),
             table: HashMap::new(),
+            holders: HashMap::new(),
             watchers: HashMap::new(),
             relied: SecondaryMap::new(),
             dirty: VecDeque::new(),
@@ -541,9 +545,9 @@ impl Orchestrator {
         if fiber.retired {
             return None;
         }
-        // A key has one active provider per realm; a competing provider waits until it is free.
-        let contested =
-            fiber.provides.iter().any(|slot| self.table.get(slot).is_some_and(|(provider, _)| *provider != id));
+        // A key has one provider per realm, from the start of its activation until it has fully
+        // stopped; a competing provider waits until the key is free.
+        let contested = fiber.provides.iter().any(|slot| self.holders.get(slot).is_some_and(|holder| *holder != id));
         if contested {
             return None;
         }
@@ -572,15 +576,15 @@ impl Orchestrator {
         let fiber = &self.fibers[id];
         let (retired, epoch) = (fiber.retired, fiber.epoch);
         match &fiber.state {
+            // A stopped fiber keeps the keys it holds only if it starts again right away, so a
+            // reload does not hand them to a waiting competitor.
             State::Inactive => match target {
                 Some(view) => self.begin(id, view),
-                None if retired => self.discard(id),
-                None => {}
+                None => self.stop(id, retired),
             },
             State::Failed { view, epoch: failed_epoch, .. } => match target {
                 Some(target) if target != *view || *failed_epoch != epoch => self.begin(id, target),
-                None if retired => self.discard(id),
-                _ => {}
+                _ => self.stop(id, retired),
             },
             State::Loading { cancel, .. } => {
                 if !current {
@@ -605,6 +609,9 @@ impl Orchestrator {
         self.next_token += 1;
         let cancel = CancellationToken::new();
 
+        for slot in self.fibers[id].provides.clone() {
+            self.holders.insert(slot, id);
+        }
         let fiber = &mut self.fibers[id];
         let control = Control { commands: self.commands.clone(), owner: Owner { id, token }, env: fiber.env.clone() };
         let task = (fiber.factory.activate)(deps, fiber.config.clone(), self.bus.clone(), control);
@@ -715,6 +722,20 @@ impl Orchestrator {
             self.release(&committed.view);
         }
         self.dirty.push_back(id);
+    }
+
+    /// Frees the keys a fiber that stays stopped holds, waking the providers waiting for them,
+    /// and discards the fiber once it is retired.
+    fn stop(&mut self, id: FiberId, retired: bool) {
+        for slot in self.fibers[id].provides.clone() {
+            if self.holders.get(&slot) == Some(&id) {
+                self.holders.remove(&slot);
+                self.mark(&slot);
+            }
+        }
+        if retired {
+            self.discard(id);
+        }
     }
 
     /// Drops one reliance on each provider in `view`, unloading providers that were waiting.

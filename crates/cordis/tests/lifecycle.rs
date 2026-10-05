@@ -175,14 +175,14 @@ async fn a_waiting_provider_takes_over_and_dependents_reload_against_it() {
     assert_eq!(status(&app, &[second, tools]).await, [const { Some(Status::Active) }; 2]);
     assert_eq!(app.get::<dyn Prompt>().await.unwrap().text(), "b");
 
-    // The replacement may activate while the old consumer is still tearing down; only the
-    // orderings the guard and the dependency imply are fixed.
+    // The replacement starts only once the old provider has fully stopped, which in turn waits
+    // for the old consumer's teardown.
     let entries = journal("failover");
     let at = |entry: &str| entries.iter().position(|e| e == entry).unwrap_or_else(|| panic!("missing {entry}"));
     assert_eq!(entries.len(), 6);
     assert!(at("activate tools with a") < at("drop tools"));
     assert!(at("drop tools") < at("drop prompt a"));
-    assert!(at("drop tools") < at("activate tools with b"));
+    assert!(at("drop prompt a") < at("activate prompt b"));
     assert!(at("activate prompt b") < at("activate tools with b"));
 }
 
@@ -266,6 +266,93 @@ async fn losing_a_dependency_cancels_an_activation_and_reverts_its_partial_effec
         journal("cancel"),
         ["activate prompt x", "activation started", "revert partial activation", "drop prompt x"]
     );
+}
+
+// A provider whose start and stop take a while, so a competitor has a window to overlap with it.
+
+#[derive(Deserialize)]
+struct ServerConfig {
+    tag: String,
+    name: String,
+    #[serde(default)]
+    fail: bool,
+}
+
+#[component(config = ServerConfig, provides(dyn Prompt))]
+struct Server {
+    tag: String,
+    name: String,
+}
+
+impl Prompt for Server {
+    fn text(&self) -> String {
+        self.name.clone()
+    }
+}
+
+impl Component for Server {
+    async fn activate(_: Cx<Self>, config: ServerConfig) -> Result<Self> {
+        record(&config.tag, format!("start {}", config.name));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if config.fail {
+            record(&config.tag, format!("fail {}", config.name));
+            return Err("configured to fail".into());
+        }
+        Ok(Self { tag: config.tag, name: config.name })
+    }
+
+    async fn deactivate(self) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        record(&self.tag, format!("stop {}", self.name));
+    }
+}
+
+#[tokio::test]
+async fn a_competing_provider_waits_while_the_first_is_still_starting() {
+    let app = App::new();
+    let first = app.insert::<Server>(json!({ "tag": "starting", "name": "a" })).await;
+    let second = app.insert::<Server>(json!({ "tag": "starting", "name": "b" })).await;
+    app.settled().await;
+    assert_eq!(status(&app, &[first, second]).await, [Some(Status::Active), Some(Status::Inactive)]);
+    assert_eq!(journal("starting"), ["start a"]);
+}
+
+#[tokio::test]
+async fn a_waiting_provider_starts_only_after_the_first_has_fully_stopped() {
+    let app = App::new();
+    let first = app.insert::<Server>(json!({ "tag": "stopping", "name": "a" })).await;
+    app.settled().await;
+    let second = app.insert::<Server>(json!({ "tag": "stopping", "name": "b" })).await;
+    app.remove(first);
+    app.settled().await;
+    assert_eq!(app.status(second).await, Some(Status::Active));
+    assert_eq!(journal("stopping"), ["start a", "stop a", "start b"]);
+}
+
+#[tokio::test]
+async fn a_configuration_update_keeps_the_key_from_a_waiting_provider() {
+    let app = App::new();
+    let first = app.insert::<Server>(json!({ "tag": "reload", "name": "a1" })).await;
+    app.settled().await;
+    let second = app.insert::<Server>(json!({ "tag": "reload", "name": "b" })).await;
+    app.update(first, json!({ "tag": "reload", "name": "a2" }));
+    app.settled().await;
+    assert_eq!(status(&app, &[first, second]).await, [Some(Status::Active), Some(Status::Inactive)]);
+    assert_eq!(app.get::<dyn Prompt>().await.unwrap().text(), "a2");
+    assert_eq!(journal("reload"), ["start a1", "stop a1", "start a2"]);
+}
+
+#[tokio::test]
+async fn a_failed_provider_frees_the_key_for_a_waiting_one() {
+    let app = App::new();
+    let first = app.insert::<Server>(json!({ "tag": "failed", "name": "a", "fail": true })).await;
+    let second = app.insert::<Server>(json!({ "tag": "failed", "name": "b" })).await;
+    app.settled().await;
+    assert_eq!(
+        status(&app, &[first, second]).await,
+        [Some(Status::Failed("configured to fail".into())), Some(Status::Active)]
+    );
+    assert_eq!(journal("failed"), ["start a", "fail a", "start b"]);
 }
 
 // A prompt derived from tools closes a cycle with ToolRegistry.
