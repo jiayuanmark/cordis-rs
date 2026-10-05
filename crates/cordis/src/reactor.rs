@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::erased::{Factory, Instance};
 use crate::realm::{Env, Slot};
-use crate::{Component, Erased, Events, Intercept, Key, KeyId, Realm, Scope};
+use crate::{Component, Erased, Events, Key, KeyId, Realm, Scope};
 
 new_key_type! {
     /// Identity of a fiber: one configured instance of a component.
@@ -95,9 +95,13 @@ impl App {
         self.scope().isolate_in::<K>(realm)
     }
 
-    /// Returns a scope that carries interception metadata for `K`. See [`Scope::intercept`].
-    pub fn intercept<K: Intercept + ?Sized>(&self, meta: K::Meta) -> Scope {
-        self.scope().intercept::<K>(meta)
+    /// Returns a scope whose root fibers receive `remap(provider)` for `K`. See
+    /// [`Scope::intercept`].
+    pub fn intercept<K: Key + ?Sized>(
+        &self,
+        remap: impl Fn(Arc<K::Value>) -> Arc<K::Value> + Send + Sync + 'static,
+    ) -> Scope {
+        self.scope().intercept::<K>(remap)
     }
 
     fn scope(&self) -> Scope {

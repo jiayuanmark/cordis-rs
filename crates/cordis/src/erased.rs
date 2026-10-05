@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::guard::RegistrationsOwner;
 use crate::reactor::Control;
 use crate::realm::Env;
-use crate::{Component, Cx, Events, Intercept, Key, KeyId, Manifest, Merge, Result};
+use crate::{Component, Cx, Events, Key, KeyId, Manifest, Result};
 
 pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
@@ -59,21 +59,10 @@ impl Resolve<'_> {
             .1
     }
 
-    /// Returns the provider of `K`, with the metadata the context carries for `K` applied, if
-    /// it carries any.
+    /// Returns the provider of `K`, with the context's interception of `K` applied, if any.
     pub fn get<K: Key + ?Sized>(&self) -> Arc<K::Value> {
         let id = KeyId::of::<K>();
-        self.env.bind(id, self.find(id).clone()).get::<K>()
-    }
-
-    /// Returns the provider of `K` with `declared` merged with what the context carries for
-    /// `K` applied, the context taking priority (Def 27).
-    pub fn get_with<K: Intercept + ?Sized>(&self, declared: K::Meta) -> Arc<K::Value> {
-        let mut meta = declared;
-        if let Some(carried) = self.env.meta::<K>() {
-            meta.merge(carried.clone());
-        }
-        K::bind(self.find(KeyId::of::<K>()).get::<K>(), &meta)
+        self.env.remap(id, self.find(id).clone()).get::<K>()
     }
 }
 

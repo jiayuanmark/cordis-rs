@@ -7,7 +7,7 @@ use syn::meta::ParseNestedMeta;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
-use syn::{DeriveInput, Expr, Ident, Token, Type, parenthesized, parse_macro_input};
+use syn::{DeriveInput, Ident, Token, Type, parenthesized, parse_macro_input};
 
 /// See `cordis::component`, which re-exports this macro with its documentation.
 #[proc_macro_attribute]
@@ -81,7 +81,7 @@ impl Declaration {
         } else {
             let deps_name = format_ident!("{}Deps", name);
             let doc = format!("Resolved dependencies of [`{name}`], one field per entry of its `deps(...)`.");
-            let fields = deps.iter().map(|Dep { name, key, .. }| {
+            let fields = deps.iter().map(|Dep { name, key }| {
                 quote_spanned! {key.span()=> pub #name: ::std::sync::Arc<<#key as ::cordis::Key>::Value> }
             });
             let struct_def = quote! {
@@ -94,10 +94,7 @@ impl Declaration {
             };
             (quote!(#deps_name), struct_def)
         };
-        let resolve = deps.iter().map(|Dep { name, key, meta }| match meta {
-            Some(meta) => quote_spanned! {meta.span()=> #name: resolved.get_with::<#key>(#meta) },
-            None => quote! { #name: resolved.get::<#key>() },
-        });
+        let resolve = deps.iter().map(|Dep { name, key }| quote! { #name: resolved.get::<#key>() });
         let resolve = if deps.is_empty() { quote!() } else { quote!(#deps_type { #(#resolve),* }) };
         let keys = deps.iter().map(|dep| &dep.key);
         quote! {
@@ -132,12 +129,10 @@ impl Declaration {
     }
 }
 
-/// One entry of `deps(...)`: the field name of the dependency, its key, and optionally the
-/// interception metadata the component declares for it, `fs: dyn Fs = FsMeta::read_only()`.
+/// One entry of `deps(...)`: the field name of the dependency and its key, `fs: dyn Fs`.
 struct Dep {
     name: Ident,
     key: Type,
-    meta: Option<Expr>,
 }
 
 impl Parse for Dep {
@@ -147,9 +142,7 @@ impl Parse for Dep {
         }
         let name = input.parse()?;
         input.parse::<Token![:]>()?;
-        let key = input.parse()?;
-        let meta = if input.parse::<Option<Token![=]>>()?.is_some() { Some(input.parse()?) } else { None };
-        Ok(Self { name, key, meta })
+        Ok(Self { name, key: input.parse()? })
     }
 }
 

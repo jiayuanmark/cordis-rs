@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use crate::events::{Held, On};
 use crate::guard::Registrations;
 use crate::reactor::Control;
-use crate::{Erased, Event, Events, Fiber, FiberId, Intercept, Key, KeyId, Realm, Resolve, Result, Scope};
+use crate::{Erased, Event, Events, Fiber, FiberId, Key, KeyId, Realm, Resolve, Result, Scope};
 
 /// A component's declarations: its configuration type, the keys it depends on, and the keys
 /// it provides.
@@ -230,10 +230,13 @@ impl<C: Component> Cx<C> {
         self.control.scope().isolate_in::<K>(realm)
     }
 
-    /// Returns a scope whose children receive `K` with `meta` applied, merged onto the
-    /// metadata this fiber's context carries for `K`. See [`Scope::intercept`].
-    pub fn intercept<K: Intercept + ?Sized>(&self, meta: K::Meta) -> Scope {
-        self.control.scope().intercept::<K>(meta)
+    /// Returns a scope whose children receive `remap(provider)` for `K`, after any interception
+    /// this fiber's context already applies. See [`Scope::intercept`].
+    pub fn intercept<K: Key + ?Sized>(
+        &self,
+        remap: impl Fn(Arc<K::Value>) -> Arc<K::Value> + Send + Sync + 'static,
+    ) -> Scope {
+        self.control.scope().intercept::<K>(remap)
     }
 
     /// Returns the resolved dependencies, one typed field per key in `deps(...)`.
