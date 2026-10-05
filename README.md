@@ -50,7 +50,7 @@ Implemented:
 - A YAML loader that validates a whole tree (unknown components, invalid configuration, missing providers, cycles) before reconciling it.
 - Child fibers instantiated through `cx.plugin`, retired with the activation that made them.
 - Realms: `cx.isolate::<K>()` gives a subtree its own provider of `K`, in a fresh or named realm, and rows can name realms with `isolate`.
-- Interception: `cx.intercept::<K>(meta)` and `deps(k: K = meta)` attach typed `Merge` metadata that `Intercept::bind` applies, for keys that opt in to the provider a consumer receives.
+- Interception: `cx.intercept::<K>(|v| ...)` hands consumers under the scope a remapped view of a provider, such as a read-only wrapper, leaving the shared provider untouched.
 
 Not yet implemented: `many` keys, loader-managed local realms and interception in configuration, listener ordering beyond registration order, the named event edge, `compose!`, and WASM components.
 

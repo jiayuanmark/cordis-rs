@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use cordis::{App, Catalog, Component, Cx, LoadError, Loader, Merge, Realm, Result, Status, component, key};
+use cordis::{App, Catalog, Component, Cx, LoadError, Loader, Realm, Result, Status, component, key};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -151,50 +151,25 @@ async fn descendants_inherit_the_realms_of_their_scope() {
     assert_eq!(seen("rejoined"), ["root"]);
 }
 
-// Interception: a file system whose metadata sets a path prefix and read-only mode.
+// Interception: consumers under a scope receive a remapped view of the shared file system.
 
 pub trait Fs: Send + Sync {
     fn describe(&self) -> String;
+    /// A view that sees only paths under `prefix`, sharing this file system.
+    fn under(self: Arc<Self>, prefix: &str) -> Arc<dyn Fs>;
 }
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct FsMeta {
-    prefix: Option<String>,
-    read_only: Option<bool>,
-}
-
-impl Merge for FsMeta {
-    fn merge(&mut self, right: Self) {
-        self.prefix.merge(right.prefix);
-        self.read_only.merge(right.read_only);
-    }
-}
-
-static BINDS: Mutex<Vec<FsMeta>> = Mutex::new(Vec::new());
-
-struct Bound(FsMeta);
-
-impl Fs for Bound {
-    fn describe(&self) -> String {
-        format!(
-            "{}:{}",
-            self.0.prefix.as_deref().unwrap_or("/"),
-            if self.0.read_only == Some(true) { "ro" } else { "rw" }
-        )
-    }
-}
-
-key!(dyn Fs = "fs", meta = FsMeta, bind = |_, meta| {
-    BINDS.lock().unwrap().push(meta.clone());
-    Arc::new(Bound(meta.clone()))
-});
+key!(dyn Fs = "fs");
 
 #[component(provides(dyn Fs))]
 struct LocalFs;
 
 impl Fs for LocalFs {
     fn describe(&self) -> String {
-        "raw".into()
+        "/".into()
+    }
+
+    fn under(self: Arc<Self>, prefix: &str) -> Arc<dyn Fs> {
+        Arc::new(Under(prefix.into(), self))
     }
 }
 
@@ -204,14 +179,39 @@ impl Component for LocalFs {
     }
 }
 
+/// A prefixed view that delegates to the shared file system.
+struct Under(String, Arc<dyn Fs>);
+
+impl Fs for Under {
+    fn describe(&self) -> String {
+        format!("{}{}", self.0, self.1.describe())
+    }
+
+    fn under(self: Arc<Self>, prefix: &str) -> Arc<dyn Fs> {
+        Arc::new(Under(prefix.into(), self))
+    }
+}
+
+/// A wrapper that marks the view read-only.
+struct ReadOnly(Arc<dyn Fs>);
+
+impl Fs for ReadOnly {
+    fn describe(&self) -> String {
+        format!("{} (ro)", self.0.describe())
+    }
+
+    fn under(self: Arc<Self>, prefix: &str) -> Arc<dyn Fs> {
+        Arc::new(Under(prefix.into(), self))
+    }
+}
+
 static VIEWS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
 fn view(reader: &str) -> String {
     VIEWS.lock().unwrap().iter().rev().find(|(name, _)| name == reader).unwrap().1.clone()
 }
 
-/// Declares `prefix: /work` for its file system.
-#[component(config = Named, deps(fs: dyn Fs = FsMeta { prefix: Some("/work".into()), read_only: None }))]
+#[component(config = Named, deps(fs: dyn Fs))]
 struct Reader;
 
 impl Component for Reader {
@@ -221,62 +221,47 @@ impl Component for Reader {
     }
 }
 
-#[component(config = Named, deps(fs: dyn Fs))]
-struct PlainReader;
-
-impl Component for PlainReader {
-    async fn activate(cx: Cx<Self>, config: Named) -> Result<Self> {
-        VIEWS.lock().unwrap().push((config.name, cx.deps().fs.describe()));
-        Ok(PlainReader)
-    }
-}
-
-/// Runs a reader under read-only interception.
+/// Runs a reader under a read-only interception of its own.
 #[component(config = Named)]
 struct Sandbox;
 
 impl Component for Sandbox {
     async fn activate(cx: Cx<Self>, config: Named) -> Result<Self> {
-        cx.intercept::<dyn Fs>(FsMeta { read_only: Some(true), ..FsMeta::default() }).plugin::<Reader>(config).await?;
+        cx.intercept::<dyn Fs>(|fs| Arc::new(ReadOnly(fs))).plugin::<Reader>(config).await?;
         Ok(Sandbox)
     }
 }
 
 #[tokio::test]
-async fn context_metadata_merges_over_declared_metadata() {
+async fn interception_changes_only_the_view_of_consumers_under_the_scope() {
     let app = App::new();
     app.insert::<LocalFs>(json!(null)).await;
-    app.insert::<PlainReader>(named("plain")).await;
-    app.insert::<Reader>(named("declared")).await;
+    app.insert::<Reader>(named("plain")).await;
+    app.intercept::<dyn Fs>(|fs| fs.under("/work")).plugin::<Reader>(named("work")).await.unwrap();
     app.insert::<Sandbox>(named("sandboxed")).await;
-    // The context's prefix takes priority over the declared one, and later intercepts over
-    // earlier ones.
-    let tmp = FsMeta { prefix: Some("/tmp".into()), read_only: Some(true) };
-    app.intercept::<dyn Fs>(tmp)
-        .intercept::<dyn Fs>(FsMeta { read_only: Some(false), ..FsMeta::default() })
-        .plugin::<Reader>(named("overridden"))
-        .await
-        .unwrap();
     app.settled().await;
 
-    // Without metadata the consumer receives the provider as is.
-    assert_eq!(view("plain"), "raw");
-    assert_eq!(view("declared"), "/work:rw");
-    assert_eq!(view("sandboxed"), "/work:ro");
-    assert_eq!(view("overridden"), "/tmp:rw");
-    assert!(!BINDS.lock().unwrap().contains(&FsMeta::default()));
+    assert_eq!(view("plain"), "/");
+    assert_eq!(view("work"), "/work/");
+    assert_eq!(view("sandboxed"), "/ (ro)");
+    // The shared provider itself is untouched.
+    assert_eq!(app.get::<dyn Fs>().await.unwrap().describe(), "/");
 }
 
 #[tokio::test]
-async fn a_child_inherits_its_parents_interception() {
+async fn nested_interceptions_apply_outermost_first() {
     let app = App::new();
     app.insert::<LocalFs>(json!(null)).await;
-    app.intercept::<dyn Fs>(FsMeta { prefix: Some("/jail".into()), read_only: None })
-        .plugin::<Sandbox>(named("nested"))
+    // The app scope narrows to /jail, then the sandbox inside marks it read-only.
+    app.intercept::<dyn Fs>(|fs| fs.under("/jail")).plugin::<Sandbox>(named("nested")).await.unwrap();
+    app.intercept::<dyn Fs>(|fs| fs.under("/a"))
+        .intercept::<dyn Fs>(|fs| fs.under("/b"))
+        .plugin::<Reader>(named("chained"))
         .await
         .unwrap();
     app.settled().await;
-    assert_eq!(view("nested"), "/jail:ro");
+    assert_eq!(view("nested"), "/jail/ (ro)");
+    assert_eq!(view("chained"), "/b/a/");
 }
 
 // Configuration: rows name realms by key.

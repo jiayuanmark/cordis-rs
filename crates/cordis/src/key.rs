@@ -2,83 +2,17 @@
 
 use std::any::TypeId;
 use std::fmt;
-use std::sync::Arc;
 
 /// A named slot with a declared value type.
 ///
 /// Consumers and providers meet at a key without naming each other. Consumers receive
 /// `Arc<Self::Value>`. Implement it for a service trait object with [`key!`](crate::key!), or
-/// by hand for a marker type that names a second slot of an existing interface:
-///
-/// ```
-/// use cordis::Key;
-///
-/// pub trait Database: Send + Sync {}
-///
-/// pub struct ReplicaDb;
-/// impl Key for ReplicaDb {
-///     type Value = dyn Database;
-///     const NAME: &'static str = "db.replica";
-/// }
-/// ```
+/// by hand for a marker type that names a second slot of an existing interface.
 pub trait Key: 'static {
     /// The type consumers receive behind an `Arc`.
     type Value: ?Sized + Send + Sync + 'static;
     /// Name used by configuration and diagnostics. Lookups use the key's `TypeId`.
     const NAME: &'static str;
-}
-
-/// A key that accepts interception metadata: how a consumer uses the provider, as opposed to
-/// which provider it reaches.
-///
-/// Opt-in: only a key that implements it can be passed to [`intercept`](crate::Cx::intercept)
-/// or given metadata in `deps(...)`. [`key!`](crate::key!) implements it with
-/// `meta = Type, bind = function`. Intercepting any other key does not compile:
-///
-/// ```compile_fail
-/// pub trait Tools: Send + Sync {}
-/// cordis::key!(dyn Tools = "tools");
-///
-/// async fn sandbox(app: cordis::App) {
-///     app.intercept::<dyn Tools>(());
-/// }
-/// ```
-pub trait Intercept: Key {
-    /// The metadata, merged right-biased (see [`Merge`]).
-    type Meta: Merge;
-
-    /// Applies metadata to the provider value a consumer receives.
-    ///
-    /// The paper's provider function from metadata to value (Def 26). The reactor calls it once
-    /// per activation of a consumer, and only when the consumer declares metadata for the key
-    /// or the context it was instantiated in carries some; otherwise the consumer receives the
-    /// provider value as is. It can wrap the value, or call a method of the service trait so
-    /// each provider decides how to honour the metadata.
-    fn bind(value: Arc<Self::Value>, meta: &Self::Meta) -> Arc<Self::Value>;
-}
-
-/// Interception metadata: a monoid with [`Default`] as its identity.
-///
-/// [`merge`](Merge::merge) must be associative and right-biased: the right operand takes
-/// priority, so metadata a context carries overrides what a component declares, and a later
-/// [`intercept`](crate::Cx::intercept) overrides an earlier one. Scalar fields are typically
-/// overwritten and set-valued fields unioned.
-pub trait Merge: Clone + Default + Send + Sync + 'static {
-    /// Merges `right` onto `self`, with `right` taking priority.
-    fn merge(&mut self, right: Self);
-}
-
-impl Merge for () {
-    fn merge(&mut self, (): ()) {}
-}
-
-/// A scalar field: `Some` on the right overwrites, `None` keeps the left.
-impl<T: Clone + Send + Sync + 'static> Merge for Option<T> {
-    fn merge(&mut self, right: Self) {
-        if right.is_some() {
-            *self = right;
-        }
-    }
 }
 
 /// Runtime identity of a [`Key`].
@@ -113,57 +47,12 @@ impl fmt::Debug for KeyId {
 /// cordis::key!(dyn Tools = "tools");
 /// assert_eq!(cordis::KeyId::of::<dyn Tools>().name(), "tools");
 /// ```
-///
-/// A key that takes interception metadata also implements [`Intercept`], naming its [`Merge`]
-/// type and the function that applies it:
-///
-/// ```
-/// use std::sync::Arc;
-///
-/// pub trait Fs: Send + Sync {
-///     fn write(&self, path: &str) -> Result<(), String>;
-/// }
-///
-/// #[derive(Clone, Default)]
-/// pub struct FsMeta {
-///     pub read_only: Option<bool>,
-/// }
-///
-/// impl cordis::Merge for FsMeta {
-///     fn merge(&mut self, right: Self) {
-///         self.read_only.merge(right.read_only);
-///     }
-/// }
-///
-/// struct ReadOnly(Arc<dyn Fs>);
-/// impl Fs for ReadOnly {
-///     fn write(&self, path: &str) -> Result<(), String> {
-///         Err(format!("{path}: read-only"))
-///     }
-/// }
-///
-/// cordis::key!(dyn Fs = "fs", meta = FsMeta, bind = |fs, meta| {
-///     if meta.read_only == Some(true) { Arc::new(ReadOnly(fs)) } else { fs }
-/// });
-/// ```
 #[macro_export]
 macro_rules! key {
     (dyn $service:path = $name:literal) => {
         impl $crate::Key for dyn $service {
             type Value = dyn $service;
             const NAME: &'static str = $name;
-        }
-    };
-    (dyn $service:path = $name:literal, meta = $meta:ty, bind = $bind:expr $(,)?) => {
-        $crate::key!(dyn $service = $name);
-
-        impl $crate::Intercept for dyn $service {
-            type Meta = $meta;
-
-            fn bind(value: ::std::sync::Arc<dyn $service>, meta: &$meta) -> ::std::sync::Arc<dyn $service> {
-                let bind: fn(::std::sync::Arc<dyn $service>, &$meta) -> ::std::sync::Arc<dyn $service> = $bind;
-                bind(value, meta)
-            }
         }
     };
 }

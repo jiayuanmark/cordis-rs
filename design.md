@@ -32,7 +32,7 @@ Rust fixes the *vocabulary* at compile time: which service traits exist, which c
 | The "relied upon" guard, Def 54 | Per-fiber count of committed views that name the fiber |
 | Derived realization, Def 23 | `Scope`: a context derived from a `Cx` or the `App`, discarded by dropping it |
 | Isolation, Defs 24 and 25 | `cx.isolate::<K>()`: the table is keyed by (key, `Realm`), and a fiber's realms are fixed at insertion |
-| Interception, Defs 26 and 27 | The opt-in `Intercept` trait: a `Merge` monoid `Meta` and a `bind` function; `cx.intercept::<K>(meta)` and `deps(k: K = meta)` |
+| Interception, Defs 26 and 27 | `cx.intercept::<K>(\|v\| ...)`: a closure that remaps the provider value for consumers under the scope |
 | Service multiplexing, §6.2 | Cardinality declared on the key: `one` or `many` |
 | Dependency typing and versioning, §6.6 | `TypeId` keys plus trait upcasting between interface versions |
 | Cordis events | Types implementing `Event`, dispatched through the built-in `Events` bus |
@@ -192,7 +192,7 @@ sub.plugin::<ToolRegistry>(()).await?;
 sub.plugin::<AgentLoop>(json!({ "role": "reviewer" })).await?;
 
 // A sandboxed agent receives a read-only file system without being changed.
-cx.intercept::<dyn Fs>(FsMeta { read_only: Some(true), ..Default::default() })
+cx.intercept::<dyn Fs>(|fs| Arc::new(ReadOnly(fs)))
     .plugin::<AgentLoop>(config)
     .await?;
 ```
@@ -207,13 +207,11 @@ cx.intercept::<dyn Fs>(FsMeta { read_only: Some(true), ..Default::default() })
 
 ### Interception
 
-- **Opt-in per key.** A key accepts metadata only if it implements `Intercept: Key`, which `key!(dyn Fs = "fs", meta = FsMeta, bind = ...)` does; `Key` itself is unchanged. `cx.intercept` and `deps(k: K = meta)` require `Intercept`, so attaching metadata to a key that ignores it does not compile.
-- **Metadata is typed per key.** `Intercept::Meta` is a `Merge` monoid: `Default` is the identity, and `merge` is associative and right-biased. `Option<T>` merges as a scalar that the right side overwrites when set.
-- **Carried metadata brings its binder.** A context stores each key's metadata together with a type-erased `bind` captured where `K: Intercept` is known, so resolving a dependency that declares no metadata needs no `Intercept` bound.
-- **The provider function is `Intercept::bind`.** The paper binds each key to a function from metadata to value (Def 26). Here the key declares that function, `bind(value, &meta) -> Arc<Value>`; it can wrap the value or call a method of the service trait, which lets each provider decide how to honour the metadata.
-- **Declared, then carried.** A component declares metadata with `deps(fs: dyn Fs = expr)`. The reactor computes `declared ⊕ carried` once per activation, so the context wins (Def 27), and resolves the field to `K::bind(provider, &merged)`. Without either, `bind` is not called and the consumer receives the provider value itself.
-- **Successive intercepts merge.** `scope.intercept::<K>(a).intercept::<K>(b)` carries `a ⊕ b`.
-- **Fixed per activation.** TypeScript Cordis reads metadata at every access through its context proxy, so updating it needs no reload. Here a consumer holds the bound value in its `Deps`, so metadata is fixed when the fiber is inserted, like its realms. Interception does not affect the reactor's rules: it changes how a binding is used, not which fiber provides it (§4.4).
+- **A closure that remaps the value.** `cx.intercept::<K>(remap)` takes `Fn(Arc<K::Value>) -> Arc<K::Value>`. A consumer instantiated under the scope receives `remap(provider)` in its `cx.deps()` instead of the provider. The closure can wrap the provider (`|fs| Arc::new(ReadOnly(fs))`) or call a method of the service trait that returns a configured view (`|fs| fs.under("/work")`). Any key can be intercepted; neither the key nor the provider has to opt in.
+- **The shared provider is untouched.** Consumers hold the provider through `Arc`, which only hands out `&self`, so the closure cannot change it in place. It returns a new value, usually a wrapper that delegates to the provider, and only consumers under the scope see that value. Everyone else, including `scope.get::<K>()`, still sees the provider itself.
+- **Nested intercepts apply outermost first.** `scope.intercept::<K>(a).intercept::<K>(b)` hands consumers `b(a(provider))`, and a fiber's children inherit its intercepts, so an enclosing component's constraint is applied before the one a nested component adds.
+- **Fixed per activation.** The closure runs once each time a consumer activates, and its result is stored in that consumer's `Deps`. TypeScript Cordis reads interception metadata at every call through its context proxy, so changing it needs no restart; here a consumer must restart to see a different remap. Interception does not affect the reactor's rules: it changes what a consumer receives, not which fiber provides the key (§4.4).
+- **Why a closure and not metadata.** The paper binds each key to a function from metadata to value (Def 26), and TypeScript passes metadata that each service reads. In Rust the remap itself is the natural unit: it is typed by the key, needs no merge rules or per-key metadata type, and leaves the provider in charge of what views it offers through its trait.
 
 ## Configuration
 

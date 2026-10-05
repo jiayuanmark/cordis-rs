@@ -1,7 +1,6 @@
 //! Realms and interception: contexts derived to change how keys resolve for the fibers
 //! instantiated through them.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -13,7 +12,7 @@ use tokio::sync::oneshot;
 use crate::erased::Erased;
 use crate::erased::Factory;
 use crate::reactor::{Command, Spawner};
-use crate::{Component, Fiber, Intercept, Key, KeyId, Merge, Result};
+use crate::{Component, Fiber, Key, KeyId, Result};
 
 /// A namespace of provisions.
 ///
@@ -82,28 +81,19 @@ impl fmt::Debug for Slot {
 }
 
 /// The tables a context carries: the realm of each isolated key (the paper's ρ, Def 24) and
-/// the interception metadata of each intercepted key (ι, Def 26).
+/// the interception of each intercepted key (ι, Def 26).
 ///
 /// A fiber's context is fixed when the fiber is inserted, and its children inherit it. Both
 /// tables are copied on write, so deriving a context leaves the one it derives from intact.
 #[derive(Clone, Default)]
 pub(crate) struct Env {
     realms: Arc<HashMap<KeyId, Realm>>,
-    meta: Arc<HashMap<KeyId, Carried>>,
+    intercepts: Arc<HashMap<KeyId, Remap>>,
 }
 
-/// Metadata a context carries for one key, with the key's binder, so a consumer that declares
-/// no metadata of its own can apply it without naming [`Intercept`].
-#[derive(Clone)]
-struct Carried {
-    meta: Arc<dyn Any + Send + Sync>,
-    bind: fn(&Erased, &(dyn Any + Send + Sync)) -> Erased,
-}
-
-fn bind_erased<K: Intercept + ?Sized>(value: &Erased, meta: &(dyn Any + Send + Sync)) -> Erased {
-    let meta = meta.downcast_ref::<K::Meta>().expect("metadata is stored only under its own key");
-    Erased::new::<K>(K::bind(value.get::<K>(), meta))
-}
+/// An interception with the key's type erased: maps the provider value to the value consumers
+/// under the context receive.
+type Remap = Arc<dyn Fn(Erased) -> Erased + Send + Sync>;
 
 impl Env {
     /// Returns where `key` resolves under this context.
@@ -111,16 +101,10 @@ impl Env {
         Slot { key, realm: self.realms.get(&key).cloned().unwrap_or_else(Realm::shared) }
     }
 
-    /// Returns the metadata this context carries for `K`, if any.
-    pub(crate) fn meta<K: Intercept + ?Sized>(&self) -> Option<&K::Meta> {
-        let carried = self.meta.get(&KeyId::of::<K>())?;
-        Some(carried.meta.downcast_ref().expect("metadata is stored only under its own key"))
-    }
-
-    /// Applies the metadata this context carries for `key`, if any, to a provider value.
-    pub(crate) fn bind(&self, key: KeyId, value: Erased) -> Erased {
-        match self.meta.get(&key) {
-            Some(carried) => (carried.bind)(&value, &*carried.meta),
+    /// Applies this context's interception of `key`, if any, to a provider value.
+    pub(crate) fn remap(&self, key: KeyId, value: Erased) -> Erased {
+        match self.intercepts.get(&key) {
+            Some(remap) => remap(value),
             None => value,
         }
     }
@@ -134,11 +118,18 @@ impl Env {
         }
     }
 
-    fn intercept<K: Intercept + ?Sized>(&mut self, meta: K::Meta) {
-        let mut merged = self.meta::<K>().cloned().unwrap_or_default();
-        merged.merge(meta);
-        let carried = Carried { meta: Arc::new(merged), bind: bind_erased::<K> };
-        Arc::make_mut(&mut self.meta).insert(KeyId::of::<K>(), carried);
+    /// Adds `remap` after any interception of `K` this context already carries.
+    fn intercept<K: Key + ?Sized>(&mut self, remap: impl Fn(Arc<K::Value>) -> Arc<K::Value> + Send + Sync + 'static) {
+        let key = KeyId::of::<K>();
+        let outer = self.intercepts.get(&key).cloned();
+        let composed: Remap = Arc::new(move |value: Erased| {
+            let value = match &outer {
+                Some(outer) => outer(value),
+                None => value,
+            };
+            Erased::new::<K>(remap(value.get::<K>()))
+        });
+        Arc::make_mut(&mut self.intercepts).insert(key, composed);
     }
 }
 
@@ -146,7 +137,7 @@ impl Env {
 /// changes how keys resolve for the fibers instantiated through it.
 ///
 /// [`isolate`](Scope::isolate) moves a key into another realm and
-/// [`intercept`](Scope::intercept) attaches metadata to it; each returns a new scope and
+/// [`intercept`](Scope::intercept) changes the value consumers of a key receive; each returns a new scope and
 /// leaves this one as it was. [`plugin`](Scope::plugin) instantiates a fiber under the scope.
 /// That fiber's own context, and so its children's, inherits every adjustment.
 ///
@@ -182,16 +173,56 @@ impl Scope {
         Scope { env, spawner: self.spawner.clone() }
     }
 
-    /// Returns a scope that carries `meta` for `K`, merged onto what this scope carries and
-    /// taking priority over it.
+    /// Returns a scope whose consumers of `K` receive `remap(provider)` instead of the provider.
     ///
-    /// A consumer of `K` instantiated through the scope receives the provider value with the
-    /// metadata applied by [`Intercept::bind`]. The context's metadata takes priority over what the
-    /// consumer declares in `deps(...)`, so an enclosing component can constrain how a
-    /// component uses a key without changing that component.
-    pub fn intercept<K: Intercept + ?Sized>(&self, meta: K::Meta) -> Scope {
+    /// The shared provider and every other consumer are untouched: `remap` runs once per
+    /// activation of each consumer instantiated through the scope, and its result becomes that
+    /// consumer's field in [`Cx::deps`](crate::Cx::deps). It can wrap the provider, or call a
+    /// method of the service trait that returns a configured view of it, so an enclosing
+    /// component can constrain how a component uses a key without changing that component.
+    /// Return a new value rather than mutating the provider, which other consumers share.
+    ///
+    /// A scope that already intercepts `K` applies its remap first, then this one.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use cordis::{Component, Cx, Result, component, key};
+    ///
+    /// pub trait Fs: Send + Sync {
+    ///     fn write(&self, path: &str) -> Result<()>;
+    /// }
+    /// key!(dyn Fs = "fs");
+    ///
+    /// struct ReadOnly;
+    /// impl Fs for ReadOnly {
+    ///     fn write(&self, path: &str) -> Result<()> {
+    ///         Err(format!("{path}: read-only").into())
+    ///     }
+    /// }
+    ///
+    /// #[component(deps(fs: dyn Fs))]
+    /// struct Agent;
+    /// # impl Component for Agent {
+    /// #     async fn activate(_: Cx<Self>, _: ()) -> Result<Self> { Ok(Agent) }
+    /// # }
+    ///
+    /// #[component]
+    /// struct Sandbox;
+    ///
+    /// impl Component for Sandbox {
+    ///     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+    ///         // This agent's `cx.deps().fs` refuses writes; everyone else's Fs is unchanged.
+    ///         cx.intercept::<dyn Fs>(|_fs| Arc::new(ReadOnly)).plugin::<Agent>(()).await?;
+    ///         Ok(Sandbox)
+    ///     }
+    /// }
+    /// ```
+    pub fn intercept<K: Key + ?Sized>(
+        &self,
+        remap: impl Fn(Arc<K::Value>) -> Arc<K::Value> + Send + Sync + 'static,
+    ) -> Scope {
         let mut env = self.env.clone();
-        env.intercept::<K>(meta);
+        env.intercept::<K>(remap);
         Scope { env, spawner: self.spawner.clone() }
     }
 
@@ -211,8 +242,8 @@ impl Scope {
         self.spawner.insert(Arc::new(Factory::of::<D>()), config, self.env.clone()).await
     }
 
-    /// Returns the current active provider of `K` in the realm this scope resolves it in, with
-    /// no metadata applied.
+    /// Returns the current active provider of `K` in the realm this scope resolves it in, without
+    /// this scope's interception.
     pub async fn get<K: Key + ?Sized>(&self) -> Option<Arc<K::Value>> {
         let commands = self.spawner.commands()?;
         let (reply, answer) = oneshot::channel();
