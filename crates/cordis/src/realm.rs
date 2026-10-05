@@ -177,10 +177,11 @@ impl Scope {
     ///
     /// The shared provider and every other consumer are untouched: `remap` runs once per
     /// activation of each consumer instantiated through the scope, and its result becomes that
-    /// consumer's field in [`Cx::deps`](crate::Cx::deps). It can wrap the provider, or call a
-    /// method of the service trait that returns a configured view of it, so an enclosing
-    /// component can constrain how a component uses a key without changing that component.
-    /// Return a new value rather than mutating the provider, which other consumers share.
+    /// consumer's field in [`Cx::deps`](crate::Cx::deps). Usually it wraps the provider in a type
+    /// that implements the same trait and forwards to it, so an enclosing component can
+    /// constrain how a component uses a key without changing that component or the provider.
+    /// The closure receives the provider through an `Arc`, which other consumers share, so it
+    /// can call only `&self` methods and returns a new value rather than changing the provider.
     ///
     /// A scope that already intercepts `K` applies its remap first, then this one.
     ///
@@ -189,13 +190,18 @@ impl Scope {
     /// use cordis::{Component, Cx, Result, component, key};
     ///
     /// pub trait Fs: Send + Sync {
-    ///     fn write(&self, path: &str) -> Result<()>;
+    ///     fn read(&self, path: &str) -> Result<String>;
+    ///     fn write(&self, path: &str, data: &str) -> Result<()>;
     /// }
     /// key!(dyn Fs = "fs");
     ///
-    /// struct ReadOnly;
+    /// // Written by the sandbox's author; providers of `dyn Fs` need not know about it.
+    /// struct ReadOnly(Arc<dyn Fs>);
     /// impl Fs for ReadOnly {
-    ///     fn write(&self, path: &str) -> Result<()> {
+    ///     fn read(&self, path: &str) -> Result<String> {
+    ///         self.0.read(path)
+    ///     }
+    ///     fn write(&self, path: &str, _: &str) -> Result<()> {
     ///         Err(format!("{path}: read-only").into())
     ///     }
     /// }
@@ -212,7 +218,7 @@ impl Scope {
     /// impl Component for Sandbox {
     ///     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
     ///         // This agent's `cx.deps().fs` refuses writes; everyone else's Fs is unchanged.
-    ///         cx.intercept::<dyn Fs>(|_fs| Arc::new(ReadOnly)).plugin::<Agent>(()).await?;
+    ///         cx.intercept::<dyn Fs>(|fs| Arc::new(ReadOnly(fs))).plugin::<Agent>(()).await?;
     ///         Ok(Sandbox)
     ///     }
     /// }

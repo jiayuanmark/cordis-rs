@@ -153,10 +153,9 @@ async fn descendants_inherit_the_realms_of_their_scope() {
 
 // Interception: consumers under a scope receive a remapped view of the shared file system.
 
+/// An ordinary service trait: nothing in it exists for interception.
 pub trait Fs: Send + Sync {
     fn describe(&self) -> String;
-    /// A view that sees only paths under `prefix`, sharing this file system.
-    fn under(self: Arc<Self>, prefix: &str) -> Arc<dyn Fs>;
 }
 key!(dyn Fs = "fs");
 
@@ -167,10 +166,6 @@ impl Fs for LocalFs {
     fn describe(&self) -> String {
         "/".into()
     }
-
-    fn under(self: Arc<Self>, prefix: &str) -> Arc<dyn Fs> {
-        Arc::new(Under(prefix.into(), self))
-    }
 }
 
 impl Component for LocalFs {
@@ -179,16 +174,15 @@ impl Component for LocalFs {
     }
 }
 
-/// A prefixed view that delegates to the shared file system.
-struct Under(String, Arc<dyn Fs>);
+// Wrappers written by whoever intercepts, not by the provider. Each delegates to the file
+// system it wraps.
+
+/// A view that sees only paths under a prefix.
+struct Under(&'static str, Arc<dyn Fs>);
 
 impl Fs for Under {
     fn describe(&self) -> String {
         format!("{}{}", self.0, self.1.describe())
-    }
-
-    fn under(self: Arc<Self>, prefix: &str) -> Arc<dyn Fs> {
-        Arc::new(Under(prefix.into(), self))
     }
 }
 
@@ -198,10 +192,6 @@ struct ReadOnly(Arc<dyn Fs>);
 impl Fs for ReadOnly {
     fn describe(&self) -> String {
         format!("{} (ro)", self.0.describe())
-    }
-
-    fn under(self: Arc<Self>, prefix: &str) -> Arc<dyn Fs> {
-        Arc::new(Under(prefix.into(), self))
     }
 }
 
@@ -237,7 +227,7 @@ async fn interception_changes_only_the_view_of_consumers_under_the_scope() {
     let app = App::new();
     app.insert::<LocalFs>(json!(null)).await;
     app.insert::<Reader>(named("plain")).await;
-    app.intercept::<dyn Fs>(|fs| fs.under("/work")).plugin::<Reader>(named("work")).await.unwrap();
+    app.intercept::<dyn Fs>(|fs| Arc::new(Under("/work", fs))).plugin::<Reader>(named("work")).await.unwrap();
     app.insert::<Sandbox>(named("sandboxed")).await;
     app.settled().await;
 
@@ -253,9 +243,9 @@ async fn nested_interceptions_apply_outermost_first() {
     let app = App::new();
     app.insert::<LocalFs>(json!(null)).await;
     // The app scope narrows to /jail, then the sandbox inside marks it read-only.
-    app.intercept::<dyn Fs>(|fs| fs.under("/jail")).plugin::<Sandbox>(named("nested")).await.unwrap();
-    app.intercept::<dyn Fs>(|fs| fs.under("/a"))
-        .intercept::<dyn Fs>(|fs| fs.under("/b"))
+    app.intercept::<dyn Fs>(|fs| Arc::new(Under("/jail", fs))).plugin::<Sandbox>(named("nested")).await.unwrap();
+    app.intercept::<dyn Fs>(|fs| Arc::new(Under("/a", fs)))
+        .intercept::<dyn Fs>(|fs| Arc::new(Under("/b", fs)))
         .plugin::<Reader>(named("chained"))
         .await
         .unwrap();
