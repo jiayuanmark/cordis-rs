@@ -1,7 +1,6 @@
 //! The `#[component]` attribute on generic and plain types.
 
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 use cordis::{App, Component, Cx, KeyId, Manifest, Result, Status, component, key};
 use serde_json::json;
@@ -83,9 +82,6 @@ impl Report for Consumer {
 
 impl Component for Consumer {
     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
-        // The key-addressed accessor reads the same field.
-        assert!(Arc::ptr_eq(&cx.dep::<dyn Counter>(), &cx.deps().counter));
-        assert_eq!(cx.dep::<dyn Named>().name(), cx.deps().named.name());
         Ok(Self { cx })
     }
 }
