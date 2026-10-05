@@ -156,7 +156,7 @@ async fn start(tag: &str, parent: serde_json::Value) -> (App, FiberId, FiberId) 
     (app, prompt, parent)
 }
 
-/// Polls until `done` holds; the reactor's work is asynchronous.
+/// Polls until `done` holds; the orchestrator's work is asynchronous.
 async fn until(mut done: impl AsyncFnMut() -> bool) {
     for _ in 0..1000 {
         if done().await {

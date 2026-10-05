@@ -1,4 +1,4 @@
-//! The reactor: one task that owns every fiber and applies lifecycle transitions.
+//! The orchestrator: one task that owns every fiber and applies lifecycle transitions.
 
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
@@ -39,9 +39,9 @@ pub enum Status {
     Failed(String),
 }
 
-/// Handle to a running reactor.
+/// Handle to a running orchestrator.
 ///
-/// Clones share one reactor. The reactor stops when every handle is dropped; call
+/// Clones share one orchestrator. The orchestrator stops when every handle is dropped; call
 /// [`shutdown`](App::shutdown) first to run every component's teardown in dependency order.
 #[derive(Clone)]
 pub struct App {
@@ -50,17 +50,17 @@ pub struct App {
 }
 
 impl App {
-    /// Starts a reactor on the current Tokio runtime.
+    /// Starts an orchestrator on the current Tokio runtime.
     ///
     /// # Panics
     ///
     /// Panics when called outside a Tokio runtime.
     pub fn new() -> Self {
         let (commands, command_rx) = mpsc::unbounded_channel();
-        let (reactor_events, event_rx) = mpsc::unbounded_channel();
+        let (orchestrator_events, event_rx) = mpsc::unbounded_channel();
         let events = Events::default();
-        let reactor = Reactor::new(commands.downgrade(), reactor_events, events.clone());
-        tokio::spawn(reactor.run(command_rx, event_rx));
+        let orchestrator = Orchestrator::new(commands.downgrade(), orchestrator_events, events.clone());
+        tokio::spawn(orchestrator.run(command_rx, event_rx));
         Self { commands, events }
     }
 
@@ -81,7 +81,7 @@ impl App {
     pub(crate) async fn insert_factory(&self, factory: Arc<Factory>, config: Value, env: Env) -> FiberId {
         let (reply, answer) = oneshot::channel();
         self.send(Command::Insert { factory, config, env, parent: None, reply });
-        answer.await.expect("the reactor replies to every command").expect("a root fiber is always inserted")
+        answer.await.expect("the orchestrator replies to every command").expect("a root fiber is always inserted")
     }
 
     /// Returns a scope where `K` resolves in a fresh realm, for inserting root fibers that
@@ -122,7 +122,7 @@ impl App {
     pub async fn status(&self, id: FiberId) -> Option<Status> {
         let (reply, answer) = oneshot::channel();
         self.send(Command::Status { id, reply });
-        answer.await.expect("the reactor replies to every command")
+        answer.await.expect("the orchestrator replies to every command")
     }
 
     /// Returns the fiber a fiber was instantiated under, or `None` for a root fiber and once
@@ -130,14 +130,14 @@ impl App {
     pub async fn parent(&self, id: FiberId) -> Option<FiberId> {
         let (reply, answer) = oneshot::channel();
         self.send(Command::Parent { id, reply });
-        answer.await.expect("the reactor replies to every command")
+        answer.await.expect("the orchestrator replies to every command")
     }
 
     /// Returns the current active provider of `K` in the shared realm, if any.
     pub async fn get<K: Key + ?Sized>(&self) -> Option<Arc<K::Value>> {
         let (reply, answer) = oneshot::channel();
         self.send(Command::Get { slot: Env::default().slot(KeyId::of::<K>()), reply });
-        let value = answer.await.expect("the reactor replies to every command");
+        let value = answer.await.expect("the orchestrator replies to every command");
         value.map(|value| value.get::<K>())
     }
 
@@ -145,7 +145,7 @@ impl App {
     pub async fn settled(&self) {
         let (reply, answer) = oneshot::channel();
         self.send(Command::Settled { reply });
-        answer.await.expect("the reactor replies to every command");
+        answer.await.expect("the orchestrator replies to every command");
     }
 
     /// Retires every fiber and waits until all of them have been torn down.
@@ -155,7 +155,7 @@ impl App {
     }
 
     fn send(&self, command: Command) {
-        self.commands.send(command).expect("the reactor runs while a handle exists");
+        self.commands.send(command).expect("the orchestrator runs while a handle exists");
     }
 }
 
@@ -205,9 +205,9 @@ pub(crate) struct Owner {
     token: u64,
 }
 
-/// A fiber's handle to the reactor, carried by its `Cx`.
+/// A fiber's handle to the orchestrator, carried by its `Cx`.
 ///
-/// The sender is weak, so a `Cx` a component keeps does not keep the reactor running.
+/// The sender is weak, so a `Cx` a component keeps does not keep the orchestrator running.
 #[derive(Clone)]
 pub(crate) struct Control {
     commands: WeakUnboundedSender<Command>,
@@ -232,7 +232,7 @@ impl Control {
 }
 
 /// Where a [`Scope`] inserts fibers: as root fibers of the app, or as children of one
-/// activation, which the reactor retires when that activation ends.
+/// activation, which the orchestrator retires when that activation ends.
 #[derive(Clone)]
 pub(crate) enum Spawner {
     App(WeakUnboundedSender<Command>),
@@ -388,7 +388,7 @@ struct Entry {
     state: State,
 }
 
-struct Reactor {
+struct Orchestrator {
     commands: WeakUnboundedSender<Command>,
     fibers: SlotMap<FiberId, Entry>,
     /// Active provisions, by key and realm. Only `Active` fibers appear here.
@@ -405,7 +405,7 @@ struct Reactor {
     waiters: Vec<oneshot::Sender<()>>,
 }
 
-impl Reactor {
+impl Orchestrator {
     fn new(commands: WeakUnboundedSender<Command>, events: mpsc::UnboundedSender<Event>, bus: Events) -> Self {
         Self {
             commands,

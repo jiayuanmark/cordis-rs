@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 
 use crate::events::{Held, On};
 use crate::guard::Registrations;
-use crate::reactor::Control;
+use crate::orchestrator::Control;
 use crate::{Erased, Event, Events, Fiber, FiberId, Key, KeyId, Realm, Resolve, Result, Scope};
 
 /// A component's declarations: its configuration type, the keys it depends on, and the keys
@@ -43,13 +43,13 @@ pub trait Manifest: Sized + 'static {
 /// A component: the effects of activation, under the declarations of its [`Manifest`].
 ///
 /// The value returned by [`activate`](Component::activate) is the component's accumulator.
-/// When the component must stop, the reactor awaits [`deactivate`](Component::deactivate),
+/// When the component must stop, the orchestrator awaits [`deactivate`](Component::deactivate),
 /// which drops the value and so reverts every effect it holds.
 pub trait Component: Manifest + Send + Sync {
     /// Builds the component from its resolved dependencies.
     ///
     /// Runs only while every declared dependency has an active provider. If a dependency
-    /// changes before this returns, the reactor drops the future at its next `.await`, which
+    /// changes before this returns, the orchestrator drops the future at its next `.await`, which
     /// drops the locals built so far in reverse declaration order.
     fn activate(cx: Cx<Self>, config: Self::Config) -> impl Future<Output = Result<Self>> + Send;
 
@@ -65,7 +65,7 @@ pub trait Component: Manifest + Send + Sync {
 /// The context of one fiber of `C`: its resolved dependencies, the event bus, and the
 /// registrations the fiber owns.
 ///
-/// The reactor constructs it only when every declared key has an active provider. Cloning is
+/// The orchestrator constructs it only when every declared key has an active provider. Cloning is
 /// cheap, so a component can keep a clone as a field and reach its context from ordinary
 /// methods, and from listeners, after `activate` returns:
 ///
@@ -131,7 +131,7 @@ impl<C: Component> Cx<C> {
 
     /// Instantiates a child fiber of component `D` under this fiber, with `config`.
     ///
-    /// The child is an effect of this fiber's current activation: the reactor retires it when
+    /// The child is an effect of this fiber's current activation: the orchestrator retires it when
     /// that activation ends, whether the fiber unloads, its activation is cancelled, or it
     /// fails. Like a root fiber, the child activates once its own dependencies have providers
     /// and reloads when they change. The returned [`Fiber`] reads its status, updates its

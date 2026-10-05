@@ -1,7 +1,7 @@
 //! Components with revertible effects and reactive dependencies.
 //!
 //! A [`Component`] declares, with [`#[component]`](component), the [`Key`]s it depends on and the keys it
-//! provides. An [`App`] runs a reactor that activates each configured component once all of
+//! provides. An [`App`] runs an orchestrator that activates each configured component once all of
 //! its dependencies have an active provider, and deactivates it, consumers first, when that
 //! stops being true. A component's value is its accumulator: dropping it reverts every effect
 //! it holds, such as the [`Guard`]s of its registrations.
@@ -19,7 +19,7 @@ mod events;
 mod guard;
 mod key;
 mod loader;
-mod reactor;
+mod orchestrator;
 mod realm;
 
 pub use component::{Component, Cx, Manifest};
@@ -67,7 +67,7 @@ pub use component::{Component, Cx, Manifest};
 ///
 /// - `deps(name: Key, ...)` generates `{Type}Deps`, a struct with one `pub name: Arc<Key::Value>`
 ///   field per entry and the visibility of the component type, and sets it as
-///   [`Manifest::Deps`]. The reactor resolves it once before activation, and components read
+///   [`Manifest::Deps`]. The orchestrator resolves it once before activation, and components read
 ///   it through [`Cx::deps`]. Only listed keys have a field, so reading an undeclared key does
 ///   not compile, and listing a key twice is rejected. Without `deps`, `Manifest::Deps` is `()` and no struct is generated. The struct
 ///   is not generic, so on a generic component the keys may not name its type parameters.
@@ -124,7 +124,7 @@ pub use events::{DefaultAction, Detached, Event, Events, Flow, Held, Next, On, S
 pub use guard::{Guard, Guards};
 pub use key::{Key, KeyId};
 pub use loader::{Catalog, Layer, LoadError, Loader, Row, Tree};
-pub use reactor::{App, Fiber, FiberId, Status};
+pub use orchestrator::{App, Fiber, FiberId, Status};
 pub use realm::{Realm, Scope};
 
 /// Error returned by component activation.
