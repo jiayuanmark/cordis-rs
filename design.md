@@ -99,7 +99,7 @@ impl Component for GrepTool {
 
 - **One declaration, on the type.** The `#[component]` attribute implements `Manifest` and takes `config`, `deps`, and `provides` in any order, each optional. It reads the type's name and generics from the item it is attached to. The `impl Component` block then holds only behavior, so it stays ordinary, rustfmt-formatted Rust.
 - **Dependencies are a typed struct.** `deps(name: Key, ...)` generates `{Type}Deps` with one `Arc<Key::Value>` field per entry and sets it as `Manifest::Deps`. The registry stays type-erased, because configuration decides at runtime which fiber provides each key; generated code downcasts each entry once, before `activate`, and `Cx<Self>` holds the resulting `Arc<Self::Deps>`. After that, reading a dependency is a field access, with no lookup or cast. This is the pattern of Bevy's `SystemParam` and axum's extractors: the compiler checks the declaration and the runtime only fills it in.
-- **Undeclared access does not compile.** A field that is not declared does not exist. `cx.dep::<K>()`, which reads the same field by key, requires `Self: Has<K>`, and `#[component]` implements `Has` only for the keys in `deps`. The bound carries `#[diagnostic::on_unimplemented]`, so the error names the missing declaration.
+- **Undeclared access does not compile.** Only declared keys have a field in `{Type}Deps`, so `cx.deps()` is the one way to read a dependency, and reading anything else is a missing-field error. `#[component]` also rejects a key listed twice.
 - **Inactive access cannot be expressed.** The reactor constructs `Cx<Self>` only when every dependency has an active provider.
 - **Methods reach the context through a stored `Cx`.** `Cx` is a cheap clone, so a component keeps one as a field and calls `self.cx.deps()` or `self.cx.on::<E>()` from ordinary methods. Every clone registers into the fiber's own set, which is reverted when the fiber unloads; after that `cx.is_live()` is `false` and new registrations revert at once. Closing the set breaks the cycle when a listener captures a `Cx` clone.
 - **A small proc-macro crate.** `cordis-macros` holds only the attribute. A declarative `component!(Name { ... })` would avoid `syn` but has to be told the type's name, and wrapping the struct inside it would take the struct out of rustfmt's reach.
@@ -316,7 +316,7 @@ The harness is a set of crates, each a service trait plus components that provid
 | Gains | Costs |
 |---|---|
 | Effect tracking is ownership | No async `Drop`: cancelled activations get synchronous cleanup only |
-| Undeclared access and invalid provisions are compile errors | Macro-heavy; readable errors depend on `#[diagnostic::on_unimplemented]` |
+| Undeclared access and invalid provisions are compile errors | Macro-heavy; an undeclared read surfaces as a missing field on the generated `{Type}Deps` |
 | Event payloads and modes are checked at compile time | Async listeners take owned or `Arc` arguments, not borrowed ones |
 | Lifecycle transitions are serialized by one owner | No native code replacement; new code arrives through WASM or another process |
 | Versioned, collision-free keys | Width compatibility is limited to what supertraits declare |

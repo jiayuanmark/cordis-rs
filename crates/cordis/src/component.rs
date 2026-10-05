@@ -11,13 +11,13 @@ use crate::erased::Factory;
 use crate::events::{Held, On};
 use crate::guard::Scope;
 use crate::reactor::Control;
-use crate::{Erased, Event, Events, Fiber, FiberId, Key, KeyId, Result};
+use crate::{Erased, Event, Events, Fiber, FiberId, KeyId, Result};
 
 /// A component's declarations: its configuration type, the keys it depends on, and the keys
 /// it provides.
 ///
 /// Implement it with [`#[component]`](crate::component), which also generates the
-/// [`Deps`](Manifest::Deps) struct and implements [`Has`] for each declared dependency.
+/// [`Deps`](Manifest::Deps) struct.
 pub trait Manifest: Sized + 'static {
     /// Configuration deserialized from the component's configuration row.
     type Config: DeserializeOwned + Send + 'static;
@@ -68,20 +68,6 @@ pub trait Component: Manifest + Send + Sync {
 #[error("the fiber's activation has ended, so it cannot instantiate children")]
 struct Ended;
 
-/// Marks `K` as a declared dependency of the component and locates its field in
-/// [`Manifest::Deps`]. [`#[component]`](crate::component) implements it for each key in
-/// `deps`, which makes [`Cx::dep`] reject undeclared keys at compile time.
-#[diagnostic::on_unimplemented(
-    message = "`{K}` is not a declared dependency of `{Self}`",
-    label = "undeclared dependency",
-    note = "add `{K}` to `deps(...)` in the `#[component]` attribute of `{Self}`"
-)]
-pub trait Has<K: Key + ?Sized>: Manifest {
-    /// Returns the field of `deps` that holds the provider of `K`.
-    #[doc(hidden)]
-    fn dep(deps: &Self::Deps) -> &Arc<K::Value>;
-}
-
 /// The context of one fiber of `C`: its resolved dependencies, the event bus, and the
 /// registrations the fiber owns.
 ///
@@ -90,7 +76,6 @@ pub trait Has<K: Key + ?Sized>: Manifest {
 /// methods, and from listeners, after `activate` returns:
 ///
 /// ```
-/// use std::sync::Arc;
 /// use cordis::{Component, Cx, Result, component, key};
 ///
 /// pub trait Fs: Send + Sync {
@@ -231,6 +216,25 @@ impl<C: Component> Cx<C> {
     /// #     }
     /// # }
     /// ```
+    ///
+    /// Only declared dependencies have a field, so reading anything else does not compile:
+    ///
+    /// ```compile_fail
+    /// use cordis::{Component, Cx, Result, component, key};
+    ///
+    /// pub trait Fs: Send + Sync {}
+    /// key!(dyn Fs = "fs");
+    ///
+    /// #[component(deps(fs: dyn Fs))]
+    /// struct Reader;
+    ///
+    /// impl Component for Reader {
+    ///     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+    ///         let _net = &cx.deps().net;
+    ///         Ok(Reader)
+    ///     }
+    /// }
+    /// ```
     pub fn deps(&self) -> &C::Deps {
         &self.deps
     }
@@ -258,54 +262,5 @@ impl<C: Component> Cx<C> {
     /// or fails. Registering after that removes the listener at once.
     pub fn on<E: Event>(&self) -> On<'_, E, E::Mode, Held<'_>> {
         On { events: &self.events, sink: Held(&self.scope), _event: PhantomData }
-    }
-
-    /// Returns the active provider of `K`, which must be a declared dependency.
-    ///
-    /// The same value as the field of [`deps`](Cx::deps) declared for `K`, for code that
-    /// names the key rather than the field.
-    ///
-    /// ```
-    /// use cordis::{Component, Cx, Result, component, key};
-    ///
-    /// pub trait Fs: Send + Sync {}
-    /// key!(dyn Fs = "fs");
-    ///
-    /// #[component(deps(fs: dyn Fs))]
-    /// struct Reader;
-    ///
-    /// impl Component for Reader {
-    ///     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
-    ///         let _fs = cx.dep::<dyn Fs>();
-    ///         Ok(Reader)
-    ///     }
-    /// }
-    /// ```
-    ///
-    /// Reading a key that is not declared does not compile:
-    ///
-    /// ```compile_fail
-    /// use cordis::{Component, Cx, Result, component, key};
-    ///
-    /// pub trait Fs: Send + Sync {}
-    /// key!(dyn Fs = "fs");
-    /// pub trait Net: Send + Sync {}
-    /// key!(dyn Net = "net");
-    ///
-    /// #[component(deps(fs: dyn Fs))]
-    /// struct Reader;
-    ///
-    /// impl Component for Reader {
-    ///     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
-    ///         let _net = cx.dep::<dyn Net>();
-    ///         Ok(Reader)
-    ///     }
-    /// }
-    /// ```
-    pub fn dep<K: Key + ?Sized>(&self) -> Arc<K::Value>
-    where
-        C: Has<K>,
-    {
-        C::dep(&self.deps).clone()
     }
 }

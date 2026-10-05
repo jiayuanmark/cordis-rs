@@ -2,7 +2,7 @@
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{format_ident, quote, quote_spanned};
+use quote::{ToTokens, format_ident, quote, quote_spanned};
 use syn::meta::ParseNestedMeta;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
@@ -39,7 +39,15 @@ impl Declaration {
             if self.deps.is_some() {
                 return Err(duplicate("deps"));
             }
-            self.deps = Some(list(&meta)?);
+            let deps: Vec<Dep> = list(&meta)?;
+            // Compared as written, which catches the common slip of listing a key twice.
+            let mut seen = std::collections::HashSet::new();
+            for dep in &deps {
+                if !seen.insert(dep.key.to_token_stream().to_string()) {
+                    return Err(syn::Error::new_spanned(&dep.key, "this key is already listed in `deps`"));
+                }
+            }
+            self.deps = Some(deps);
         } else if meta.path.is_ident("provides") {
             if self.provides.is_some() {
                 return Err(duplicate("provides"));
@@ -78,6 +86,8 @@ impl Declaration {
             });
             let struct_def = quote! {
                 #[doc = #doc]
+                // A component may declare a dependency only to be ordered after its provider.
+                #[allow(dead_code)]
                 #vis struct #deps_name {
                     #(#fields),*
                 }
@@ -87,15 +97,6 @@ impl Declaration {
         let resolve = deps.iter().map(|Dep { name, key }| quote! { #name: ::cordis::Erased::find::<#key>(resolved) });
         let resolve = if deps.is_empty() { quote!() } else { quote!(#deps_type { #(#resolve),* }) };
         let keys = deps.iter().map(|dep| &dep.key);
-        let has = deps.iter().map(|Dep { name: field, key }| {
-            quote_spanned! {key.span()=>
-                impl #impl_generics ::cordis::Has<#key> for #name #ty_generics #where_clause {
-                    fn dep(deps: &Self::Deps) -> &::std::sync::Arc<<#key as ::cordis::Key>::Value> {
-                        &deps.#field
-                    }
-                }
-            }
-        });
         quote! {
             #deps_struct
 
@@ -124,7 +125,6 @@ impl Declaration {
                 }
             }
 
-            #(#has)*
         }
     }
 }

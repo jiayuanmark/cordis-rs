@@ -16,9 +16,9 @@ mod key;
 mod loader;
 mod reactor;
 
-pub use component::{Component, Cx, Has, Manifest};
+pub use component::{Component, Cx, Manifest};
 /// Declares a component's configuration, dependencies, and provisions by implementing
-/// [`Manifest`] and [`Has`] for the type it is attached to, and generates a struct of its
+/// [`Manifest`] for the type it is attached to, and generates a struct of its
 /// resolved dependencies.
 ///
 /// ```
@@ -62,9 +62,8 @@ pub use component::{Component, Cx, Has, Manifest};
 /// - `deps(name: Key, ...)` generates `{Type}Deps`, a struct with one `pub name: Arc<Key::Value>`
 ///   field per entry and the visibility of the component type, and sets it as
 ///   [`Manifest::Deps`]. The reactor resolves it once before activation, and components read
-///   it through [`Cx::deps`]. It also implements [`Has<K>`](Has) for each listed key, so
-///   [`Cx::dep`] compiles only for listed keys. Listing a key twice is a conflicting-impl
-///   error. Without `deps`, `Manifest::Deps` is `()` and no struct is generated. The struct
+///   it through [`Cx::deps`]. Only listed keys have a field, so reading an undeclared key does
+///   not compile, and listing a key twice is rejected. Without `deps`, `Manifest::Deps` is `()` and no struct is generated. The struct
 ///   is not generic, so on a generic component the keys may not name its type parameters.
 /// - `provides(...)` publishes the component's `Arc` as `Arc<K::Value>` for each listed key
 ///   `K`. The coercion is written once per key, so it fails to compile when the component
@@ -78,6 +77,18 @@ pub use component::{Component, Cx, Has, Manifest};
 ///
 /// #[component(provides(dyn Tools))]
 /// struct NotTools;
+/// ```
+///
+/// A key listed twice is rejected:
+///
+/// ```compile_fail
+/// use cordis::{component, key};
+///
+/// pub trait Fs: Send + Sync {}
+/// key!(dyn Fs = "fs");
+///
+/// #[component(deps(a: dyn Fs, b: dyn Fs))]
+/// struct Twice;
 /// ```
 ///
 /// A dependency without a field name is rejected:

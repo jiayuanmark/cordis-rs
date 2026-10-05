@@ -66,7 +66,7 @@ impl Greet for Greeter {
     fn greet_everyone_named(&self) {
         // The listener captures a clone of the `Cx` that owns it.
         let cx = self.cx.clone();
-        self.cx.on::<Named>().listen(move |name| record(format!("{} {name}", cx.dep::<dyn Salutation>().text())));
+        self.cx.on::<Named>().listen(move |name| record(format!("{} {name}", cx.deps().salutation.text())));
     }
 }
 
