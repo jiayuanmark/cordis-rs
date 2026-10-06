@@ -137,3 +137,39 @@ async fn get_reads_the_provider_when_awaited() {
     app.settled().await;
     assert_eq!(get.await.map(|named| named.name()), Some("alpha"));
 }
+
+// A component declared inside a `macro_rules!` macro, with the key passed in by name.
+struct Second;
+impl cordis::Key for Second {
+    type Value = dyn Named;
+    const NAME: &'static str = "second";
+}
+
+macro_rules! named {
+    ($component:ident: $key:ident = $name:literal) => {
+        #[component(provides($key))]
+        struct $component;
+
+        impl Named for $component {
+            fn name(&self) -> &'static str {
+                $name
+            }
+        }
+
+        impl Component for $component {
+            async fn activate(_: Cx<Self>, _: ()) -> Result<Self> {
+                Ok($component)
+            }
+        }
+    };
+}
+
+named!(Beta: Second = "beta");
+
+#[tokio::test]
+async fn a_component_declared_by_a_macro_provides_its_key() {
+    let app = App::new();
+    app.insert::<Beta>(json!(null)).await;
+    app.settled().await;
+    assert_eq!(app.get::<Second>().await.unwrap().name(), "beta");
+}
