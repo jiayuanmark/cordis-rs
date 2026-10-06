@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, Weak};
 use futures::future::join_all;
 
 use crate::Guard;
-use crate::dispose::Undo;
+use crate::dispose::UndoHandle;
 use crate::erased::BoxFuture;
 
 /// An event type: its name, dispatch mode, payload, and result.
@@ -276,7 +276,7 @@ impl Sink for Detached {
 }
 
 /// Hands the guard to the registering fiber's undo list, which drops it when the fiber unloads.
-pub struct Held<'a>(pub(crate) &'a Undo);
+pub struct Held<'a>(pub(crate) &'a UndoHandle);
 
 impl Sink for Held<'_> {
     type Out = ();

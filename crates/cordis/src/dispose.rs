@@ -3,7 +3,7 @@
 use std::any::Any;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use futures::FutureExt;
@@ -21,7 +21,8 @@ const SLOW_UNDO: Duration = Duration::from_secs(5);
 ///
 /// - [`Guard`]: dropped, which runs its inverse; [`Guards`] likewise, newest first.
 /// - Tokio's [`JoinHandle`]: the task is aborted, then awaited until it has stopped, so
-///   everything it owns is dropped before the next undo starts.
+///   everything it owns is dropped before the next undo starts. A `spawn_blocking` task cannot
+///   be aborted once it has started, so disposal waits until its closure returns.
 /// - Async closures, `FnOnce() -> impl Future<Output = ()>`: called, and the future awaited.
 ///
 /// Implement it for a type with an asynchronous close, such as a connection.
@@ -100,15 +101,23 @@ impl<D: Dispose> Entry for D {
 /// that remains, so pushing stays cheap.
 const PRUNE_AT: usize = 32;
 
-/// The undo list of one fiber run. Clones share one list.
+/// The undo list of one fiber run, as its owners hold it: the activation task, then the
+/// fiber's instance.
 ///
-/// Every `Cx` of the run adds to it: [`Cx::on_dispose`](crate::Cx::on_dispose) entries,
-/// listeners registered with `cx.on`, and children instantiated with `cx.plugin`. The runtime
-/// runs it once, when the run unloads, fails, or is cancelled, and closes it first. An entry
-/// added after that is undone at once, so nothing a run registers can outlive it, even when a
-/// listener or a stored component keeps a clone of its `Cx`.
+/// Every `Cx` of the run adds to it through an [`UndoHandle`]: [`Cx::on_dispose`](crate::Cx::on_dispose)
+/// entries, listeners registered with `cx.on`, and children instantiated with `cx.plugin`. The
+/// runtime runs it once, when the run unloads, fails, or is cancelled, and closes it first. An
+/// entry added after that is undone at once, so nothing a run registers can outlive it.
 #[derive(Clone)]
 pub(crate) struct Undo(Arc<List>);
+
+/// A handle to a run's undo list, as every `Cx` of the run holds it.
+///
+/// It does not keep the list alive, so a `Cx` captured by a listener or by an undo cannot keep
+/// the run's effects in place: when the owners drop the list without running it, because the
+/// app was dropped, the list undoes its entries anyway.
+#[derive(Clone)]
+pub(crate) struct UndoHandle(Weak<List>);
 
 /// `None` once the list has been closed.
 struct List(Mutex<Option<Open>>);
@@ -128,13 +137,37 @@ impl Open {
     }
 }
 
+impl List {
+    /// Locks the list. A panic while it was locked (in an `is_finished`) leaves it consistent,
+    /// so poisoning is ignored.
+    fn lock(&self) -> MutexGuard<'_, Option<Open>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn push(&self, entry: Box<dyn Entry>) {
+        let mut list = self.lock();
+        match list.as_mut() {
+            Some(open) => open.push(entry),
+            None => {
+                drop(list);
+                undo_late(entry);
+            }
+        }
+    }
+
+    /// Closes the list and returns its entries, newest first.
+    fn close(&self) -> impl Iterator<Item = Box<dyn Entry>> + use<> {
+        let open = self.lock().take();
+        open.map(|open| open.entries).unwrap_or_default().into_iter().rev()
+    }
+}
+
 impl Drop for List {
     /// A list dropped without being run, because the app was dropped while the run was live,
     /// undoes its entries newest first as late entries: the synchronous parts in order now, and
     /// the rest concurrently on the runtime.
     fn drop(&mut self) {
-        let open = self.0.get_mut().unwrap_or_else(PoisonError::into_inner).take();
-        for entry in open.map(|open| open.entries).unwrap_or_default().into_iter().rev() {
+        for entry in self.close() {
             undo_late(entry);
         }
     }
@@ -145,32 +178,38 @@ impl Undo {
         Self(Arc::new(List(Mutex::new(Some(Open { entries: Vec::new(), prune_at: PRUNE_AT })))))
     }
 
-    /// Adds `undo` to run before every entry already in the list, or undoes it now if the list
-    /// has been closed.
-    pub(crate) fn push(&self, undo: impl Dispose) {
-        let entry: Box<dyn Entry> = Box::new(undo);
-        let mut list = self.0.0.lock().unwrap();
-        match list.as_mut() {
-            Some(open) => open.push(entry),
-            None => {
-                drop(list);
-                undo_late(entry);
-            }
-        }
-    }
-
-    pub(crate) fn is_open(&self) -> bool {
-        self.0.0.lock().unwrap().is_some()
+    pub(crate) fn handle(&self) -> UndoHandle {
+        UndoHandle(Arc::downgrade(&self.0))
     }
 
     /// Closes the list and runs it newest first, each undo finishing before the next starts.
     ///
     /// A panicking undo is logged, and the rest still run.
     pub(crate) async fn run(&self) {
-        let open = self.0.0.lock().unwrap().take();
-        for entry in open.map(|open| open.entries).unwrap_or_default().into_iter().rev() {
+        for entry in self.0.close() {
             undo(entry).await;
         }
+    }
+}
+
+impl UndoHandle {
+    /// Returns the list while one of its owners still holds it.
+    pub(crate) fn upgrade(&self) -> Option<Undo> {
+        self.0.upgrade().map(Undo)
+    }
+
+    /// Adds `undo` to run before every entry already in the list, or undoes it now if the list
+    /// has been closed.
+    pub(crate) fn push(&self, undo: impl Dispose) {
+        let entry: Box<dyn Entry> = Box::new(undo);
+        match self.0.upgrade() {
+            Some(list) => list.push(entry),
+            None => undo_late(entry),
+        }
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.0.upgrade().is_some_and(|list| list.lock().is_some())
     }
 }
 
@@ -257,14 +296,15 @@ mod tests {
     async fn entries_run_newest_first_and_late_entries_run_at_once() {
         let (log, guard) = log();
         let undo = Undo::new();
-        undo.push(guard("first"));
-        undo.push(guard("second"));
-        assert!(undo.is_open());
+        let handle = undo.handle();
+        handle.push(guard("first"));
+        handle.push(guard("second"));
+        assert!(handle.is_open());
 
         undo.run().await;
-        assert!(!undo.is_open());
+        assert!(!handle.is_open());
         assert_eq!(*log.lock().unwrap(), ["second", "first"]);
-        undo.push(guard("late"));
+        handle.push(guard("late"));
         assert_eq!(*log.lock().unwrap(), ["second", "first", "late"]);
     }
 
@@ -272,10 +312,14 @@ mod tests {
     fn a_list_dropped_without_running_undoes_its_entries() {
         let (log, guard) = log();
         let undo = Undo::new();
-        undo.push(guard("first"));
-        undo.push(guard("second"));
+        let handle = undo.handle();
+        handle.push(guard("first"));
+        handle.push(guard("second"));
         drop(undo);
         assert_eq!(*log.lock().unwrap(), ["second", "first"]);
+        assert!(!handle.is_open());
+        handle.push(guard("late"));
+        assert_eq!(*log.lock().unwrap(), ["second", "first", "late"]);
     }
 
     #[tokio::test]
@@ -286,9 +330,9 @@ mod tests {
             while !task.is_finished() {
                 tokio::task::yield_now().await;
             }
-            undo.push(task);
+            undo.handle().push(task);
         }
-        let len = undo.0.0.lock().unwrap().as_ref().unwrap().entries.len();
+        let len = undo.0.lock().as_ref().unwrap().entries.len();
         assert!(len <= PRUNE_AT, "{len} entries kept");
     }
 
@@ -296,8 +340,8 @@ mod tests {
     fn a_late_entry_without_a_runtime_runs_its_synchronous_part() {
         let (log, guard) = log();
         let undo = Undo::new();
-        *undo.0.0.lock().unwrap() = None;
-        undo.push(guard("late"));
+        undo.0.close().for_each(drop);
+        undo.handle().push(guard("late"));
         assert_eq!(*log.lock().unwrap(), ["late"]);
     }
 }

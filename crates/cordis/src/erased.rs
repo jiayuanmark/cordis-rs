@@ -98,7 +98,7 @@ fn activate<C: Component>(
     Box::pin(async move {
         let config: C::Config = serde_json::from_value(config)?;
         let deps = Arc::new(C::resolve(&Resolve { values: &deps, env: control.env() }));
-        let undo = control.undo().clone();
+        let undo = control.undo().upgrade().expect("the activation task holds its run's undo list");
         let component = C::activate(Cx::new(deps, events, control), config).await?;
         Ok(Box::new(Active { component: Arc::new(component), undo }) as Box<dyn Instance>)
     })
