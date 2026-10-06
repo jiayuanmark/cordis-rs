@@ -236,6 +236,56 @@ async fn a_failed_activation_is_isolated_and_retried_after_a_configuration_chang
     assert_eq!(app.status(flaky).await, Some(Status::Active));
 }
 
+pub trait Database: Send + Sync {
+    fn ready(&self) -> bool;
+}
+key!(dyn Database = "database");
+
+#[derive(Deserialize)]
+struct DatabaseConfig {
+    ready: bool,
+}
+
+#[component(config = DatabaseConfig, provides(dyn Database))]
+struct Postgres(bool);
+
+impl Database for Postgres {
+    fn ready(&self) -> bool {
+        self.0
+    }
+}
+
+impl Component for Postgres {
+    async fn activate(_: Cx<Self>, config: DatabaseConfig) -> Result<Self> {
+        Ok(Postgres(config.ready))
+    }
+}
+
+/// Fails while its database isn't ready.
+#[component(deps(db: dyn Database))]
+struct WebServer;
+
+impl Component for WebServer {
+    async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+        if cx.deps().db.ready() { Ok(WebServer) } else { Err("database not ready".into()) }
+    }
+}
+
+#[tokio::test]
+async fn a_failed_consumer_retries_when_its_provider_restarts() {
+    let app = App::new();
+    let db = app.insert::<Postgres>(json!({ "ready": false })).await;
+    let web = app.insert::<WebServer>(json!(null)).await;
+    app.settled().await;
+    assert_eq!(app.status(web).await, Some(Status::Failed("database not ready".into())));
+
+    // Same fiber, new activation: the consumer's view changes, so it retries.
+    app.update(db, json!({ "ready": true }));
+    app.settled().await;
+    assert_eq!(app.status(db).await, Some(Status::Active));
+    assert_eq!(app.status(web).await, Some(Status::Active));
+}
+
 #[component(config = Tag, deps(prompt: dyn Prompt))]
 struct Slow;
 
