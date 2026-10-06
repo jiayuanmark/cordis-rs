@@ -4,16 +4,12 @@ use std::any::Any;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
-use std::time::Duration;
 
 use futures::FutureExt;
 use tokio::task::JoinHandle;
 
 use crate::erased::BoxFuture;
 use crate::{Guard, Guards};
-
-/// How long an undo may run before the runtime warns that it is still running.
-const SLOW_UNDO: Duration = Duration::from_secs(5);
 
 /// Something a fiber undoes when it is disposed. Pass it to [`Cx::on_dispose`](crate::Cx::on_dispose).
 ///
@@ -233,24 +229,8 @@ fn report(result: std::thread::Result<()>) {
 }
 
 async fn undo(entry: Box<dyn Entry>) {
-    let Some(mut future) = start(entry) else { return };
-    // Most undos finish at once and need no timer.
-    if let Some(result) = (&mut future).now_or_never() {
-        return report(result);
-    }
-    let mut waited = Duration::ZERO;
-    loop {
-        // A runtime without timers can't warn about a slow undo; the undo still runs.
-        let Ok(slow) = catch_unwind(|| tokio::time::sleep(SLOW_UNDO)) else {
-            return report(future.await);
-        };
-        tokio::select! {
-            result = &mut future => return report(result),
-            () = slow => {
-                waited += SLOW_UNDO;
-                tracing::warn!(seconds = waited.as_secs(), "an undo is still running; the fiber's providers wait for it");
-            }
-        }
+    if let Some(future) = start(entry) {
+        report(future.await);
     }
 }
 
