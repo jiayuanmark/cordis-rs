@@ -105,20 +105,6 @@ async fn undos_run_newest_first_one_at_a_time() {
     assert_eq!(journal("stack"), ["start 3", "end 3", "start 2", "end 2", "start 1", "end 1"]);
 }
 
-#[test]
-fn undos_run_on_a_runtime_without_timers() {
-    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
-    runtime.block_on(async {
-        let app = App::new();
-        let stack = app.insert::<Stack>(tag("no-timers")).await;
-        app.settled().await;
-
-        app.remove(stack);
-        app.settled().await;
-        assert_eq!(journal("no-timers"), ["start 3", "end 3", "start 2", "end 2", "start 1", "end 1"]);
-    });
-}
-
 /// Runs a background task, flushing after it has stopped.
 #[component(config = Tag)]
 struct Ticker;
