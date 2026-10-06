@@ -66,11 +66,15 @@ impl Declaration {
         let config = self.config.map_or_else(|| quote!(()), |config| quote!(#config));
         let deps = self.deps.unwrap_or_default();
         let provides = self.provides.unwrap_or_default();
+        // The parameter of `publish`. Named with the call site's span: inside the key-spanned
+        // code below, a plain `component` would take the key's hygiene, and miss the parameter
+        // when the key was written inside a `macro_rules!` macro.
+        let component = Ident::new("component", proc_macro2::Span::call_site());
         let publish = provides.iter().map(|key| {
             // Spanned at the key, so a component that does not implement the key's value type
             // gets the error on that key.
             quote_spanned! {key.span()=> {
-                let value: ::std::sync::Arc<<#key as ::cordis::Key>::Value> = component.clone();
+                let value: ::std::sync::Arc<<#key as ::cordis::Key>::Value> = #component.clone();
                 (::cordis::KeyId::of::<#key>(), ::cordis::Erased::new::<#key>(value))
             }}
         });
