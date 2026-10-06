@@ -50,7 +50,7 @@ Implemented:
 
 - Keys as types, with compile-time rejection of undeclared dependencies and invalid provisions.
 - One undo list per fiber run: `cx.on_dispose` takes a `Guard`, a Tokio `JoinHandle`, or an async closure; listeners and children join the same list, undone newest first, one at a time, when the fiber unloads or its activation is cancelled or fails.
-- Reactive activation and deactivation, including cascades, the "relied upon" teardown guard, cancellation of in-flight activations, exclusive providers with takeover, configuration reloads, and per-fiber failure.
+- Reactive activation and deactivation, including cascades, the "relied upon" teardown guard, cancellation of in-flight activations (signalled through `cx.cancelled()`, never by dropping `activate` mid-step), exclusive providers with takeover, configuration reloads, and per-fiber failure.
 - Typed events with `Emit`, `Bail`, `Parallel`, `Serial`, and `Waterfall` dispatch; listeners registered through `Cx` are removed when their fiber unloads or its activation is cancelled or fails.
 - Layered configuration: `Tree::layered` merges YAML layers by row id (override set fields, replace `config` whole, toggle `disabled`, append new rows).
 - A YAML loader that validates a whole tree (unknown components, invalid configuration, missing providers, cycles) before reconciling it.

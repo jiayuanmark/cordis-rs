@@ -2,7 +2,6 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use cordis::{App, Component, Cx, Events, Flow, Result, Status, component, event};
 use serde::Deserialize;
@@ -148,7 +147,7 @@ struct StallConfig {
     fail: bool,
 }
 
-/// Registers a listener, then either fails or never finishes activating.
+/// Registers a listener, then either fails or waits until it is cancelled.
 #[component(config = StallConfig)]
 struct Stall;
 
@@ -159,8 +158,8 @@ impl Component for Stall {
         if config.fail {
             return Err("stalled".into());
         }
-        tokio::time::sleep(Duration::from_secs(3600)).await;
-        unreachable!("the test cancels this activation");
+        cx.cancelled().await;
+        Err("cancelled".into())
     }
 }
 

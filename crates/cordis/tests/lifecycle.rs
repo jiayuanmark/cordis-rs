@@ -290,12 +290,12 @@ async fn a_failed_consumer_retries_when_its_provider_restarts() {
 struct Slow;
 
 impl Component for Slow {
-    async fn activate(_: Cx<Self>, config: Tag) -> Result<Self> {
+    async fn activate(cx: Cx<Self>, config: Tag) -> Result<Self> {
         let tag = config.tag.clone();
-        let _partial = Guard::new(move || record(&tag, "revert partial activation"));
+        cx.on_dispose(Guard::new(move || record(&tag, "revert partial activation")));
         record(&config.tag, "activation started");
-        tokio::time::sleep(Duration::from_secs(3600)).await;
-        unreachable!("the test cancels this activation");
+        cx.cancelled().await;
+        Err("cancelled".into())
     }
 }
 

@@ -48,10 +48,11 @@ pub trait Manifest: Sized + 'static {
 pub trait Component: Manifest + Send + Sync {
     /// Builds the component from its resolved dependencies.
     ///
-    /// Runs only while every declared dependency has an active provider. If a dependency
-    /// changes before this returns, the orchestrator drops the future at its next `.await`, which
-    /// drops the locals built so far in reverse declaration order, and then runs the inverses
-    /// handed to [`Cx::on_dispose`] so far.
+    /// Runs only while every declared dependency has an active provider. The orchestrator never
+    /// stops it partway: if a dependency changes before it returns, [`Cx::cancelled`] resolves,
+    /// and once it returns, the inverses handed to [`Cx::on_dispose`] are run. A long wait should
+    /// therefore also wait on `cx.cancelled()` and return early; a cancelled activation that
+    /// returns an error is not marked failed.
     fn activate(cx: Cx<Self>, config: Self::Config) -> impl Future<Output = Result<Self>> + Send;
 }
 
@@ -324,6 +325,33 @@ impl<C: Component> Cx<C> {
     /// Once the run has been disposed (see [`is_live`](Cx::is_live)), `undo` is undone at once.
     pub fn on_dispose(&self, undo: impl Dispose) {
         self.control.undo().push(undo);
+    }
+
+    /// Resolves once this run should stop: a dependency changed while `activate` was running,
+    /// the fiber has started to unload, or the app was dropped. It also resolves once the
+    /// activation has failed, so a `Cx` kept from a failed run sees it.
+    ///
+    /// `activate` is never dropped at an `.await`, because that could stop it between an effect
+    /// and the `on_dispose` that undoes it. Instead, a wait that may take long races this:
+    ///
+    /// ```
+    /// # use cordis::{Component, Cx, Result, component};
+    /// # async fn connect() -> std::io::Result<()> { Ok(()) }
+    /// #[component]
+    /// struct Client;
+    ///
+    /// impl Component for Client {
+    ///     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+    ///         tokio::select! {
+    ///             connected = connect() => connected?,
+    ///             () = cx.cancelled() => return Err("cancelled".into()),
+    ///         }
+    ///         Ok(Client)
+    ///     }
+    /// }
+    /// ```
+    pub async fn cancelled(&self) {
+        self.control.cancel().cancelled().await;
     }
 
     /// Returns whether this fiber run is still live, so that what is added through this

@@ -2,13 +2,15 @@
 //! and when.
 
 use std::collections::HashMap;
-use std::future::Ready;
-use std::sync::Mutex;
+use std::future::{Future, Ready};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cordis::{App, Component, Cx, Guard, Result, Status, component, event, key};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::sync::Notify;
 
 // Journal shared by the components below. Tests run in parallel, so each entry carries the
 // test's tag.
@@ -258,14 +260,14 @@ impl Component for Unfinished {
             "fail" => Err("unfinished".into()),
             _ => {
                 let _bomb = Bomb;
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-                unreachable!("the test cancels this activation");
+                cx.cancelled().await;
+                Err("cancelled".into())
             }
         }
     }
 }
 
-/// Panics when dropped, as a local of a cancelled activation.
+/// Panics when dropped, as a local of an activation that returns because it was cancelled.
 struct Bomb;
 
 impl Drop for Bomb {
@@ -351,6 +353,7 @@ async fn an_undo_added_after_disposal_runs_at_once() {
     app.remove(keeper);
     app.settled().await;
     assert!(!cx.is_live());
+    tokio::time::timeout(Duration::from_secs(5), cx.cancelled()).await.expect("cancelled once the fiber leaves");
     cx.on_dispose(Guard::new(|| record("late", "guard")));
     assert_eq!(journal("late"), ["guard"]);
 
@@ -414,4 +417,108 @@ async fn an_activation_that_ended_cannot_instantiate_children_while_it_is_undone
     app.insert::<LateParent>(tag("late-parent")).await;
     app.settled().await;
     assert_eq!(journal("late-parent"), ["plugin refused: true"]);
+}
+
+pub trait Registry: Send + Sync {
+    /// Registers `name` at once, then finishes setting it up; the guard comes back at the end.
+    fn add(self: Arc<Self>, name: String) -> Pin<Box<dyn Future<Output = Guard> + Send>>;
+}
+key!(dyn Registry = "registry");
+
+static SETUP: Notify = Notify::const_new();
+
+#[component(config = Tag, provides(dyn Registry))]
+struct SlowRegistry(String);
+
+impl Registry for SlowRegistry {
+    fn add(self: Arc<Self>, name: String) -> Pin<Box<dyn Future<Output = Guard> + Send>> {
+        record(&self.0, format!("registered {name}"));
+        Box::pin(async move {
+            SETUP.notified().await;
+            Guard::new(move || record(&self.0, format!("unregistered {name}")))
+        })
+    }
+}
+
+impl Component for SlowRegistry {
+    async fn activate(_: Cx<Self>, config: Tag) -> Result<Self> {
+        Ok(SlowRegistry(config.tag))
+    }
+}
+
+#[component(deps(registry: dyn Registry))]
+struct SearchTool;
+
+impl Component for SearchTool {
+    async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+        let registration = cx.deps().registry.clone().add("search".into()).await;
+        cx.on_dispose(registration);
+        Ok(SearchTool)
+    }
+}
+
+#[tokio::test]
+async fn an_activation_cancelled_mid_step_still_undoes_that_step() {
+    let app = App::new();
+    let registry = app.insert::<SlowRegistry>(tag("mid-step")).await;
+    app.insert::<SearchTool>(json!(null)).await;
+    until(|| journal("mid-step") == ["registered search"]).await;
+
+    // The registry leaves while the tool's activation is inside `add`, between the effect and
+    // the guard that undoes it.
+    app.remove(registry);
+    tokio::task::yield_now().await;
+    SETUP.notify_one();
+    app.settled().await;
+    assert_eq!(journal("mid-step"), ["registered search", "unregistered search"]);
+}
+
+/// Adds an undo, then waits until its run is cancelled.
+#[component(config = Tag)]
+struct Waiter;
+
+impl Component for Waiter {
+    async fn activate(cx: Cx<Self>, config: Tag) -> Result<Self> {
+        let tag = config.tag;
+        let undone = tag.clone();
+        cx.on_dispose(Guard::new(move || record(&undone, "undone")));
+        record(&tag, "started");
+        cx.cancelled().await;
+        Err("cancelled".into())
+    }
+}
+
+#[tokio::test]
+async fn dropping_the_app_cancels_a_run_still_activating() {
+    let app = App::new();
+    app.insert::<Waiter>(tag("dropped mid-activate")).await;
+    until(|| journal("dropped mid-activate") == ["started"]).await;
+
+    drop(app);
+    until(|| journal("dropped mid-activate") == ["started", "undone"]).await;
+}
+
+static QUITTERS: Mutex<Vec<Cx<Quitter>>> = Mutex::new(Vec::new());
+
+/// Keeps its `Cx` where the test can reach it, then fails.
+#[component]
+struct Quitter;
+
+impl Component for Quitter {
+    async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+        QUITTERS.lock().unwrap().push(cx);
+        Err("quit".into())
+    }
+}
+
+#[tokio::test]
+async fn a_failed_run_is_cancelled() {
+    let app = App::new();
+    let quitter = app.insert::<Quitter>(json!(null)).await;
+    app.settled().await;
+    assert_eq!(app.status(quitter).await, Some(Status::Failed("quit".into())));
+
+    let cx = QUITTERS.lock().unwrap().pop().expect("the run kept its context");
+    assert!(!cx.is_live());
+    tokio::time::timeout(Duration::from_secs(5), cx.cancelled()).await.expect("cancelled once the run fails");
 }
