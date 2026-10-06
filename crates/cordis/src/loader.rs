@@ -1,6 +1,7 @@
 //! Configuration trees: validate them, then reconcile them against a running [`App`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -177,6 +178,8 @@ impl Layer {
 }
 
 /// A configuration tree that cannot be applied. Nothing in the running app changes.
+///
+/// A tree whose rows only lack providers is not an error; see [`LoadWarning`].
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
     /// The YAML text does not describe a tree.
@@ -201,32 +204,56 @@ pub enum LoadError {
     /// A row's configuration does not deserialize into its component's `Config`.
     #[error("row `{row}` has invalid config: {message}")]
     InvalidConfig { row: String, message: String },
+    /// A row isolates a key that no registered component depends on or provides.
+    #[error("row `{row}` isolates unknown key `{key}`")]
+    UnknownKey { row: String, key: String },
+}
+
+/// Something an applied tree leaves its rows waiting on, unless a provider outside the tree fills
+/// the gap. The tree is applied anyway: the rows' fibers wait, as any fiber waits for a provider
+/// that isn't there yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoadWarning {
     /// A row depends on a key that no enabled row provides in the realm the row resolves it in.
-    #[error("row `{row}` depends on `{key}`{}, which no enabled row provides there", in_realm(.realm))]
+    /// The check reads the tree only: the row still activates if something else provides the
+    /// key there, such as a fiber the host inserts or a child fiber of another row.
     MissingProvider {
         row: String,
         key: &'static str,
         /// The realm the row's `isolate` names for the key, or `None` for the shared realm.
         realm: Option<String>,
     },
-    /// A row isolates a key that no registered component depends on or provides.
-    #[error("row `{row}` isolates unknown key `{key}`")]
-    UnknownKey { row: String, key: String },
-    /// Enabled rows depend on each other in a cycle, so none of them could activate.
-    #[error("dependency cycle: {}", .0.join(" -> "))]
+    /// Enabled rows depend on each other in a cycle, so none of them activates unless
+    /// something outside the cycle provides one of its keys.
     Cycle(Vec<String>),
 }
 
-fn in_realm(realm: &Option<String>) -> String {
-    realm.as_ref().map(|realm| format!(" in realm `{realm}`")).unwrap_or_default()
+impl fmt::Display for LoadWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LoadWarning::MissingProvider { row, key, realm } => {
+                write!(f, "row `{row}` depends on `{key}`")?;
+                if let Some(realm) = realm {
+                    write!(f, " in realm `{realm}`")?;
+                }
+                write!(f, ", which no enabled row provides there; it waits unless something outside the tree does")
+            }
+            LoadWarning::Cycle(rows) => write!(f, "dependency cycle: {}", rows.join(" -> ")),
+        }
+    }
 }
 
 /// Applies configuration trees to an [`App`].
 ///
 /// Each application validates the whole tree first. It then retires fibers whose rows are
 /// gone, disabled, switched to another component, or moved to other realms; updates fibers
-/// whose configuration changed; and inserts fibers for new rows. A row's realms are fixed when
-/// its fiber is inserted, so moving a row rebuilds its fiber, and its dependents follow.
+/// whose configuration differs from their row; and inserts fibers for new rows. A row's realms
+/// are fixed when its fiber is inserted, so moving a row rebuilds its fiber, and its dependents
+/// follow.
+///
+/// The loader compares rows against what the app is running, not against the trees it applied
+/// before: applying a tree again mounts a new fiber for a row whose fiber the host removed, and
+/// restores a row's configuration after the host updated its fiber.
 pub struct Loader {
     app: App,
     catalog: Catalog,
@@ -239,7 +266,6 @@ type Checked<'t> = (&'t Row, Arc<Factory>, Env);
 struct Mounted {
     component: String,
     isolate: BTreeMap<String, String>,
-    config: Value,
     fiber: FiberId,
 }
 
@@ -251,21 +277,35 @@ impl Loader {
 
     /// Parses YAML text into a [`Tree`] and applies it.
     ///
+    /// # Returns
+    ///
+    /// The tree's warnings, as [`apply`](Loader::apply) returns them.
+    ///
     /// # Errors
     ///
     /// Returns a [`LoadError`] when the text or the tree is invalid; nothing is applied then.
-    pub async fn apply_yaml(&mut self, text: &str) -> Result<(), LoadError> {
+    pub async fn apply_yaml(&mut self, text: &str) -> Result<Vec<LoadWarning>, LoadError> {
         let tree: Tree = serde_yaml::from_str(text)?;
         self.apply(&tree).await
     }
 
     /// Validates `tree`, then reconciles the app against it.
     ///
+    /// # Returns
+    ///
+    /// What the tree alone leaves its rows waiting on: keys no enabled row provides, and
+    /// dependency cycles among the rows (every cycle shares a row with a reported one). Each is
+    /// also logged as a warning. The rows are mounted anyway, and a provider from outside the
+    /// tree, such as a fiber the host inserts, still satisfies them.
+    ///
     /// # Errors
     ///
     /// Returns a [`LoadError`] when the tree is invalid; nothing is applied then.
-    pub async fn apply(&mut self, tree: &Tree) -> Result<(), LoadError> {
-        let rows = self.check(tree)?;
+    pub async fn apply(&mut self, tree: &Tree) -> Result<Vec<LoadWarning>, LoadError> {
+        let (rows, warnings) = self.check(tree)?;
+        for warning in &warnings {
+            tracing::warn!("{warning}");
+        }
         let app = &self.app;
         self.mounted.retain(|id, mounted| {
             let kept = rows
@@ -277,33 +317,32 @@ impl Loader {
             kept
         });
         for (row, factory, env) in rows {
-            match self.mounted.get_mut(&row.id) {
-                Some(mounted) if mounted.config != row.config => {
-                    self.app.update(mounted.fiber, row.config.clone());
-                    mounted.config = row.config.clone();
-                }
-                Some(_) => {}
+            let mounted = self.mounted.get(&row.id).map(|mounted| mounted.fiber);
+            let running = match mounted {
+                Some(fiber) => self.app.config(fiber).await.map(|config| (fiber, config)),
+                None => None,
+            };
+            match running {
+                Some((_, config)) if config == row.config => {}
+                Some((fiber, _)) => self.app.update(fiber, row.config.clone()),
                 None => {
                     let fiber = self.app.insert_factory(factory, row.config.clone(), env).await;
-                    let mounted = Mounted {
-                        component: row.component.clone(),
-                        isolate: row.isolate.clone(),
-                        config: row.config.clone(),
-                        fiber,
-                    };
+                    let mounted = Mounted { component: row.component.clone(), isolate: row.isolate.clone(), fiber };
                     self.mounted.insert(row.id.clone(), mounted);
                 }
             }
         }
-        Ok(())
+        Ok(warnings)
     }
 
-    /// Returns the fiber mounted for a row id.
+    /// Returns the fiber the loader last mounted for a row id. The host may have removed it
+    /// since; the next application then mounts a new one.
     pub fn fiber(&self, row: &str) -> Option<FiberId> {
         self.mounted.get(row).map(|mounted| mounted.fiber)
     }
 
-    fn check<'t>(&self, tree: &'t Tree) -> Result<Vec<Checked<'t>>, LoadError> {
+    /// Validates `tree`, returning its enabled rows and what keeps some of them from activating.
+    fn check<'t>(&self, tree: &'t Tree) -> Result<(Vec<Checked<'t>>, Vec<LoadWarning>), LoadError> {
         let mut ids = HashSet::new();
         let mut rows = Vec::new();
         for row in &tree.plugins {
@@ -337,28 +376,46 @@ impl Loader {
                 providers.entry(env.slot(*key)).or_default().push(index);
             }
         }
+        let mut warnings = Vec::new();
         let mut edges = Vec::with_capacity(rows.len());
         for (row, factory, env) in &rows {
             let mut targets = Vec::new();
             for key in &factory.deps {
-                let provided_by = providers.get(&env.slot(*key)).ok_or_else(|| LoadError::MissingProvider {
-                    row: row.id.clone(),
-                    key: key.name(),
-                    realm: row.isolate.get(key.name()).cloned(),
-                })?;
-                targets.extend(provided_by);
+                match providers.get(&env.slot(*key)) {
+                    Some(provided_by) => targets.extend(provided_by),
+                    None => warnings.push(LoadWarning::MissingProvider {
+                        row: row.id.clone(),
+                        key: key.name(),
+                        realm: row.isolate.get(key.name()).cloned(),
+                    }),
+                }
             }
             edges.push(targets);
         }
-        if let Some(cycle) = find_cycle(&edges) {
-            return Err(LoadError::Cycle(cycle.into_iter().map(|index| rows[index].0.id.clone()).collect()));
+        for cycle in find_cycles(&edges) {
+            warnings.push(LoadWarning::Cycle(cycle.into_iter().map(|index| rows[index].0.id.clone()).collect()));
         }
-        Ok(rows)
+        Ok((rows, warnings))
     }
 }
 
-/// Returns the rows of one dependency cycle, first row repeated at the end, if any exists.
-fn find_cycle(edges: &[Vec<usize>]) -> Option<Vec<usize>> {
+/// Returns dependency cycles, each with its first row repeated at the end. Every cycle shares a
+/// row with a returned one: each search skips the rows of the cycles already found.
+fn find_cycles(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let mut found = vec![false; edges.len()];
+    let mut cycles = Vec::new();
+    while let Some(cycle) = find_cycle(edges, &found) {
+        for &row in &cycle {
+            found[row] = true;
+        }
+        cycles.push(cycle);
+    }
+    cycles
+}
+
+/// Returns the rows of one dependency cycle among the rows not `skipped`, first row repeated at
+/// the end, if any exists.
+fn find_cycle(edges: &[Vec<usize>], skipped: &[bool]) -> Option<Vec<usize>> {
     #[derive(Clone, Copy, PartialEq)]
     enum Mark {
         New,
@@ -390,7 +447,7 @@ fn find_cycle(edges: &[Vec<usize>]) -> Option<Vec<usize>> {
         None
     }
 
-    let mut marks = vec![Mark::New; edges.len()];
+    let mut marks: Vec<Mark> = skipped.iter().map(|&skip| if skip { Mark::Done } else { Mark::New }).collect();
     let mut stack = Vec::new();
     (0..edges.len()).find_map(
         |node| {

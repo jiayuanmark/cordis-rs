@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use cordis::{App, Catalog, Component, Cx, LoadError, Loader, Realm, Result, Status, component, key};
+use cordis::{App, Catalog, Component, Cx, LoadError, LoadWarning, Loader, Realm, Result, Status, component, key};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -294,10 +294,9 @@ async fn the_loader_checks_providers_within_each_realm() {
   - { id: shared, use: registry, config: { name: x } }
   - { id: b, use: agent, config: { name: y }, isolate: { tools: sandbox } }
 ";
-    match loader.apply_yaml(missing).await {
-        Err(LoadError::MissingProvider { key: "tools", realm: Some(realm), .. }) => assert_eq!(realm, "sandbox"),
-        other => panic!("expected a missing provider, got {other:?}"),
-    }
+    let warnings = loader.apply_yaml(missing).await.unwrap();
+    let realm = Some("sandbox".to_owned());
+    assert_eq!(warnings, [LoadWarning::MissingProvider { row: "b".into(), key: "tools", realm }]);
     let unknown = "plugins:\n  - { id: a, use: agent, config: { name: z }, isolate: { nope: x } }\n";
     assert!(matches!(loader.apply_yaml(unknown).await, Err(LoadError::UnknownKey { .. })));
 }

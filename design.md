@@ -222,7 +222,7 @@ cx.intercept::<dyn Fs>(|fs| Arc::new(ReadOnly(fs)))
 - **Realms are fixed when a fiber is inserted**, again following §4.4: a fiber whose realms change is a different fiber. The loader rebuilds a row whose `isolate` changes.
 - **Three kinds of realm.** `isolate::<K>()` makes a fresh one, private to the scope's subtree. `Realm::named("tenant-a")` is shared by every scope that names it, from anywhere in the tree. `Realm::shared()` undoes an inherited isolation, which matches Def 25's "a key already isolated is reassigned rather than refused".
 - **A realm holds several keys, never one binding for two.** In TypeScript Cordis two keys isolated to the same symbol share a store slot. Here a binding is typed by its key, so `(dyn Tools, r)` and `(dyn Fs, r)` are separate slots; a named realm works as a tenant namespace instead.
-- **Configuration** names realms per key: `isolate: { tools: sandbox }` places the row's `dyn Tools` in the realm `sandbox`, shared with every row naming it. The loader checks providers within each realm. TypeScript's local realms (`isolate: { tools: true }`) are private to an entry and its group; this loader has no groups yet, so it accepts names only.
+- **Configuration** names realms per key: `isolate: { tools: sandbox }` places the row's `dyn Tools` in the realm `sandbox`, shared with every row naming it. The loader checks providers within each realm, and warns about a row whose realm has none. TypeScript's local realms (`isolate: { tools: true }`) are private to an entry and its group; this loader has no groups yet, so it accepts names only.
 
 ### Interception
 
@@ -249,8 +249,9 @@ plugins:
 
 - **`use` names a registered component.** Native components are registered by name; WASM and out-of-process components name a file or endpoint.
 - **Configuration is validated at load** by deserializing into the component's `Config` type.
-- **The loader checks the whole tree before activating anything.** Every row's dependencies and provisions are static metadata, so unknown components, invalid configuration, missing providers, and dependency cycles are load errors.
-- **Reapplying a tree reconciles it.** Removed rows retire their fibers, changed configuration reloads them, and new rows insert fibers.
+- **The loader checks the whole tree before activating anything.** Unknown components and invalid configuration are load errors, and nothing is applied.
+- **Missing providers and dependency cycles are warnings.** The rows are mounted anyway and wait, as any fiber waits for a provider that isn't there yet. Disabling a provider row is an ordinary change: its consumers deactivate. A provider can also come from outside the tree, such as a fiber the host inserts or a child of another row, so a missing-provider warning says only that no row provides the key.
+- **Reapplying a tree reconciles it against what is running.** Removed rows retire their fibers, rows whose fiber's configuration differs reload it, and rows without a live fiber insert one. The loader asks the app for each fiber's state rather than trusting the trees it applied before, so a fiber the host removed is mounted again and a host `update` is reverted to the row's configuration.
 - **Profiles and overlays** remain layers of plain data merged by row id before the loader sees the tree.
 - **Optional static composition.** A `compose!` macro can fix a whole application in Rust code, making missing providers and cycles compile errors. A build script can apply the same check to shipped profiles while users still layer patches at runtime.
 
