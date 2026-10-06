@@ -203,7 +203,8 @@ pub(crate) enum Command {
     },
 }
 
-/// One activation of a fiber, which owns the children it instantiates until it unloads.
+/// One activation of a fiber: it owns the children it instantiates until it unloads, and it is
+/// what a consumer's view records as its provider, so a provider that restarts counts as new.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Owner {
     pub(crate) id: FiberId,
@@ -364,14 +365,17 @@ enum Event {
     },
 }
 
-/// The provider fiber of each dependency, in declaration order. Providers are compared by
-/// identity, so a replaced provider changes the view.
+/// The provider of each dependency, in declaration order: the provider fiber and the activation
+/// of it that published the key. A provider that is replaced, reloaded, or restarted after a
+/// failure changes the view, so its consumers reload or retry. (The paper reinserts a revised
+/// fiber as a new one, §4.4; a `FiberId` survives a configuration change, so the activation tells
+/// them apart.)
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct View(Vec<(Slot, FiberId)>);
+struct View(Vec<(Slot, Owner)>);
 
 impl View {
     fn providers(&self) -> impl Iterator<Item = FiberId> + '_ {
-        self.0.iter().map(|(_, provider)| *provider)
+        self.0.iter().map(|(_, provider)| provider.id)
     }
 }
 
@@ -426,8 +430,9 @@ struct Entry {
 struct Orchestrator {
     commands: WeakUnboundedSender<Command>,
     fibers: SlotMap<FiberId, Entry>,
-    /// Active provisions, by key and realm. Only `Active` fibers appear here.
-    table: HashMap<Slot, (FiberId, Erased)>,
+    /// Active provisions, by key and realm, with the activation that published each. Only
+    /// `Active` fibers appear here.
+    table: HashMap<Slot, (Owner, Erased)>,
     /// The fiber that holds each provided slot, from the start of its activation until it has
     /// fully stopped. A slot has at most one holder, so two providers never run at once.
     holders: HashMap<Slot, FiberId>,
@@ -699,7 +704,7 @@ impl Orchestrator {
         let target = self.target(id);
         let current = self.is_current(id, target.as_ref());
         match outcome {
-            Some(Ok(instance)) if current => self.publish(id, instance),
+            Some(Ok(instance)) if current => self.publish(Owner { id, token }, instance),
             Some(Ok(instance)) => {
                 // The target moved while the last step ran; revert what it built.
                 self.fibers[id].state = State::Leaving { instance };
@@ -725,15 +730,15 @@ impl Orchestrator {
         }
     }
 
-    fn publish(&mut self, id: FiberId, instance: Box<dyn Instance>) {
-        let fiber = &self.fibers[id];
+    fn publish(&mut self, run: Owner, instance: Box<dyn Instance>) {
+        let fiber = &self.fibers[run.id];
         let provisions: Vec<(Slot, Erased)> =
             instance.provisions().into_iter().map(|(key, value)| (fiber.env.slot(key), value)).collect();
         for (slot, value) in provisions {
-            self.table.insert(slot.clone(), (id, value));
+            self.table.insert(slot.clone(), (run, value));
             self.mark(&slot);
         }
-        self.fibers[id].state = State::Active { instance };
+        self.fibers[run.id].state = State::Active { instance };
     }
 
     fn leave(&mut self, id: FiberId) {
@@ -744,7 +749,7 @@ impl Orchestrator {
         fiber.state = State::Leaving { instance };
         let provides = fiber.provides.clone();
         for slot in provides {
-            if self.table.get(&slot).is_some_and(|(provider, _)| *provider == id) {
+            if self.table.get(&slot).is_some_and(|(provider, _)| provider.id == id) {
                 self.table.remove(&slot);
                 self.mark(&slot);
             }

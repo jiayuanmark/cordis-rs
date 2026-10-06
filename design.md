@@ -27,7 +27,7 @@ Rust fixes the *vocabulary* at compile time: which service traits exist, which c
 | Effect iterator and iteration boundaries, Def 17 | `async fn activate`; each `.await` is an iteration boundary |
 | Fiber and fiber tree, Defs 49 and 50 | One configured instance of a component, owned by the orchestrator; a child records the activation it was instantiated under |
 | Instantiation and retirement, Def 52 | `cx.plugin::<C>(config)`; the orchestrator retires a child when its parent's activation ends (O-Retire) |
-| Target view and committed view, Def 53 | `View`: the provider fiber of each dependency key |
+| Target view and committed view, Def 53 | `View`: the provider of each dependency key, as a fiber and one activation of it |
 | Satisfaction and `notify`, Def 22 | The orchestrator's settle step |
 | The "relied upon" guard, Def 54 | Per-fiber count of committed views that name the fiber |
 | Derived realization, Def 23 | `Scope`: a context derived from a `Cx` or the `App`, discarded by dropping it |
@@ -271,7 +271,7 @@ enum State {
 }
 ```
 
-Each fiber also records its **committed view**: the provider fiber of each dependency key that it activated against. Its **target view** is computed from the table: the current provider of each dependency key, or none if a key has no active provider. Views compare providers by fiber identity, so a replaced provider changes the view even when the new value looks the same.
+Each fiber also records its **committed view**: the provider of each dependency key that it activated against. Its **target view** is computed from the table: the current provider of each dependency key, or none if a key has no active provider. A view names a provider by its fiber *and* the activation that published the key. The paper reinserts a revised fiber as a new fiber (§4.4); here a fiber keeps its id when its configuration changes, so the activation is what tells the two apart. So a replaced provider, and a provider that reloaded or restarted after a failure, changes the view even when the new value looks the same. Retrying a failed consumer when its view changes is this port's choice: in the paper a failed fiber stays failed until it is itself revised.
 
 ### Rules
 
