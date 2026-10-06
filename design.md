@@ -16,6 +16,8 @@ The runtime keeps only what is inherently dynamic: an orchestrator that activate
 
 Rust fixes the *vocabulary* at compile time: which service traits exist, which component types exist, and what each one declares. Configuration still decides the *composition*: which components run, with what configuration, and so which implementation serves each key.
 
+This document also describes parts that do not exist yet; each is marked *(planned)*. The [README](README.md) lists what is implemented.
+
 ## Concept mapping
 
 | Paper concept | Rust realization |
@@ -33,7 +35,7 @@ Rust fixes the *vocabulary* at compile time: which service traits exist, which c
 | Derived realization, Def 23 | `Scope`: a context derived from a `Cx` or the `App`, discarded by dropping it |
 | Isolation, Defs 24 and 25 | `cx.isolate::<K>()`: the table is keyed by (key, `Realm`), and a fiber's realms are fixed at insertion |
 | Interception, Defs 26 and 27 | `cx.intercept::<K>(\|v\| ...)`: a closure that remaps the provider value for consumers under the scope |
-| Service multiplexing, §6.2 | Cardinality declared on the key: `one` or `many` |
+| Service multiplexing, §6.2 | *(planned)* Cardinality declared on the key: `one` or `many`. Today every key has one provider at a time |
 | Dependency typing and versioning, §6.6 | `TypeId` keys plus trait upcasting between interface versions |
 | Cordis events | Types implementing `Event`, dispatched through the built-in `Events` bus |
 
@@ -101,7 +103,7 @@ impl Component for GrepTool {
 - **One declaration, on the type.** The `#[component]` attribute implements `Manifest` and takes `config`, `deps`, and `provides` in any order, each optional. It reads the type's name and generics from the item it is attached to. The `impl Component` block then holds only behavior, so it stays ordinary, rustfmt-formatted Rust.
 - **Dependencies are a typed struct.** `deps(name: Key, ...)` generates `{Type}Deps` with one `Arc<Key::Value>` field per entry and sets it as `Manifest::Deps`. The registry stays type-erased, because configuration decides at runtime which fiber provides each key; generated code downcasts each entry once, before `activate`, and `Cx<Self>` holds the resulting `Arc<Self::Deps>`. After that, reading a dependency is a field access, with no lookup or cast. This is the pattern of Bevy's `SystemParam` and axum's extractors: the compiler checks the declaration and the runtime only fills it in.
 - **Undeclared access does not compile.** Only declared keys have a field in `{Type}Deps`, so `cx.deps()` is the one way to read a dependency, and reading anything else is a missing-field error. `#[component]` also rejects a key listed twice.
-- **Inactive access cannot be expressed.** The orchestrator constructs `Cx<Self>` only when every dependency has an active provider.
+- **Dependencies are present when `activate` starts.** The orchestrator constructs `Cx<Self>` only when every dependency has an active provider. A `Cx` kept past its run's teardown still reads that run's providers, whose effects may already be undone; `cx.is_live()` tells the two apart.
 - **Methods reach the context through a stored `Cx`.** `Cx` is a cheap clone, so a component keeps one as a field and calls `self.cx.deps()` or `self.cx.on::<E>()` from ordinary methods. Every clone adds to the same undo list, which runs when the fiber unloads; after that `cx.is_live()` is `false` and anything added is undone at once. Closing the list breaks the cycle when a listener captures a `Cx` clone.
 - **A small proc-macro crate.** `cordis-macros` holds only the attribute. A declarative `component!(Name { ... })` would avoid `syn` but has to be told the type's name, and wrapping the struct inside it would take the struct out of rustfmt's reach.
 
@@ -145,7 +147,7 @@ impl Tools for ToolRegistry { fn register(&self, name: &str) -> Guard { /* ... *
 ```
 
 - **Versions.** Trait upcasting lets one provider serve several interface versions: with `trait ToolsV2: Tools`, the provider lists both `dyn ToolsV2` and `dyn Tools`.
-- **Cardinality.** A `one` key has one provider at a time, counted from the start of its activation until its teardown has finished; a second provider waits and takes over once the first has fully stopped. A provider that reloads, for a configuration change or a replaced dependency, keeps the key. For a `many` key, adding or removing a provider does not reload consumers, which observe a live set instead. This gives load balancing and rolling updates (paper §6.2).
+- **Cardinality.** A key has one provider at a time, counted from the start of its activation until its teardown has finished; a second provider waits and takes over once the first has fully stopped. A provider that reloads, for a configuration change or a replaced dependency, keeps the key. *(Planned)* A `many` key, where adding or removing a provider does not reload consumers, which observe a live set instead. This gives load balancing and rolling updates (paper §6.2).
 
 ## Events
 
@@ -247,13 +249,13 @@ plugins:
     config: { max_matches: 200 }
 ```
 
-- **`use` names a registered component.** Native components are registered by name; WASM and out-of-process components name a file or endpoint.
+- **`use` names a registered component.** Native components are registered by name. *(Planned)* WASM and out-of-process components name a file or endpoint.
 - **Configuration is validated at load** by deserializing into the component's `Config` type.
 - **The loader checks the whole tree before activating anything.** Unknown components and invalid configuration are load errors, and nothing is applied.
 - **Missing providers and dependency cycles are warnings.** The rows are mounted anyway and wait, as any fiber waits for a provider that isn't there yet. Disabling a provider row is an ordinary change: its consumers deactivate. A provider can also come from outside the tree, such as a fiber the host inserts or a child of another row, so a missing-provider warning says only that no row provides the key.
 - **Reapplying a tree reconciles it against what is running.** Removed rows retire their fibers, rows whose fiber's configuration differs reload it, and rows without a live fiber insert one. The loader asks the app for each fiber's state rather than trusting the trees it applied before, so a fiber the host removed is mounted again and a host `update` is reverted to the row's configuration.
 - **Profiles and overlays** remain layers of plain data merged by row id before the loader sees the tree.
-- **Optional static composition.** A `compose!` macro can fix a whole application in Rust code, making missing providers and cycles compile errors. A build script can apply the same check to shipped profiles while users still layer patches at runtime.
+- **Optional static composition** *(planned)*. A `compose!` macro can fix a whole application in Rust code, making missing providers and cycles compile errors. A build script can apply the same check to shipped profiles while users still layer patches at runtime.
 
 ## Reactive lifecycle
 
@@ -291,6 +293,15 @@ After every command or task completion, the orchestrator settles each affected f
 - **Configuration changes** bump a per-fiber epoch that is part of the committed view, so an update reloads the fiber through the same rules.
 - **A panic or error in `activate`** moves only that fiber to `Failed`. It retries when its target view or configuration changes.
 
+### Guarantees
+
+These hold for every order in which commands and task completions arrive. `tests/invariants.rs` checks them, in the shared realm, under random inserts, updates and removals, with activations and undos that take random turns, and without waiting for one change to settle before the next.
+
+1. **One provider per key and realm**, counted from the start of its activation until its last undo has finished (Def 50).
+2. **Consumers before providers.** A provider starts undoing only after every run that read it has finished undoing (Theorem 70).
+3. **Every effect is undone with its run**, before the run's last undo finishes (Corollary 69).
+4. **The app settles** (Theorem 73), and then every fiber is in the state its providers allow: active when it can run, failed only when it fails against them, inactive only when a provider is missing or another fiber holds its key.
+
 ### Cascade
 
 `G` depends on `dyn Tools`, provided by `T`; `T` depends on `dyn Prompt`, provided by `P`.
@@ -325,6 +336,8 @@ The orchestrator holds each instance as an `Arc<Self>` and publishes clones of i
 
 ## Execution tiers
 
+Only the native tier exists; the other two are *(planned)*.
+
 | Tier | Code | Reload | Use |
 |---|---|---|---|
 | Native | Compiled into the binary | Configuration reconciliation | Core services |
@@ -341,9 +354,9 @@ world plugin {
 }
 ```
 
-## Agent harness on top
+## Agent harness on top *(planned)*
 
-The harness is a set of crates, each a service trait plus components that provide it.
+The harness is planned as a set of crates, each a service trait plus components that provide it. `examples/harness.rs` sketches it in one file.
 
 | Crate | Depends on | Provides |
 |---|---|---|
@@ -353,7 +366,7 @@ The harness is a set of crates, each a service trait plus components that provid
 | `dsh-agent-loop` | `dyn Llm`, `dyn Tools`, `dyn Sessions` | `dyn Agents` |
 
 - **Interception points** (`agent/pre-step`, `agent/request`, `tools/*`, `agent/turn-stopping`, `session/event`) are event types declared by the crate that dispatches them.
-- **Presets and subagents** are realms that override `dyn Tools` or `dyn Fs` for one agent.
+- **Presets and subagents** are realms that override `dyn Tools` or `dyn Fs` for one agent. Realms isolate keys only: the event bus is shared by every fiber, so a realm alone is not yet a sandbox.
 - **Self-modification** compiles a generated component to `wasm32-wasip2` and mounts it as a fiber.
 - **Model-visible means logged.** Only the session crate can construct `Logged<T>`, and the request builder accepts only `Logged` values.
 - **Session events** are serde types registered with a decoder table. A log with an unknown event type that is not marked ignorable is refused. Format migrations are an `impl From<V1> for V2` chain.
