@@ -116,3 +116,24 @@ async fn deps_resolve_into_the_generated_struct() {
     assert_eq!(app.status(consumer).await, Some(Status::Active));
     assert_eq!(app.get::<dyn Report>().await.unwrap().describe(), "alpha 7");
 }
+
+#[tokio::test]
+async fn get_works_inside_a_spawned_task() {
+    let app = App::new();
+    app.insert::<Provider<Alpha>>(json!(null)).await;
+    app.settled().await;
+    let task = tokio::spawn({
+        let app = app.clone();
+        async move { app.get::<dyn Named>().await.map(|named| named.name()) }
+    });
+    assert_eq!(task.await.unwrap(), Some("alpha"));
+}
+
+#[tokio::test]
+async fn get_reads_the_provider_when_awaited() {
+    let app = App::new();
+    let get = app.get::<dyn Named>();
+    app.insert::<Provider<Alpha>>(json!(null)).await;
+    app.settled().await;
+    assert_eq!(get.await.map(|named| named.name()), Some("alpha"));
+}

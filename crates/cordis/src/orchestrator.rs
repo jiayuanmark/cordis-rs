@@ -145,12 +145,34 @@ impl App {
         answer.await.expect("the orchestrator replies to every command")
     }
 
-    /// Returns the current active provider of `K` in the shared realm, if any.
-    pub async fn get<K: Key + ?Sized>(&self) -> Option<Arc<K::Value>> {
-        let (reply, answer) = oneshot::channel();
-        self.send(Command::Get { slot: Env::default().slot(KeyId::of::<K>()), reply });
-        let value = answer.await.expect("the orchestrator replies to every command");
-        value.map(|value| value.get::<K>())
+    /// Returns the active provider of `K` in the shared realm, if any, as of when the future is
+    /// first polled. The future does not keep the app alive; once the app is dropped it returns
+    /// `None`.
+    ///
+    /// For host code. A component reads its providers through `cx.deps()`, which tracks them.
+    pub fn get<K: Key + ?Sized>(&self) -> impl Future<Output = Option<Arc<K::Value>>> + Send + use<K> {
+        self.get_in::<K>(&Realm::shared())
+    }
+
+    /// Returns the active provider of `K` in `realm`, if any. See [`get`](App::get).
+    pub fn get_in<K: Key + ?Sized>(
+        &self,
+        realm: &Realm,
+    ) -> impl Future<Output = Option<Arc<K::Value>>> + Send + use<K> {
+        // A plain `fn` rather than an `async fn`: the compiler cannot prove an `async fn`
+        // generic over `dyn Trait` keys `Send`, so it could not be awaited in a spawned task.
+        // The future asks when first polled, like an `async fn`, and holds the app only weakly
+        // until then, so a future nobody awaits does not keep the app running.
+        let commands = self.commands.downgrade();
+        let slot = Slot { key: KeyId::of::<K>(), realm: realm.clone() };
+        async move {
+            // The app was dropped, and with it every provider.
+            let commands = commands.upgrade()?;
+            let (reply, answer) = oneshot::channel();
+            commands.send(Command::Get { slot, reply }).expect("the orchestrator runs while a handle exists");
+            let value = answer.await.expect("the orchestrator replies to every command");
+            value.map(|value| value.get::<K>())
+        }
     }
 
     /// Waits until no activation or deactivation is in flight and every fiber has settled.
