@@ -1,8 +1,10 @@
 //! The orchestrator: one task that owns every fiber and applies lifecycle transitions.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::FutureExt;
 use serde_json::Value;
@@ -14,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::dispose::{Undo, panic_message};
 use crate::erased::{Factory, Instance};
 use crate::realm::{Env, Slot};
-use crate::{Component, Erased, Events, Guard, Key, KeyId, Realm, Scope};
+use crate::{Component, Dispose, Erased, Events, Key, KeyId, Realm, Scope};
 
 new_key_type! {
     /// Identity of a fiber: one configured instance of a component.
@@ -271,12 +273,9 @@ impl Spawner {
         let (reply, answer) = oneshot::channel();
         commands.send(Command::Insert { factory, config, env, parent, reply }).map_err(|_| Refused::Stopped)?;
         let id = answer.await.map_err(|_| Refused::Stopped)?.ok_or(Refused::Ended)?;
-        let fiber = Fiber { id, commands: commands.downgrade() };
+        let fiber = Fiber { id, commands: commands.downgrade(), disposed: Arc::default() };
         if let Spawner::Fiber(control) = self {
-            // Retiring the child is its parent activation's inverse (Def 52), so it takes its
-            // place in the parent's undo list. The parent does not wait for the child to leave.
-            let child = fiber.clone();
-            control.undo.push(Guard::new(move || child.dispose()));
+            control.undo.push(Retire(fiber.clone()));
         }
         Ok(fiber)
     }
@@ -292,6 +291,8 @@ impl Spawner {
 pub struct Fiber {
     id: FiberId,
     commands: WeakUnboundedSender<Command>,
+    /// Set by `dispose` on any clone.
+    disposed: Arc<AtomicBool>,
 }
 
 impl Fiber {
@@ -320,6 +321,7 @@ impl Fiber {
 
     /// Retires the fiber now. It deactivates after its consumers, then is discarded.
     pub fn dispose(&self) {
+        self.disposed.store(true, Ordering::Relaxed);
         self.send(Command::Remove { id: self.id });
     }
 
@@ -327,6 +329,23 @@ impl Fiber {
         if let Some(commands) = self.commands.upgrade() {
             let _ = commands.send(command);
         }
+    }
+}
+
+/// Retiring a child: an inverse of the parent run that instantiated it (Def 52), so it takes its
+/// place in that run's undo list. The parent does not wait for the child to leave. Once the
+/// child has been disposed through its handle, the entry is finished and the list can drop it,
+/// so a parent that runs a child per request doesn't accumulate them.
+struct Retire(Fiber);
+
+impl Dispose for Retire {
+    fn dispose(self) -> impl Future<Output = ()> + Send + 'static {
+        self.0.dispose();
+        std::future::ready(())
+    }
+
+    fn is_finished(&self) -> bool {
+        self.0.disposed.load(Ordering::Relaxed)
     }
 }
 
@@ -793,5 +812,20 @@ impl Orchestrator {
         if let Some(watchers) = self.watchers.get(slot) {
             self.dirty.extend(watchers.iter().copied());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_child_disposed_through_its_handle_is_a_finished_entry() {
+        let (commands, _receiver) = mpsc::unbounded_channel();
+        let child = Fiber { id: FiberId::default(), commands: commands.downgrade(), disposed: Arc::default() };
+        let retire = Retire(child.clone());
+        assert!(!retire.is_finished());
+        child.dispose();
+        assert!(retire.is_finished());
     }
 }
