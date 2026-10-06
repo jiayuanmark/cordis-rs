@@ -126,7 +126,7 @@ pub use erased::{Erased, Resolve};
 pub use events::{DefaultAction, Detached, Event, Events, Flow, Held, Next, On, Sink, mode};
 pub use guard::{Guard, Guards};
 pub use key::{Key, KeyId};
-pub use loader::{Catalog, Layer, LoadError, Loader, Row, Tree};
+pub use loader::{Catalog, Layer, LoadError, LoadWarning, Loader, Row, Tree};
 pub use orchestrator::{App, Fiber, FiberId, Status};
 pub use realm::{Realm, Scope};
 

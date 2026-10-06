@@ -130,6 +130,13 @@ impl App {
         answer.await.expect("the orchestrator replies to every command")
     }
 
+    /// Returns the configuration a fiber runs with, or `None` once it has been removed.
+    pub(crate) async fn config(&self, id: FiberId) -> Option<Value> {
+        let (reply, answer) = oneshot::channel();
+        self.send(Command::Config { id, reply });
+        answer.await.expect("the orchestrator replies to every command")
+    }
+
     /// Returns the fiber a fiber was instantiated under, or `None` for a root fiber and once
     /// the fiber has been discarded.
     pub async fn parent(&self, id: FiberId) -> Option<FiberId> {
@@ -189,6 +196,10 @@ pub(crate) enum Command {
     Status {
         id: FiberId,
         reply: oneshot::Sender<Option<Status>>,
+    },
+    Config {
+        id: FiberId,
+        reply: oneshot::Sender<Option<Value>>,
     },
     Parent {
         id: FiberId,
@@ -545,6 +556,10 @@ impl Orchestrator {
             }
             Command::Status { id, reply } => {
                 let _ = reply.send(self.fibers.get(id).map(|fiber| fiber.state.status()));
+            }
+            Command::Config { id, reply } => {
+                let config = self.fibers.get(id).filter(|fiber| !fiber.retired).map(|fiber| fiber.config.clone());
+                let _ = reply.send(config);
             }
             Command::Parent { id, reply } => {
                 let _ = reply.send(self.fibers.get(id).and_then(|fiber| fiber.parent).map(|parent| parent.id));

@@ -3,7 +3,9 @@
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use cordis::{App, Catalog, Component, Cx, FiberId, Guard, LoadError, Loader, Result, Status, component, key};
+use cordis::{
+    App, Catalog, Component, Cx, FiberId, Guard, LoadError, LoadWarning, Loader, Result, Status, component, key,
+};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -463,24 +465,106 @@ plugins:
 }
 
 #[tokio::test]
-async fn the_loader_rejects_invalid_trees_before_mounting_anything() {
-    let app = App::new();
-    let mut loader = Loader::new(app, catalog());
+async fn the_loader_rejects_invalid_rows_before_mounting_anything() {
+    let mut loader = Loader::new(App::new(), catalog());
 
-    let missing = "plugins:\n  - { id: grep, use: grep-tool, config: { tag: t } }\n";
-    assert!(matches!(loader.apply_yaml(missing).await, Err(LoadError::MissingProvider { key: "tools", .. })));
-
-    let unknown = "plugins:\n  - { id: x, use: nope }\n";
+    let unknown =
+        "plugins:\n  - { id: p, use: static-prompt, config: { tag: t, text: x } }\n  - { id: x, use: nope }\n";
     assert!(matches!(loader.apply_yaml(unknown).await, Err(LoadError::UnknownComponent { .. })));
 
     let invalid = "plugins:\n  - { id: p, use: static-prompt, config: { tag: t } }\n";
     assert!(matches!(loader.apply_yaml(invalid).await, Err(LoadError::InvalidConfig { .. })));
+    assert!(loader.fiber("p").is_none());
+}
 
+#[tokio::test]
+async fn the_loader_mounts_rows_that_wait_for_a_provider() {
+    // No row provides `prompt`: the tools row is mounted and waits, here for the host.
+    let app = App::new();
+    let mut loader = Loader::new(app.clone(), catalog());
+    let missing = "plugins:\n  - { id: tools, use: tool-registry, config: { tag: wait } }\n";
+    let warnings = loader.apply_yaml(missing).await.unwrap();
+    assert_eq!(warnings, [LoadWarning::MissingProvider { row: "tools".into(), key: "prompt", realm: None }]);
+    app.settled().await;
+    let tools = loader.fiber("tools").unwrap();
+    assert_eq!(app.status(tools).await, Some(Status::Inactive));
+    app.insert::<StaticPrompt>(json!({ "tag": "wait", "text": "host" })).await;
+    app.settled().await;
+    assert_eq!(app.status(tools).await, Some(Status::Active));
+
+    // Rows in a cycle are mounted too, and wait for each other.
+    let app = App::new();
+    let mut loader = Loader::new(app.clone(), catalog());
     let cycle =
         "plugins:\n  - { id: tools, use: tool-registry, config: { tag: t } }\n  - { id: prompt, use: tools-prompt }\n";
-    match loader.apply_yaml(cycle).await {
-        Err(LoadError::Cycle(rows)) => assert_eq!(rows, ["tools", "prompt", "tools"]),
-        other => panic!("expected a cycle, got {other:?}"),
-    }
-    assert!(loader.fiber("tools").is_none());
+    let warnings = loader.apply_yaml(cycle).await.unwrap();
+    assert_eq!(warnings, [LoadWarning::Cycle(vec!["tools".into(), "prompt".into(), "tools".into()])]);
+    app.settled().await;
+    assert_eq!(app.status(loader.fiber("tools").unwrap()).await, Some(Status::Inactive));
+    assert_eq!(app.status(loader.fiber("prompt").unwrap()).await, Some(Status::Inactive));
+
+    // Separate cycles are each reported.
+    let app = App::new();
+    let mut loader = Loader::new(app.clone(), catalog());
+    let isolated = "  - { id: tools2, use: tool-registry, config: { tag: t }, isolate: { tools: x, prompt: x } }\n  \
+                    - { id: prompt2, use: tools-prompt, isolate: { tools: x, prompt: x } }\n";
+    let warnings = loader.apply_yaml(&format!("{cycle}{isolated}")).await.unwrap();
+    assert_eq!(
+        warnings,
+        [
+            LoadWarning::Cycle(vec!["tools".into(), "prompt".into(), "tools".into()]),
+            LoadWarning::Cycle(vec!["tools2".into(), "prompt2".into(), "tools2".into()]),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn disabling_a_provider_row_deactivates_its_consumers() {
+    let app = App::new();
+    let mut loader = Loader::new(app.clone(), catalog());
+    let tree = r#"
+plugins:
+  - { id: prompt, use: static-prompt, config: { tag: disable, text: v1 } }
+  - { id: tools, use: tool-registry, config: { tag: disable } }
+  - { id: grep, use: grep-tool, config: { tag: disable } }
+"#;
+    loader.apply_yaml(tree).await.unwrap();
+    app.settled().await;
+    let (tools, grep) = (loader.fiber("tools").unwrap(), loader.fiber("grep").unwrap());
+
+    let disabled = tree.replace("use: tool-registry,", "use: tool-registry, disabled: true,");
+    let warnings = loader.apply_yaml(&disabled).await.unwrap();
+    assert_eq!(warnings, [LoadWarning::MissingProvider { row: "grep".into(), key: "tools", realm: None }]);
+    app.settled().await;
+    assert_eq!(app.status(tools).await, None);
+    assert_eq!(app.status(grep).await, Some(Status::Inactive));
+
+    assert!(loader.apply_yaml(tree).await.unwrap().is_empty());
+    app.settled().await;
+    assert_eq!(app.status(grep).await, Some(Status::Active));
+}
+
+#[tokio::test]
+async fn reapplying_a_tree_undoes_host_changes_to_its_fibers() {
+    let app = App::new();
+    let mut loader = Loader::new(app.clone(), catalog());
+    let tree = "plugins:\n  - { id: prompt, use: static-prompt, config: { tag: drift, text: v1 } }\n";
+    loader.apply_yaml(tree).await.unwrap();
+    app.settled().await;
+
+    // The host removes the row's fiber; applying the tree again mounts a new one.
+    app.remove(loader.fiber("prompt").unwrap());
+    app.settled().await;
+    assert!(app.get::<dyn Prompt>().await.is_none());
+    loader.apply_yaml(tree).await.unwrap();
+    app.settled().await;
+    assert_eq!(app.get::<dyn Prompt>().await.unwrap().text(), "v1");
+
+    // The host updates the fiber; applying the tree again restores the row's config.
+    app.update(loader.fiber("prompt").unwrap(), json!({ "tag": "drift", "text": "host" }));
+    app.settled().await;
+    assert_eq!(app.get::<dyn Prompt>().await.unwrap().text(), "host");
+    loader.apply_yaml(tree).await.unwrap();
+    app.settled().await;
+    assert_eq!(app.get::<dyn Prompt>().await.unwrap().text(), "v1");
 }
