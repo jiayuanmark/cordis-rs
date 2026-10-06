@@ -126,7 +126,7 @@ impl Tools for ToolRegistry { fn register(&self, name: &str) -> Guard { /* ... *
 ```
 
 - **Versions.** Trait upcasting lets one provider serve several interface versions: with `trait ToolsV2: Tools`, the provider lists both `dyn ToolsV2` and `dyn Tools`.
-- **Cardinality.** A `one` key has one active provider at a time; a second provider waits and takes over when the first leaves. For a `many` key, adding or removing a provider does not reload consumers, which observe a live set instead. This gives load balancing and rolling updates (paper §6.2).
+- **Cardinality.** A `one` key has one provider at a time, counted from the start of its activation until its teardown has finished; a second provider waits and takes over once the first has fully stopped. A provider that reloads, for a configuration change or a replaced dependency, keeps the key. For a `many` key, adding or removing a provider does not reload consumers, which observe a live set instead. This gives load balancing and rolling updates (paper §6.2).
 
 ## Events
 
