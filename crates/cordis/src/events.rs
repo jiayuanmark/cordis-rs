@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, Weak};
 use futures::future::join_all;
 
 use crate::Guard;
+use crate::dispose::Undo;
 use crate::erased::BoxFuture;
-use crate::guard::Registrations;
 
 /// An event type: its name, dispatch mode, payload, and result.
 ///
@@ -275,13 +275,13 @@ impl Sink for Detached {
     }
 }
 
-/// Hands the guard to the registering fiber, which drops it when the fiber unloads.
-pub struct Held<'a>(pub(crate) &'a Registrations);
+/// Hands the guard to the registering fiber's undo list, which drops it when the fiber unloads.
+pub struct Held<'a>(pub(crate) &'a Undo);
 
 impl Sink for Held<'_> {
     type Out = ();
     fn accept(self, guard: Guard) {
-        self.0.hold(guard);
+        self.0.push(guard);
     }
 }
 

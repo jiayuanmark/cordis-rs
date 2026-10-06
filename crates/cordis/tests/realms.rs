@@ -42,18 +42,14 @@ fn seen(agent: &str) -> Vec<String> {
 
 /// Records which registry it activated against.
 #[component(config = Named, deps(tools: dyn Tools))]
-struct Agent {
-    name: String,
-}
+struct Agent;
 
 impl Component for Agent {
     async fn activate(cx: Cx<Self>, config: Named) -> Result<Self> {
-        SEEN.lock().unwrap().push((config.name.clone(), cx.deps().tools.owner()));
-        Ok(Self { name: config.name })
-    }
-
-    async fn deactivate(self) {
-        SEEN.lock().unwrap().push((self.name, "down".into()));
+        let name = config.name;
+        SEEN.lock().unwrap().push((name.clone(), cx.deps().tools.owner()));
+        cx.on_dispose(move || async move { SEEN.lock().unwrap().push((name, "down".into())) });
+        Ok(Agent)
     }
 }
 

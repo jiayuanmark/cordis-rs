@@ -3,8 +3,9 @@
 //! A [`Component`] declares, with [`#[component]`](component), the [`Key`]s it depends on and the keys it
 //! provides. An [`App`] runs an orchestrator that activates each configured component once all of
 //! its dependencies have an active provider, and deactivates it, consumers first, when that
-//! stops being true. A component's value is its accumulator: dropping it reverts every effect
-//! it holds, such as the [`Guard`]s of its registrations.
+//! stops being true. Each fiber run keeps an undo list: a component hands every inverse, such as
+//! the [`Guard`] of a registration, to [`Cx::on_dispose`], and the orchestrator runs the list,
+//! newest first, when the fiber is disposed.
 //!
 //! A [`Scope`], derived from a fiber's [`Cx`] or from the [`App`], changes how keys resolve for
 //! the fibers instantiated through it: [`Cx::isolate`] moves a key into another [`Realm`], so
@@ -14,6 +15,7 @@
 //! `design.md` at the repository root maps these types to the paper's model.
 
 mod component;
+mod dispose;
 mod erased;
 mod events;
 mod guard;
@@ -118,6 +120,7 @@ pub use component::{Component, Cx, Manifest};
 ///
 /// The generated code names the crate as `::cordis`, so depend on it under that name.
 pub use cordis_macros::component;
+pub use dispose::Dispose;
 #[doc(hidden)]
 pub use erased::{Erased, Resolve};
 pub use events::{DefaultAction, Detached, Event, Events, Flow, Held, Next, On, Sink, mode};

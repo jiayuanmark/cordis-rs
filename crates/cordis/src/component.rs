@@ -8,9 +8,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::events::{Held, On};
-use crate::guard::Registrations;
 use crate::orchestrator::Control;
-use crate::{Erased, Event, Events, Fiber, FiberId, Key, KeyId, Realm, Resolve, Result, Scope};
+use crate::{Dispose, Erased, Event, Events, Fiber, FiberId, Key, KeyId, Realm, Resolve, Result, Scope};
 
 /// A component's declarations: its configuration type, the keys it depends on, and the keys
 /// it provides.
@@ -42,28 +41,22 @@ pub trait Manifest: Sized + 'static {
 
 /// A component: the effects of activation, under the declarations of its [`Manifest`].
 ///
-/// The value returned by [`activate`](Component::activate) is the component's accumulator.
-/// When the component must stop, the orchestrator awaits [`deactivate`](Component::deactivate),
-/// which drops the value and so reverts every effect it holds.
+/// The value returned by [`activate`](Component::activate) is the service the component
+/// provides. Its effects are undone by its fiber, not by dropping the value: `activate` hands
+/// each inverse to [`Cx::on_dispose`], and the orchestrator runs them, newest first, when the
+/// fiber unloads. That happens on time even if a consumer still holds the value.
 pub trait Component: Manifest + Send + Sync {
     /// Builds the component from its resolved dependencies.
     ///
     /// Runs only while every declared dependency has an active provider. If a dependency
     /// changes before this returns, the orchestrator drops the future at its next `.await`, which
-    /// drops the locals built so far in reverse declaration order.
+    /// drops the locals built so far in reverse declaration order, and then runs the inverses
+    /// handed to [`Cx::on_dispose`] so far.
     fn activate(cx: Cx<Self>, config: Self::Config) -> impl Future<Output = Result<Self>> + Send;
-
-    /// Asynchronous part of the inverse.
-    ///
-    /// Runs after every consumer of this component has finished its own teardown, so the
-    /// component's own dependencies are still available. The default drops `self`.
-    fn deactivate(self) -> impl Future<Output = ()> + Send {
-        async move { drop(self) }
-    }
 }
 
-/// The context of one fiber of `C`: its resolved dependencies, the event bus, and the
-/// registrations the fiber owns.
+/// The context of one fiber run of `C`: its resolved dependencies, the event bus, and the
+/// run's undo list.
 ///
 /// The orchestrator constructs it only when every declared key has an active provider. Cloning is
 /// cheap, so a component can keep a clone as a field and reach its context from ordinary
@@ -95,14 +88,13 @@ pub trait Component: Manifest + Send + Sync {
 /// }
 /// ```
 ///
-/// Every clone registers listeners into the same fiber-owned set, which is reverted when the
-/// fiber unloads or its activation is cancelled or fails. After that, [`is_live`](Cx::is_live)
-/// returns `false` and a new registration is reverted immediately. A listener may capture a
-/// clone of the `Cx` that registered it; the fiber still removes it, so the cycle cannot leak.
+/// Every clone adds to the same undo list, which the orchestrator runs when the fiber unloads
+/// or its activation is cancelled or fails. After that, [`is_live`](Cx::is_live) returns
+/// `false` and anything added is undone at once. A listener may capture a clone of the `Cx`
+/// that registered it; the fiber still removes it, so the cycle cannot leak.
 pub struct Cx<C: Component> {
     deps: Arc<C::Deps>,
     events: Events,
-    registrations: Registrations,
     control: Control,
     _component: PhantomData<fn() -> C>,
 }
@@ -112,7 +104,6 @@ impl<C: Component> Clone for Cx<C> {
         Self {
             deps: self.deps.clone(),
             events: self.events.clone(),
-            registrations: self.registrations.clone(),
             control: self.control.clone(),
             _component: PhantomData,
         }
@@ -120,8 +111,8 @@ impl<C: Component> Clone for Cx<C> {
 }
 
 impl<C: Component> Cx<C> {
-    pub(crate) fn new(deps: Arc<C::Deps>, events: Events, registrations: Registrations, control: Control) -> Self {
-        Self { deps, events, registrations, control, _component: PhantomData }
+    pub(crate) fn new(deps: Arc<C::Deps>, events: Events, control: Control) -> Self {
+        Self { deps, events, control, _component: PhantomData }
     }
 
     /// Returns the id of the fiber this context belongs to.
@@ -131,9 +122,10 @@ impl<C: Component> Cx<C> {
 
     /// Instantiates a child fiber of component `D` under this fiber, with `config`.
     ///
-    /// The child is an effect of this fiber's current activation: the orchestrator retires it when
-    /// that activation ends, whether the fiber unloads, its activation is cancelled, or it
-    /// fails. Like a root fiber, the child activates once its own dependencies have providers
+    /// The child is an effect of this fiber's current activation: it joins the run's undo list
+    /// (see [`on_dispose`](Cx::on_dispose)), so the orchestrator retires it, in its place in the
+    /// list, when that activation ends, whether the fiber unloads, its activation is cancelled,
+    /// or it fails. Like a root fiber, the child activates once its own dependencies have providers
     /// and reloads when they change. The returned [`Fiber`] reads its status, updates its
     /// configuration, or disposes of it early. The parent does not wait for its children to
     /// finish unloading.
@@ -288,13 +280,60 @@ impl<C: Component> Cx<C> {
         &self.deps
     }
 
-    /// Returns whether the fiber still owns registrations made through this context.
+    /// Hands an inverse to this fiber run, which undoes it when the fiber is disposed: when it
+    /// unloads, or when its activation is cancelled or fails.
+    ///
+    /// `undo` is a [`Guard`](crate::Guard) (dropped), a Tokio `JoinHandle` (aborted, then awaited
+    /// until the task has stopped), or an async closure (called and awaited); see [`Dispose`].
+    /// The run undoes its entries newest first, each finishing before the next starts, after
+    /// every consumer of this fiber has finished its own teardown, so dependencies are still
+    /// available. Listeners registered with [`on`](Cx::on) and children instantiated with
+    /// [`plugin`](Cx::plugin) join the same list in the order they are made.
+    ///
+    /// Add each inverse right after the effect it undoes; the order then comes out right:
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// use cordis::{Component, Cx, Guard, Result, component, key};
+    ///
+    /// pub trait Tools: Send + Sync {
+    ///     fn register(&self, name: &str) -> Guard;
+    /// }
+    /// key!(dyn Tools = "tools");
+    ///
+    /// #[component(deps(tools: dyn Tools))]
+    /// struct Indexer;
+    ///
+    /// impl Component for Indexer {
+    ///     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+    ///         cx.on_dispose(|| async { /* flush the index to disk */ });
+    ///         cx.on_dispose(cx.deps().tools.register("search"));
+    ///         cx.on_dispose(tokio::spawn(async {
+    ///             loop {
+    ///                 tokio::time::sleep(Duration::from_secs(60)).await; // reindex
+    ///             }
+    ///         }));
+    ///         // Disposal stops the task, then unregisters the tool, then flushes.
+    ///         Ok(Indexer)
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Once the run has been disposed (see [`is_live`](Cx::is_live)), `undo` is undone at once.
+    pub fn on_dispose(&self, undo: impl Dispose) {
+        self.control.undo().push(undo);
+    }
+
+    /// Returns whether this fiber run is still live, so that what is added through this
+    /// context is undone with the run rather than at once.
     ///
     /// `true` while the fiber activates and while it is active; `false` once it unloads or its
     /// activation is cancelled or fails. A component that outlives its fiber, for example
     /// through an `Arc` a consumer kept, can use it to stop work that needs the fiber.
     pub fn is_live(&self) -> bool {
-        self.registrations.is_open()
+        self.control.undo().is_open()
     }
 
     /// Returns the event bus, for dispatching events.
@@ -306,10 +345,11 @@ impl<C: Component> Cx<C> {
     ///
     /// # Returns
     ///
-    /// A registrar whose `listen` takes the listener signature of `E`'s mode. The fiber holds
-    /// the registration and removes it when the fiber unloads or its activation is cancelled
-    /// or fails. Registering after that removes the listener at once.
+    /// A registrar whose `listen` takes the listener signature of `E`'s mode. The registration
+    /// joins this run's undo list (see [`on_dispose`](Cx::on_dispose)), so the listener is
+    /// removed when the fiber unloads or its activation is cancelled or fails. Registering after
+    /// that removes the listener at once.
     pub fn on<E: Event>(&self) -> On<'_, E, E::Mode, Held<'_>> {
-        On { events: &self.events, sink: Held(&self.registrations), _event: PhantomData }
+        On { events: &self.events, sink: Held(self.control.undo()), _event: PhantomData }
     }
 }

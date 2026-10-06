@@ -51,30 +51,26 @@ impl Component for StaticPrompt {
 struct ChildConfig {
     tag: String,
     name: String,
-    /// Makes `deactivate` wait for `GATE`.
+    /// Makes its undo wait for `GATE`.
     slow: bool,
 }
 
 #[component(config = ChildConfig)]
-struct Child {
-    tag: String,
-    name: String,
-    slow: bool,
-}
+struct Child;
 
 static GATE: Notify = Notify::const_new();
 
 impl Component for Child {
-    async fn activate(_: Cx<Self>, config: ChildConfig) -> Result<Self> {
+    async fn activate(cx: Cx<Self>, config: ChildConfig) -> Result<Self> {
         record(&config.tag, format!("{} up", config.name));
-        Ok(Self { tag: config.tag, name: config.name, slow: config.slow })
-    }
-
-    async fn deactivate(self) {
-        if self.slow {
-            GATE.notified().await;
-        }
-        record(&self.tag, format!("{} down", self.name));
+        let ChildConfig { tag, name, slow } = config;
+        cx.on_dispose(move || async move {
+            if slow {
+                GATE.notified().await;
+            }
+            record(&tag, format!("{name} down"));
+        });
+        Ok(Child)
     }
 }
 
@@ -94,26 +90,21 @@ key!(dyn Marker = "marker");
 /// Instantiates a child named after the prompt text, then follows `then`. Keeps its `Cx` in
 /// `CONTEXTS` so tests can instantiate more children from outside `activate`.
 #[component(config = ParentConfig, deps(prompt: dyn Prompt), provides(dyn Marker))]
-struct Parent {
-    tag: String,
-}
+struct Parent;
 
 impl Marker for Parent {}
 
-/// Consumes the parent's `Marker`; its `deactivate` waits for `WATCH_GATE`, which holds the
-/// parent in `Leaving`.
+/// Consumes the parent's `Marker`; its undo waits for `WATCH_GATE`, which holds the parent in
+/// `Leaving`.
 #[component(deps(marker: dyn Marker))]
 struct Watcher;
 
 static WATCH_GATE: Notify = Notify::const_new();
 
 impl Component for Watcher {
-    async fn activate(_: Cx<Self>, _: ()) -> Result<Self> {
+    async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+        cx.on_dispose(|| WATCH_GATE.notified());
         Ok(Watcher)
-    }
-
-    async fn deactivate(self) {
-        WATCH_GATE.notified().await;
     }
 }
 
@@ -127,6 +118,8 @@ impl Component for Parent {
     async fn activate(cx: Cx<Self>, config: ParentConfig) -> Result<Self> {
         let tag = config.tag;
         CONTEXTS.lock().unwrap().get_or_insert_default().insert(tag.clone(), cx.clone());
+        let down = tag.clone();
+        cx.on_dispose(move || async move { record(&down, "parent down") });
         let name = cx.deps().prompt.text();
         cx.plugin::<Child>(ChildConfig { tag: tag.clone(), name, slow: config.slow_child }).await?;
         match config.then.as_str() {
@@ -135,12 +128,8 @@ impl Component for Parent {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
                 unreachable!("the test cancels this activation");
             }
-            _ => Ok(Self { tag }),
+            _ => Ok(Parent),
         }
-    }
-
-    async fn deactivate(self) {
-        record(&self.tag, "parent down");
     }
 }
 
@@ -154,6 +143,16 @@ async fn start(tag: &str, parent: serde_json::Value) -> (App, FiberId, FiberId) 
         tokio::task::yield_now().await;
     }
     (app, prompt, parent)
+}
+
+/// The child's journal for an activation that failed or was cancelled, after checking that the
+/// parent's own undo ran too. Retiring the child doesn't wait for it, so the parent's entry can
+/// land anywhere among the child's.
+fn undone(tag: &str) -> Vec<String> {
+    let mut entries = journal(tag);
+    let parent = entries.iter().position(|entry| entry == "parent down").expect("the parent's undo ran");
+    entries.remove(parent);
+    entries
 }
 
 /// Polls until `done` holds; the orchestrator's work is asynchronous.
@@ -210,7 +209,7 @@ async fn a_cancelled_activation_retires_its_children() {
     app.remove(prompt);
     app.settled().await;
     assert_eq!(app.status(parent).await, Some(Status::Inactive));
-    assert_eq!(journal("cancel"), ["first up", "first down"]);
+    assert_eq!(undone("cancel"), ["first up", "first down"]);
 }
 
 #[tokio::test]
@@ -218,7 +217,7 @@ async fn a_failed_activation_retires_its_children() {
     let (app, _, parent) = start("fail", json!({ "then": "fail" })).await;
     app.settled().await;
     assert_eq!(app.status(parent).await, Some(Status::Failed("parent failed".into())));
-    assert_eq!(journal("fail"), ["first up", "first down"]);
+    assert_eq!(undone("fail"), ["first up", "first down"]);
 }
 
 #[tokio::test]
