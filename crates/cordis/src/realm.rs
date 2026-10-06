@@ -7,11 +7,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
-use tokio::sync::oneshot;
 
 use crate::erased::Erased;
 use crate::erased::Factory;
-use crate::orchestrator::{Command, Spawner};
+use crate::orchestrator::Spawner;
 use crate::{Component, Fiber, Key, KeyId, Result};
 
 /// A namespace of provisions.
@@ -246,14 +245,5 @@ impl Scope {
     pub async fn plugin<D: Component>(&self, config: impl Serialize) -> Result<Fiber> {
         let config = serde_json::to_value(config)?;
         self.spawner.insert(Arc::new(Factory::of::<D>()), config, self.env.clone()).await
-    }
-
-    /// Returns the current active provider of `K` in the realm this scope resolves it in, without
-    /// this scope's interception.
-    pub async fn get<K: Key + ?Sized>(&self) -> Option<Arc<K::Value>> {
-        let commands = self.spawner.commands()?;
-        let (reply, answer) = oneshot::channel();
-        commands.send(Command::Get { slot: self.env.slot(KeyId::of::<K>()), reply }).ok()?;
-        answer.await.ok().flatten().map(|value| value.get::<K>())
     }
 }

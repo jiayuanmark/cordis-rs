@@ -111,7 +111,7 @@ async fn a_named_realm_is_shared_by_every_scope_that_names_it() {
 
     assert_eq!(seen("tenant-agent"), ["tenant-a"]);
     assert!(seen("other-agent").is_empty());
-    assert_eq!(app.isolate_in::<dyn Tools>(&tenant).get::<dyn Tools>().await.unwrap().owner(), "tenant-a");
+    assert_eq!(app.get_in::<dyn Tools>(&tenant).await.unwrap().owner(), "tenant-a");
     assert!(app.get::<dyn Tools>().await.is_none());
 
     // Withdrawing the realm's provider unloads only the consumers inside it.
