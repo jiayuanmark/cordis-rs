@@ -23,8 +23,8 @@ Rust fixes the *vocabulary* at compile time: which service traits exist, which c
 | Key *k* with value type *V_k* | A type implementing `Key`, with `Key::Value` as *V_k* |
 | Component (*d*, *p*, *e*), Def 48 | A type implementing `Component`, with *d* and *p* declared by `#[component]` |
 | Revertible effect and inverse, §3.1 | A value implementing `Dispose` (a `Guard`, a Tokio `JoinHandle`, an async closure), handed to the fiber with `cx.on_dispose` |
-| Accumulator φ | The undo list of the fiber run, held by the orchestrator; during a cancelled activation, also the future's locals |
-| Effect iterator and iteration boundaries, Def 17 | `async fn activate`; each `.await` is an iteration boundary |
+| Accumulator φ | The undo list of the fiber run, held by the orchestrator |
+| Effect iterator and iteration boundaries, Def 17 | `async fn activate`, which always runs to its end: an `.await` can sit between an effect and its inverse, so the runtime never stops it there (an inertial host, §4.4). `cx.cancelled()` tells it to finish early |
 | Fiber and fiber tree, Defs 49 and 50 | One configured instance of a component, owned by the orchestrator; a child records the activation it was instantiated under |
 | Instantiation and retirement, Def 52 | `cx.plugin::<C>(config)`; the orchestrator retires a child when its parent's activation ends (O-Retire) |
 | Target view and committed view, Def 53 | `View`: the provider of each dependency key, as a fiber and one activation of it |
@@ -126,7 +126,7 @@ async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
 - **Entries that end on their own are dropped early.** A finished task, or a child disposed through its handle, leaves the list (`Dispose::is_finished`), so a long-lived run that starts a task or a child per request doesn't accumulate them.
 - **Newest first, one at a time.** The list runs in reverse order of registration, the rule Rust uses for locals, and each undo finishes before the next starts. Adding each inverse right after its effect gives the right order (Theorem 16). A retired child is not waited for (O-Retire).
 - **On time, whoever holds the value.** The orchestrator runs the list when the fiber unloads, after its consumers have finished their own teardown and before its own providers are released, so dependencies are still readable inside an undo. A consumer or the host that kept the component value keeps only memory; see [Leaks](#leaks).
-- **Failed and cancelled activations run their list too**, async entries included. A cancelled activation first drops its future, which drops its locals in reverse declaration order (rule L-Divert); a panic in that drop is logged and does not wedge the fiber.
+- **Failed and cancelled activations run their list too**, async entries included, once `activate` has returned. A cancelled activation that returns an error is not marked failed.
 - **A slow undo is waited for and never killed**, since the paper has no timeout; a stuck undo holds up its providers' teardown. A panicking undo is logged, and the rest still run.
 - **Dropping the app without `shutdown` still undoes every run**, consumers first. Only the synchronous part of each undo runs in order then; the rest runs on the runtime, and nothing waits for it. A `Cx` holds only a weak handle to its run's list, so a listener or undo that captures its `Cx` cannot keep the run alive.
 - **Added after the run, undone at once.** A `Cx` kept past its run undoes a late `on_dispose` immediately; `cx.is_live()` says which case applies.
@@ -263,7 +263,7 @@ The orchestrator is one task that owns every fiber. It decides *when* a componen
 ```rust
 enum State {
     Inactive,
-    Loading { token: u64, cancel: CancellationToken }, // activate() is running
+    Loading { token: u64, cancel: CancellationToken }, // activate() is running; it always runs to its end
     Active { inst: Box<dyn Instance> },                 // its provisions are in the table
     Leaving { inst: Box<dyn Instance> },                // out of the table; waiting until no longer relied upon
     Deactivating,                                       // the undo list is running
@@ -280,7 +280,7 @@ After every command or task completion, the orchestrator settles each affected f
 | Fiber is | Condition | Action | Paper rule |
 |---|---|---|---|
 | `Inactive` | target view exists | spawn `activate` | L-Begin |
-| `Loading` | target differs from committed | cancel the task; dropping the future reverts its partial effects | L-Divert |
+| `Loading` | target differs from committed | signal `cx.cancelled()`; once `activate` returns, run its undo list | L-Divert |
 | `Loading` completes | target still matches | publish provisions to the table, become `Active`, mark dependents | L-Finish |
 | `Active` | target differs from committed | remove provisions from the table, become `Leaving`, mark dependents | L-Leave |
 | `Leaving` | no committed view names this fiber | run its undo list, then release its own providers | L-Unload |
@@ -363,6 +363,7 @@ The harness is a set of crates, each a service trait plus components that provid
 | Gains | Costs |
 |---|---|
 | Effects are undone by the fiber, asynchronously and on time | Undo order is registration order, which the author gets right by adding each inverse after its effect; a value kept past teardown still answers calls |
+| `activate` is never stopped between an effect and its inverse | An `activate` that waits long must also wait on `cx.cancelled()`; one that never returns holds its fiber and its providers |
 | Undeclared access and invalid provisions are compile errors | Macro-heavy; an undeclared read surfaces as a missing field on the generated `{Type}Deps` |
 | Event payloads and modes are checked at compile time | Async listeners take owned or `Arc` arguments, not borrowed ones |
 | Lifecycle transitions are serialized by one owner | No native code replacement; new code arrives through WASM or another process |

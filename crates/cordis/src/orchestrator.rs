@@ -222,6 +222,8 @@ pub(crate) struct Control {
     env: Env,
     /// The undo list of this activation.
     undo: UndoHandle,
+    /// Cancelled once this run should stop: its activation was diverted, or the fiber leaves.
+    cancel: CancellationToken,
 }
 
 impl Control {
@@ -235,6 +237,10 @@ impl Control {
 
     pub(crate) fn undo(&self) -> &UndoHandle {
         &self.undo
+    }
+
+    pub(crate) fn cancel(&self) -> &CancellationToken {
+        &self.cancel
     }
 
     /// Returns the fiber's own context, from which its children derive theirs.
@@ -354,7 +360,8 @@ impl Dispose for Retire {
 }
 
 enum Event {
-    /// An activation task ended. `outcome` is `None` when the task was cancelled.
+    /// An activation task ended. `outcome` is `None` when the activation was cancelled and
+    /// returned without an instance.
     Loaded {
         id: FiberId,
         token: u64,
@@ -388,7 +395,7 @@ struct Committed {
 enum State {
     Inactive,
     Loading { token: u64, cancel: CancellationToken, undo: UndoHandle },
-    Active { instance: Box<dyn Instance> },
+    Active { instance: Box<dyn Instance>, cancel: CancellationToken },
     Leaving { instance: Box<dyn Instance> },
     Deactivating,
     Failed { view: View, epoch: u64, error: String },
@@ -665,8 +672,9 @@ impl Orchestrator {
             owner: Owner { id, token },
             env: fiber.env.clone(),
             undo: undo.handle(),
+            cancel: cancel.clone(),
         };
-        let mut task = (fiber.factory.activate)(deps, fiber.config.clone(), self.bus.clone(), control);
+        let task = (fiber.factory.activate)(deps, fiber.config.clone(), self.bus.clone(), control);
         fiber.committed = Some(Committed { view, epoch: fiber.epoch });
         fiber.owner = Some(token);
         fiber.state = State::Loading { token, cancel: cancel.clone(), undo: undo.handle() };
@@ -674,22 +682,25 @@ impl Orchestrator {
         self.in_flight += 1;
         let events = self.events.clone();
         tokio::spawn(async move {
-            let outcome = tokio::select! {
-                result = AssertUnwindSafe(&mut task).catch_unwind() => Some(match result {
-                    Ok(Ok(instance)) => Ok(instance),
-                    Ok(Err(error)) => Err(error.to_string()),
-                    Err(panic) => Err(panic_message(&*panic)),
-                }),
-                () = cancel.cancelled() => None,
+            // `activate` always runs to its end. Dropping it at an `.await` could stop it between
+            // an effect and the `on_dispose` that undoes it (an async host is inertial, paper
+            // §4.4); a cancelled run sees `cx.cancelled()` and returns early instead.
+            let outcome = match AssertUnwindSafe(task).catch_unwind().await {
+                Ok(Ok(instance)) => Some(Ok(instance)),
+                Err(panic) if cancel.is_cancelled() => {
+                    tracing::error!(fiber = ?id, panic = panic_message(&*panic), "cancelled activation panicked");
+                    None
+                }
+                // A cancelled activation that returns no instance was stopped, not failed.
+                _ if cancel.is_cancelled() => None,
+                Ok(Err(error)) => Some(Err(error.to_string())),
+                Err(panic) => Some(Err(panic_message(&*panic))),
             };
-            // Dropping a cancelled activation drops the locals it built so far, in reverse
-            // order. A panic there must not keep this task from reporting back.
-            if let Err(panic) = std::panic::catch_unwind(AssertUnwindSafe(move || drop(task))) {
-                tracing::error!(fiber = ?id, panic = panic_message(&*panic), "dropping a cancelled activation panicked");
-            }
             // An activation that did not produce an instance is disposed of here; an instance
-            // takes the undo list with it.
+            // takes the undo list with it. The run has ended, so a `Cx` kept from it sees
+            // `cancelled()` resolve.
             if !matches!(outcome, Some(Ok(_))) {
+                cancel.cancel();
                 undo.run().await;
             }
             let _ = events.send(Event::Loaded { id, token, outcome });
@@ -738,14 +749,19 @@ impl Orchestrator {
             self.table.insert(slot.clone(), (run, value));
             self.mark(&slot);
         }
-        self.fibers[run.id].state = State::Active { instance };
+        let State::Loading { cancel, .. } = &self.fibers[run.id].state else {
+            unreachable!("only a loading fiber publishes");
+        };
+        let cancel = cancel.clone();
+        self.fibers[run.id].state = State::Active { instance, cancel };
     }
 
     fn leave(&mut self, id: FiberId) {
         let fiber = &mut self.fibers[id];
-        let State::Active { instance } = std::mem::replace(&mut fiber.state, State::Inactive) else {
+        let State::Active { instance, cancel } = std::mem::replace(&mut fiber.state, State::Inactive) else {
             unreachable!("only an active fiber leaves");
         };
+        cancel.cancel();
         fiber.state = State::Leaving { instance };
         let provides = fiber.provides.clone();
         for slot in provides {
@@ -813,6 +829,12 @@ impl Orchestrator {
     /// `shutdown` would undo them in, so a consumer's undos run while its providers' effects
     /// are still in place.
     fn drop_consumers_first(&mut self) {
+        // Runs still activating see `cx.cancelled()`, so they end and undo their lists.
+        for fiber in self.fibers.values() {
+            if let State::Loading { cancel, .. } | State::Active { cancel, .. } = &fiber.state {
+                cancel.cancel();
+            }
+        }
         loop {
             let unrelied: Vec<FiberId> =
                 self.fibers.keys().filter(|id| self.relied.get(*id).is_none_or(|count| *count == 0)).collect();

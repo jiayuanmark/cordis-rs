@@ -77,7 +77,8 @@ impl Component for Child {
 #[derive(Deserialize)]
 struct ParentConfig {
     tag: String,
-    /// What `activate` does after instantiating its first child: `ok`, `fail`, or `hang`.
+    /// What `activate` does after instantiating its first child: `ok`, `fail`, or `hang` until
+    /// cancelled.
     #[serde(default)]
     then: String,
     #[serde(default)]
@@ -125,8 +126,8 @@ impl Component for Parent {
         match config.then.as_str() {
             "fail" => Err("parent failed".into()),
             "hang" => {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-                unreachable!("the test cancels this activation");
+                cx.cancelled().await;
+                Err("cancelled".into())
             }
             _ => Ok(Parent),
         }
