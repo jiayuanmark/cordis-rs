@@ -112,13 +112,13 @@ impl Drop for ToolRegistry {
 #[component(config = Tag, deps(tools: dyn Tools))]
 struct GrepTool {
     tag: String,
-    _registration: Guard,
 }
 
 impl Component for GrepTool {
     async fn activate(cx: Cx<Self>, config: Tag) -> Result<Self> {
         record(&config.tag, "activate grep");
-        Ok(Self { tag: config.tag, _registration: cx.deps().tools.register("grep") })
+        cx.on_dispose(cx.deps().tools.register("grep"));
+        Ok(Self { tag: config.tag })
     }
 }
 
@@ -280,7 +280,6 @@ struct ServerConfig {
 
 #[component(config = ServerConfig, provides(dyn Prompt))]
 struct Server {
-    tag: String,
     name: String,
 }
 
@@ -291,19 +290,19 @@ impl Prompt for Server {
 }
 
 impl Component for Server {
-    async fn activate(_: Cx<Self>, config: ServerConfig) -> Result<Self> {
+    async fn activate(cx: Cx<Self>, config: ServerConfig) -> Result<Self> {
         record(&config.tag, format!("start {}", config.name));
         tokio::time::sleep(Duration::from_millis(20)).await;
         if config.fail {
             record(&config.tag, format!("fail {}", config.name));
             return Err("configured to fail".into());
         }
-        Ok(Self { tag: config.tag, name: config.name })
-    }
-
-    async fn deactivate(self) {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        record(&self.tag, format!("stop {}", self.name));
+        let (tag, name) = (config.tag, config.name.clone());
+        cx.on_dispose(move || async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            record(&tag, format!("stop {name}"));
+        });
+        Ok(Self { name: config.name })
     }
 }
 

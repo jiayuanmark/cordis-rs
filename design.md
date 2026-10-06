@@ -6,7 +6,7 @@ This document describes a native Rust realization of the context paradigm from *
 
 TypeScript Cordis enforces the paper's guarantees with runtime machinery: a `Proxy` that mediates every context access, an explicit effect accumulator, and a string-keyed event bus. In Rust, language features replace most of that machinery:
 
-- **Revertible effects** are ownership and `Drop`.
+- **Revertible effects** are values whose drop or async close is the inverse, handed to the fiber's undo list.
 - **Effect iterators** are `async fn`.
 - **Coeffect specifications** are associated types.
 - **Coeffect provisions** are checked coercions to `Arc<dyn Trait>`.
@@ -22,8 +22,8 @@ Rust fixes the *vocabulary* at compile time: which service traits exist, which c
 |---|---|
 | Key *k* with value type *V_k* | A type implementing `Key`, with `Key::Value` as *V_k* |
 | Component (*d*, *p*, *e*), Def 48 | A type implementing `Component`, with *d* and *p* declared by `#[component]` |
-| Revertible effect and inverse, §3.1 | Owning a value whose `Drop` performs the inverse |
-| Accumulator φ | The component's state value; during a cancelled activation, the future's locals |
+| Revertible effect and inverse, §3.1 | A value implementing `Dispose` (a `Guard`, a Tokio `JoinHandle`, an async closure), handed to the fiber with `cx.on_dispose` |
+| Accumulator φ | The undo list of the fiber run, held by the orchestrator; during a cancelled activation, also the future's locals |
 | Effect iterator and iteration boundaries, Def 17 | `async fn activate`; each `.await` is an iteration boundary |
 | Fiber and fiber tree, Defs 49 and 50 | One configured instance of a component, owned by the orchestrator; a child records the activation it was instantiated under |
 | Instantiation and retirement, Def 52 | `cx.plugin::<C>(config)`; the orchestrator retires a child when its parent's activation ends (O-Retire) |
@@ -67,7 +67,7 @@ impl Key for ReplicaDb { type Value = dyn Database; const NAME: &'static str = "
 
 ## Components
 
-A component is a type. Its state value is its accumulator: dropping the value reverts everything the component did.
+A component is a type. Its value is the service it provides. What it did is undone by its fiber: `activate` hands each inverse to `cx.on_dispose`, and the orchestrator runs them when the fiber unloads.
 
 ```rust
 pub trait Manifest: Sized + 'static {
@@ -79,13 +79,12 @@ pub trait Manifest: Sized + 'static {
 
 pub trait Component: Manifest + Send + Sync {
     fn activate(cx: Cx<Self>, cfg: Self::Config) -> impl Future<Output = Result<Self>> + Send;
-    fn deactivate(self) -> impl Future<Output = ()> + Send { async {} } // Drop does the rest
 }
 ```
 
 ```rust
 #[component(config = GrepConfig, deps(tools: dyn Tools, fs: dyn Fs))]
-struct GrepTool { _reg: Guard }
+struct GrepTool;
 
 // generated:
 // struct GrepToolDeps { pub tools: Arc<dyn Tools>, pub fs: Arc<dyn Fs> }
@@ -93,7 +92,8 @@ struct GrepTool { _reg: Guard }
 impl Component for GrepTool {
     async fn activate(cx: Cx<Self>, cfg: GrepConfig) -> Result<Self> {
         let GrepToolDeps { tools, fs } = cx.deps();
-        Ok(Self { _reg: tools.register(grep_tool(fs.clone(), cfg)) })
+        cx.on_dispose(tools.register(grep_tool(fs.clone(), cfg)));
+        Ok(GrepTool)
     }
 }
 ```
@@ -102,18 +102,35 @@ impl Component for GrepTool {
 - **Dependencies are a typed struct.** `deps(name: Key, ...)` generates `{Type}Deps` with one `Arc<Key::Value>` field per entry and sets it as `Manifest::Deps`. The registry stays type-erased, because configuration decides at runtime which fiber provides each key; generated code downcasts each entry once, before `activate`, and `Cx<Self>` holds the resulting `Arc<Self::Deps>`. After that, reading a dependency is a field access, with no lookup or cast. This is the pattern of Bevy's `SystemParam` and axum's extractors: the compiler checks the declaration and the runtime only fills it in.
 - **Undeclared access does not compile.** Only declared keys have a field in `{Type}Deps`, so `cx.deps()` is the one way to read a dependency, and reading anything else is a missing-field error. `#[component]` also rejects a key listed twice.
 - **Inactive access cannot be expressed.** The orchestrator constructs `Cx<Self>` only when every dependency has an active provider.
-- **Methods reach the context through a stored `Cx`.** `Cx` is a cheap clone, so a component keeps one as a field and calls `self.cx.deps()` or `self.cx.on::<E>()` from ordinary methods. Every clone registers into the fiber's own set, which is reverted when the fiber unloads; after that `cx.is_live()` is `false` and new registrations revert at once. Closing the set breaks the cycle when a listener captures a `Cx` clone.
+- **Methods reach the context through a stored `Cx`.** `Cx` is a cheap clone, so a component keeps one as a field and calls `self.cx.deps()` or `self.cx.on::<E>()` from ordinary methods. Every clone adds to the same undo list, which runs when the fiber unloads; after that `cx.is_live()` is `false` and anything added is undone at once. Closing the list breaks the cycle when a listener captures a `Cx` clone.
 - **A small proc-macro crate.** `cordis-macros` holds only the attribute. A declarative `component!(Name { ... })` would avoid `syn` but has to be told the type's name, and wrapping the struct inside it would take the struct out of rustfmt's reach.
 
 ### Effects
 
-- **Unloading drops the component value.** Every `Guard` field drops with it and reverts its registration.
-- **External resources already follow this pattern.** `AbortOnDropHandle`, `Command::kill_on_drop`, `TempDir`, and listener sockets release their resource on drop, which covers most of the system boundary in paper §6.1.
-- **Attribution is possession.** An effect belongs to whoever holds its guard.
+Each run of a fiber, from `activate` until its teardown, has one undo list, held by the orchestrator rather than by the component value. This is the paper's accumulator held by the runtime (Def 49) and TypeScript's `ctx.effect`.
+
+```rust
+async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+    let index = Arc::new(Mutex::new(Index::load().await?));
+    let flush = index.clone();
+    cx.on_dispose(move || async move { flush.lock().await.flush().await }); // 1
+    cx.on_dispose(cx.deps().tools.register(search_tool(index.clone())));   // 2
+    cx.on_dispose(tokio::spawn(reindex_every_minute(index.clone())));      // 3
+    Ok(Self { index })
+}
+// Teardown: stop the task (3), unregister the tool (2), then flush (1).
+```
+
+- **One method, three kinds of inverse.** `cx.on_dispose(x)` takes anything implementing `Dispose`: a `Guard` or `Guards` (dropped), a Tokio `JoinHandle` (aborted, then awaited until the task has stopped, so everything it owned is dropped), or an async closure (called and awaited). A type with an async close can implement `Dispose` itself.
+- **Listeners and children join the same list.** `cx.on` adds its listener's guard and `cx.plugin` adds the child's retirement, in the order they are made.
+- **Newest first, one at a time.** The list runs in reverse order of registration, the rule Rust uses for locals, and each undo finishes before the next starts. Adding each inverse right after its effect gives the right order (Theorem 16). A retired child is not waited for (O-Retire).
+- **On time, whoever holds the value.** The orchestrator runs the list when the fiber unloads, after its consumers have finished their own teardown and before its own providers are released, so dependencies are still readable inside an undo. A consumer or the host that kept the component value keeps only memory; see [Leaks](#leaks).
+- **Failed and cancelled activations run their list too**, async entries included. A cancelled activation first drops its future, which drops its locals in reverse declaration order (rule L-Divert); a panic in that drop is logged and does not wedge the fiber.
+- **A slow undo is waited for, with a warning** every five seconds; it is never killed, since the paper has no timeout. A panicking undo is logged, and the rest still run.
+- **Added after the run, undone at once.** A `Cx` kept past its run undoes a late `on_dispose` immediately; `cx.is_live()` says which case applies.
+- **External resources already follow this pattern.** `AbortOnDropHandle`, `Command::kill_on_drop`, `TempDir`, and listener sockets release their resource on drop, which covers most of the system boundary in paper §6.1. Wrap one in a `Guard`, or move it into a task, to put it on the list.
 - **A guard holds a `Weak` reference to its registry**, so it never keeps its provider alive and does nothing if the registry is already gone.
-- **LIFO revert.** Dropping an `activate` future drops its locals in reverse declaration order, which realizes rule L-Divert and Theorem 16. `Vec` drops front to back, so `Guards` pops from the back.
-- **Async cleanup goes in `deactivate`.** Rust has no stable async `Drop`, so a cancelled activation receives only synchronous cleanup.
-- **Registrations made through `Cx` belong to the fiber.** The fiber holds their guards and drops them before `deactivate` runs, or when the activation is cancelled or fails.
+- **A guard kept in a field still works, without the timing promise.** It reverts when the component value drops: on time if nobody kept a clone, late if someone did.
 
 ## Provision
 
@@ -173,7 +190,7 @@ let result = cx.events().waterfall::<ToolsPreExecute>(call, |call| run_tool(call
   ```
 
 - **`on::<E>()` returns a registrar** whose `listen` signature depends on the event's mode. Putting the signature on a method with a direct `Fn` bound lets the compiler infer closure argument types.
-- **Registrations are effects.** `cx.on` hands its guard to the fiber, so listeners are removed when the fiber unloads, and when its activation is cancelled or fails. Host code outside a component uses `app.events().on::<E>().listen(...)`, which returns the `Guard`.
+- **Registrations are effects.** `cx.on` adds its guard to the fiber run's undo list, so listeners are removed when the fiber unloads, and when its activation is cancelled or fails. Host code outside a component uses `app.events().on::<E>().listen(...)`, which returns the `Guard`.
 - **Payloads move instead of being shared mutably.** A waterfall passes `Args` by value down the chain; each listener may change it before calling `next.run(args)`. Parallel and serial listeners share an `Arc<Args>`.
 - **A waterfall listener returns `Flow<Output>`**, which only `next.run()` or an explicit `Flow::short_circuit` can produce, so an accidental short circuit does not compile. `Flow::map` post-processes the downstream result.
 - **TODO: listener order.** Listeners run in registration order, and registration happens during activation, so components that activate concurrently register in an unspecified order, and a reloaded component moves to the end. TypeScript Cordis has the same behaviour and offers `prepend`; the harness uses it where position matters. Planned: an explicit priority, with ties broken by the fiber's row position, so the order is deterministic and survives reloads.
@@ -247,7 +264,7 @@ enum State {
     Loading { token: u64, cancel: CancellationToken }, // activate() is running
     Active { inst: Box<dyn Instance> },                 // its provisions are in the table
     Leaving { inst: Box<dyn Instance> },                // out of the table; waiting until no longer relied upon
-    Deactivating,                                       // deactivate() is running
+    Deactivating,                                       // the undo list is running
     Failed { view: View, error: String },
 }
 ```
@@ -264,7 +281,7 @@ After every command or task completion, the orchestrator settles each affected f
 | `Loading` | target differs from committed | cancel the task; dropping the future reverts its partial effects | L-Divert |
 | `Loading` completes | target still matches | publish provisions to the table, become `Active`, mark dependents | L-Finish |
 | `Active` | target differs from committed | remove provisions from the table, become `Leaving`, mark dependents | L-Leave |
-| `Leaving` | no committed view names this fiber | run `deactivate`, then release its own providers | L-Unload |
+| `Leaving` | no committed view names this fiber | run its undo list, then release its own providers | L-Unload |
 
 - **Only active fibers are in the table.** A provider value does not exist until `activate` returns it, so dependents can never see a half-built provider.
 - **Dependents are found through a reverse index** from each key to the fibers that depend on it.
@@ -294,14 +311,14 @@ Activation runs in dependency order, and independent branches activate concurren
 A component instantiates a child fiber with `cx.plugin::<C>(config)`, from `activate` or from any method of a value that keeps its `Cx`. The child is an effect of the parent's current activation:
 
 - **The orchestrator owns the link.** Each fiber records the activation it was instantiated under (`parent: Option<Owner>`, an id plus the activation token). The parent's `Cx` carries a weak sender to the orchestrator, so a kept `Cx` never keeps the orchestrator alive.
-- **Retirement follows the parent's activation.** When that activation ends, whether it is cancelled, fails, or unloads (at the start of `deactivate`), the orchestrator sets the retirement flag on each of its children. A reload is an unload and a fresh activation, so a reloaded parent gets fresh children.
+- **Retirement follows the parent's activation.** The child is an entry in the parent's undo list, so it is retired in its place when that list runs: when the activation is cancelled, fails, or unloads. Once the list has run, the orchestrator retires any child still left. A reload is an unload and a fresh activation, so a reloaded parent gets fresh children.
 - **The parent does not wait.** As in the paper's O-Retire, retirement is unconditional, and a parent may finish unloading while a child is still unloading (§4.2.1). Children do not count toward the parent's "relied upon" guard.
 - **A child is an ordinary fiber otherwise.** It activates when its own dependencies have providers and reloads when they change. `plugin` returns a `Fiber` handle with `status`, `update`, and `dispose`, so a parent can retire a child early, such as an agent that finished its task. Like a TS fiber, the handle is a view: dropping it changes nothing. `App::parent` reports the link.
 - **Late requests are refused.** A fiber that is leaving or whose activation has ended gets an error from `plugin`; in the paper's `Unloading` state a fiber performs no more effects. The orchestrator makes the check, so a race cannot leave an orphan.
 
 ### Leaks
 
-The orchestrator holds each instance as an `Arc<Self>`. After the guard releases, it calls `Arc::into_inner` to recover the owned value for `deactivate`. `None` means some consumer kept a clone past its own teardown. The orchestrator logs the leak, and `Drop` runs when the last clone is released.
+The orchestrator holds each instance as an `Arc<Self>` and publishes clones of it. Teardown never needs the value back: the orchestrator runs the undo list and drops its own clone. A consumer or the host that kept a clone past teardown keeps a value whose effects are already undone. Calls on it still run, so a component that keeps its `Cx` can check `cx.is_live()`; `Drop` runs when the last clone is released.
 
 ## Execution tiers
 
@@ -343,7 +360,7 @@ The harness is a set of crates, each a service trait plus components that provid
 
 | Gains | Costs |
 |---|---|
-| Effect tracking is ownership | No async `Drop`: cancelled activations get synchronous cleanup only |
+| Effects are undone by the fiber, asynchronously and on time | Undo order is registration order, which the author gets right by adding each inverse after its effect; a value kept past teardown still answers calls |
 | Undeclared access and invalid provisions are compile errors | Macro-heavy; an undeclared read surfaces as a missing field on the generated `{Type}Deps` |
 | Event payloads and modes are checked at compile time | Async listeners take owned or `Arc` arguments, not borrowed ones |
 | Lifecycle transitions are serialized by one owner | No native code replacement; new code arrives through WASM or another process |

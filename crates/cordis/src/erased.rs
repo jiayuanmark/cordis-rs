@@ -1,13 +1,13 @@
 //! Type-erased values and component operations used by the orchestrator.
 
-use std::any::{Any, type_name};
+use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::guard::RegistrationsOwner;
+use crate::dispose::Undo;
 use crate::orchestrator::Control;
 use crate::realm::Env;
 use crate::{Component, Cx, Events, Key, KeyId, Manifest, Result};
@@ -97,10 +97,10 @@ fn activate<C: Component>(
 ) -> BoxFuture<Result<Box<dyn Instance>>> {
     Box::pin(async move {
         let config: C::Config = serde_json::from_value(config)?;
-        let registrations = RegistrationsOwner::new();
         let deps = Arc::new(C::resolve(&Resolve { values: &deps, env: control.env() }));
-        let component = C::activate(Cx::new(deps, events, registrations.registrations(), control), config).await?;
-        Ok(Box::new(Active { component: Arc::new(component), registrations }) as Box<dyn Instance>)
+        let undo = control.undo().clone();
+        let component = C::activate(Cx::new(deps, events, control), config).await?;
+        Ok(Box::new(Active { component: Arc::new(component), undo }) as Box<dyn Instance>)
     })
 }
 
@@ -109,15 +109,15 @@ pub(crate) trait Instance: Send + Sync {
     /// Returns the value to publish under each provided key.
     fn provisions(&self) -> Vec<(KeyId, Erased)>;
 
-    /// Runs the component's inverse.
-    fn deactivate(self: Box<Self>) -> BoxFuture<()>;
+    /// Runs the fiber run's undo list, then releases the orchestrator's reference to the
+    /// component.
+    fn dispose(self: Box<Self>) -> BoxFuture<()>;
 }
 
 struct Active<C> {
     component: Arc<C>,
-    /// Registrations made through `Cx`, including clones the component kept; closed before
-    /// `deactivate` so no listener runs during teardown.
-    registrations: RegistrationsOwner,
+    /// The run's undo list, which every `Cx` clone of the run adds to.
+    undo: Undo,
 }
 
 impl<C: Component> Instance for Active<C> {
@@ -125,18 +125,13 @@ impl<C: Component> Instance for Active<C> {
         <C as Manifest>::publish(&self.component)
     }
 
-    fn deactivate(self: Box<Self>) -> BoxFuture<()> {
-        let Active { component, registrations } = *self;
-        drop(registrations);
-        match Arc::into_inner(component) {
-            Some(component) => Box::pin(component.deactivate()),
-            None => {
-                tracing::warn!(
-                    component = type_name::<C>(),
-                    "a reference outlived every consumer's teardown; the component drops when it is released",
-                );
-                Box::pin(async {})
-            }
-        }
+    fn dispose(self: Box<Self>) -> BoxFuture<()> {
+        let Active { component, undo } = *self;
+        Box::pin(async move {
+            undo.run().await;
+            // A consumer may still hold the value; its effects are undone either way, and it
+            // drops when the last reference is released.
+            drop(component);
+        })
     }
 }

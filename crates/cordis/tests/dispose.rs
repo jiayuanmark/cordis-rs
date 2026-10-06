@@ -1,0 +1,363 @@
+//! The undo list of a fiber run: what `Cx::on_dispose` hands over, in what order it is undone,
+//! and when.
+
+use std::collections::HashMap;
+use std::future::Ready;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use cordis::{App, Component, Cx, Guard, Result, Status, component, event, key};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+// Journal shared by the components below. Tests run in parallel, so each entry carries the
+// test's tag.
+
+static JOURNAL: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+fn record(tag: &str, entry: impl Into<String>) {
+    JOURNAL.lock().unwrap().push((tag.to_owned(), entry.into()));
+}
+
+fn journal(tag: &str) -> Vec<String> {
+    JOURNAL.lock().unwrap().iter().filter(|(t, _)| t == tag).map(|(_, e)| e.clone()).collect()
+}
+
+/// Records `entry` when dropped.
+struct Recorder {
+    tag: String,
+    entry: &'static str,
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        record(&self.tag, self.entry);
+    }
+}
+
+/// Polls until `done` holds; the orchestrator's work is asynchronous.
+async fn until(mut done: impl FnMut() -> bool) {
+    for _ in 0..1000 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("condition not reached");
+}
+
+#[derive(Serialize, Deserialize)]
+struct Tag {
+    tag: String,
+}
+
+fn tag(tag: &str) -> serde_json::Value {
+    json!({ "tag": tag })
+}
+
+pub trait Store: Send + Sync {
+    fn name(&self) -> String;
+}
+key!(dyn Store = "store");
+
+#[component(config = Tag, provides(dyn Store))]
+struct MemoryStore;
+
+impl Store for MemoryStore {
+    fn name(&self) -> String {
+        "memory".into()
+    }
+}
+
+impl Component for MemoryStore {
+    async fn activate(cx: Cx<Self>, config: Tag) -> Result<Self> {
+        cx.on_dispose(move || async move { record(&config.tag, "store down") });
+        Ok(MemoryStore)
+    }
+}
+
+/// Three async undos that each yield halfway through.
+#[component(config = Tag)]
+struct Stack;
+
+impl Component for Stack {
+    async fn activate(cx: Cx<Self>, config: Tag) -> Result<Self> {
+        for step in 1..=3 {
+            let tag = config.tag.clone();
+            cx.on_dispose(move || async move {
+                record(&tag, format!("start {step}"));
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                record(&tag, format!("end {step}"));
+            });
+        }
+        Ok(Stack)
+    }
+}
+
+#[tokio::test]
+async fn undos_run_newest_first_one_at_a_time() {
+    let app = App::new();
+    let stack = app.insert::<Stack>(tag("stack")).await;
+    app.settled().await;
+
+    app.remove(stack);
+    app.settled().await;
+    assert_eq!(journal("stack"), ["start 3", "end 3", "start 2", "end 2", "start 1", "end 1"]);
+}
+
+/// Runs a background task, flushing after it has stopped.
+#[component(config = Tag)]
+struct Ticker;
+
+impl Component for Ticker {
+    async fn activate(cx: Cx<Self>, config: Tag) -> Result<Self> {
+        let tag = config.tag.clone();
+        cx.on_dispose(move || async move { record(&tag, "flush") });
+        let owned = Recorder { tag: config.tag, entry: "task stopped" };
+        cx.on_dispose(tokio::spawn(async move {
+            let _owned = owned;
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }));
+        Ok(Ticker)
+    }
+}
+
+#[tokio::test]
+async fn a_task_has_stopped_before_older_undos_run() {
+    let app = App::new();
+    let ticker = app.insert::<Ticker>(tag("ticker")).await;
+    app.settled().await;
+    assert_eq!(journal("ticker"), Vec::<String>::new());
+
+    app.remove(ticker);
+    app.settled().await;
+    assert_eq!(journal("ticker"), ["task stopped", "flush"]);
+}
+
+/// Consumes `dyn Store`, and still reads it while undoing.
+#[component(config = Tag, deps(store: dyn Store))]
+struct Reader;
+
+impl Component for Reader {
+    async fn activate(cx: Cx<Self>, config: Tag) -> Result<Self> {
+        let store = cx.deps().store.clone();
+        cx.on_dispose(move || async move { record(&config.tag, format!("reader down, store {}", store.name())) });
+        Ok(Reader)
+    }
+}
+
+#[tokio::test]
+async fn a_held_service_is_still_undone_on_time_and_consumers_go_first() {
+    let app = App::new();
+    let store = app.insert::<MemoryStore>(tag("held")).await;
+    app.insert::<Reader>(tag("held")).await;
+    app.settled().await;
+    let held = app.get::<dyn Store>().await.expect("the store is active");
+
+    app.remove(store);
+    app.settled().await;
+    assert_eq!(app.status(store).await, None);
+    assert_eq!(journal("held"), ["reader down, store memory", "store down"]);
+    // The host's copy is now just a value; its effects were undone without it.
+    assert_eq!(held.name(), "memory");
+}
+
+event!(Ping = "dispose/ping", Emit(String));
+
+/// Emits `Ping` from an undo older and an undo newer than its own listener.
+#[component(config = Tag)]
+struct Echo;
+
+impl Component for Echo {
+    async fn activate(cx: Cx<Self>, config: Tag) -> Result<Self> {
+        let events = cx.events().clone();
+        cx.on_dispose(move || async move { events.emit::<Ping>("older".into()) });
+        let tag = config.tag;
+        cx.on::<Ping>().listen(move |text| record(&tag, format!("heard {text}")));
+        let events = cx.events().clone();
+        cx.on_dispose(move || async move { events.emit::<Ping>("newer".into()) });
+        Ok(Echo)
+    }
+}
+
+#[tokio::test]
+async fn a_listener_is_removed_in_its_place_in_the_list() {
+    let app = App::new();
+    let echo = app.insert::<Echo>(tag("echo")).await;
+    app.settled().await;
+
+    app.remove(echo);
+    app.settled().await;
+    assert_eq!(journal("echo"), ["heard newer"]);
+}
+
+#[component(config = Tag)]
+struct Leaf;
+
+impl Component for Leaf {
+    async fn activate(cx: Cx<Self>, config: Tag) -> Result<Self> {
+        cx.on_dispose(move || async move { record(&config.tag, "leaf down") });
+        Ok(Leaf)
+    }
+}
+
+/// Instantiates a `Leaf` between two undos.
+#[component(config = Tag)]
+struct Branch;
+
+impl Component for Branch {
+    async fn activate(cx: Cx<Self>, config: Tag) -> Result<Self> {
+        let tag = config.tag.clone();
+        cx.on_dispose(move || async move { record(&tag, "older undo") });
+        let leaf = cx.plugin::<Leaf>(Tag { tag: config.tag.clone() }).await?;
+        let tag = config.tag;
+        cx.on_dispose(move || async move { record(&tag, "newer undo") });
+        drop(leaf);
+        Ok(Branch)
+    }
+}
+
+#[tokio::test]
+async fn a_child_is_retired_in_its_place_in_the_list() {
+    let app = App::new();
+    let branch = app.insert::<Branch>(tag("branch")).await;
+    app.settled().await;
+
+    app.remove(branch);
+    app.settled().await;
+    let entries = journal("branch");
+    let at = |entry: &str| entries.iter().position(|e| e == entry).unwrap_or_else(|| panic!("{entry} missing"));
+    assert_eq!(entries.len(), 3);
+    assert_eq!(at("newer undo"), 0);
+    // The parent doesn't wait for a retired child, so only the newer undo is ordered before it.
+    assert!(at("newer undo") < at("leaf down"));
+}
+
+#[derive(Serialize, Deserialize)]
+struct EndConfig {
+    tag: String,
+    /// `fail`, or `hang` until cancelled.
+    then: String,
+}
+
+/// Adds an async undo, then fails or hangs.
+#[component(config = EndConfig, deps(store: dyn Store))]
+struct Unfinished;
+
+impl Component for Unfinished {
+    async fn activate(cx: Cx<Self>, config: EndConfig) -> Result<Self> {
+        let tag = config.tag.clone();
+        cx.on_dispose(move || async move {
+            tokio::task::yield_now().await;
+            record(&tag, "undone");
+        });
+        record(&config.tag, "started");
+        match config.then.as_str() {
+            "fail" => Err("unfinished".into()),
+            _ => {
+                let _bomb = Bomb;
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                unreachable!("the test cancels this activation");
+            }
+        }
+    }
+}
+
+/// Panics when dropped, as a local of a cancelled activation.
+struct Bomb;
+
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        panic!("bomb dropped");
+    }
+}
+
+#[tokio::test]
+async fn a_failed_activation_runs_its_async_undos() {
+    let app = App::new();
+    app.insert::<MemoryStore>(tag("failed")).await;
+    let unfinished = app.insert::<Unfinished>(json!({ "tag": "failed", "then": "fail" })).await;
+    app.settled().await;
+    assert_eq!(app.status(unfinished).await, Some(Status::Failed("unfinished".into())));
+    assert_eq!(journal("failed"), ["started", "undone"]);
+}
+
+#[tokio::test]
+async fn a_cancelled_activation_runs_its_async_undos_even_when_a_local_panics_on_drop() {
+    let app = App::new();
+    let store = app.insert::<MemoryStore>(tag("cancelled")).await;
+    let unfinished = app.insert::<Unfinished>(json!({ "tag": "cancelled", "then": "hang" })).await;
+    until(|| journal("cancelled") == ["started"]).await;
+
+    app.remove(store);
+    tokio::time::timeout(Duration::from_secs(5), app.settled()).await.expect("the app settles");
+    assert_eq!(app.status(unfinished).await, Some(Status::Inactive));
+    let mut entries = journal("cancelled");
+    entries.sort();
+    assert_eq!(entries, ["started", "store down", "undone"]);
+}
+
+/// Panics in two of its undos.
+#[component(config = Tag)]
+struct Faulty;
+
+impl Component for Faulty {
+    async fn activate(cx: Cx<Self>, config: Tag) -> Result<Self> {
+        let tag = config.tag.clone();
+        cx.on_dispose(move || async move { record(&tag, "oldest") });
+        cx.on_dispose(|| async { panic!("async undo panicked") });
+        cx.on_dispose(|| -> Ready<()> { panic!("undo panicked before returning its future") });
+        let tag = config.tag;
+        cx.on_dispose(move || async move { record(&tag, "newest") });
+        Ok(Faulty)
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_undo_does_not_stop_the_rest() {
+    let app = App::new();
+    let faulty = app.insert::<Faulty>(tag("faulty")).await;
+    app.settled().await;
+
+    app.remove(faulty);
+    app.settled().await;
+    assert_eq!(app.status(faulty).await, None);
+    assert_eq!(journal("faulty"), ["newest", "oldest"]);
+}
+
+static CONTEXTS: Mutex<Option<HashMap<String, Cx<Keeper>>>> = Mutex::new(None);
+
+/// Keeps its `Cx` where the test can reach it after the fiber is gone.
+#[component(config = Tag)]
+struct Keeper;
+
+impl Component for Keeper {
+    async fn activate(cx: Cx<Self>, config: Tag) -> Result<Self> {
+        CONTEXTS.lock().unwrap().get_or_insert_default().insert(config.tag, cx);
+        Ok(Keeper)
+    }
+}
+
+#[tokio::test]
+async fn an_undo_added_after_disposal_runs_at_once() {
+    let app = App::new();
+    let keeper = app.insert::<Keeper>(tag("late")).await;
+    app.settled().await;
+    let cx = CONTEXTS.lock().unwrap().as_ref().unwrap()["late"].clone();
+    assert!(cx.is_live());
+
+    app.remove(keeper);
+    app.settled().await;
+    assert!(!cx.is_live());
+    cx.on_dispose(Guard::new(|| record("late", "guard")));
+    assert_eq!(journal("late"), ["guard"]);
+
+    let owned = Recorder { tag: "late".into(), entry: "task stopped" };
+    cx.on_dispose(tokio::spawn(async move {
+        let _owned = owned;
+        std::future::pending::<()>().await;
+    }));
+    until(|| journal("late") == ["guard", "task stopped"]).await;
+}

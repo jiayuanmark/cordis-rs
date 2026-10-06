@@ -1,6 +1,5 @@
 //! The orchestrator: one task that owns every fiber and applies lifecycle transitions.
 
-use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -12,9 +11,10 @@ use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::dispose::{Undo, panic_message};
 use crate::erased::{Factory, Instance};
 use crate::realm::{Env, Slot};
-use crate::{Component, Erased, Events, Key, KeyId, Realm, Scope};
+use crate::{Component, Erased, Events, Guard, Key, KeyId, Realm, Scope};
 
 new_key_type! {
     /// Identity of a fiber: one configured instance of a component.
@@ -32,7 +32,7 @@ pub enum Status {
     Active,
     /// Its provisions are withdrawn; waiting for its consumers to finish their teardown.
     Leaving,
-    /// `deactivate` is running.
+    /// Its undo list is running.
     Deactivating,
     /// `activate` returned an error or panicked. Retried when the fiber's dependencies or
     /// configuration change.
@@ -214,6 +214,8 @@ pub(crate) struct Control {
     owner: Owner,
     /// The context the fiber was inserted under, which its children inherit.
     env: Env,
+    /// The undo list of this activation.
+    undo: Undo,
 }
 
 impl Control {
@@ -223,6 +225,10 @@ impl Control {
 
     pub(crate) fn env(&self) -> &Env {
         &self.env
+    }
+
+    pub(crate) fn undo(&self) -> &Undo {
+        &self.undo
     }
 
     /// Returns the fiber's own context, from which its children derive theirs.
@@ -265,7 +271,14 @@ impl Spawner {
         let (reply, answer) = oneshot::channel();
         commands.send(Command::Insert { factory, config, env, parent, reply }).map_err(|_| Refused::Stopped)?;
         let id = answer.await.map_err(|_| Refused::Stopped)?.ok_or(Refused::Ended)?;
-        Ok(Fiber { id, commands: commands.downgrade() })
+        let fiber = Fiber { id, commands: commands.downgrade() };
+        if let Spawner::Fiber(control) = self {
+            // Retiring the child is its parent activation's inverse (Def 52), so it takes its
+            // place in the parent's undo list. The parent does not wait for the child to leave.
+            let child = fiber.clone();
+            control.undo.push(Guard::new(move || child.dispose()));
+        }
+        Ok(fiber)
     }
 }
 
@@ -613,8 +626,14 @@ impl Orchestrator {
             self.holders.insert(slot, id);
         }
         let fiber = &mut self.fibers[id];
-        let control = Control { commands: self.commands.clone(), owner: Owner { id, token }, env: fiber.env.clone() };
-        let task = (fiber.factory.activate)(deps, fiber.config.clone(), self.bus.clone(), control);
+        let undo = Undo::new();
+        let control = Control {
+            commands: self.commands.clone(),
+            owner: Owner { id, token },
+            env: fiber.env.clone(),
+            undo: undo.clone(),
+        };
+        let mut task = (fiber.factory.activate)(deps, fiber.config.clone(), self.bus.clone(), control);
         fiber.committed = Some(Committed { view, epoch: fiber.epoch });
         fiber.owner = Some(token);
         fiber.state = State::Loading { token, cancel: cancel.clone() };
@@ -623,14 +642,23 @@ impl Orchestrator {
         let events = self.events.clone();
         tokio::spawn(async move {
             let outcome = tokio::select! {
-                result = AssertUnwindSafe(task).catch_unwind() => Some(match result {
+                result = AssertUnwindSafe(&mut task).catch_unwind() => Some(match result {
                     Ok(Ok(instance)) => Ok(instance),
                     Ok(Err(error)) => Err(error.to_string()),
                     Err(panic) => Err(panic_message(&*panic)),
                 }),
-                // Dropping `task` drops the locals it built so far, in reverse order.
                 () = cancel.cancelled() => None,
             };
+            // Dropping a cancelled activation drops the locals it built so far, in reverse
+            // order. A panic there must not keep this task from reporting back.
+            if let Err(panic) = std::panic::catch_unwind(AssertUnwindSafe(move || drop(task))) {
+                tracing::error!(fiber = ?id, panic = panic_message(&*panic), "dropping a cancelled activation panicked");
+            }
+            // An activation that did not produce an instance is disposed of here; an instance
+            // takes the undo list with it.
+            if !matches!(outcome, Some(Ok(_))) {
+                undo.run().await;
+            }
             let _ = events.send(Event::Loaded { id, token, outcome });
         });
     }
@@ -704,18 +732,19 @@ impl Orchestrator {
         let State::Leaving { instance } = std::mem::replace(&mut self.fibers[id].state, State::Deactivating) else {
             unreachable!("checked above");
         };
-        self.retire_children(id);
         self.in_flight += 1;
         let events = self.events.clone();
         tokio::spawn(async move {
-            if let Err(panic) = AssertUnwindSafe(instance.deactivate()).catch_unwind().await {
-                tracing::error!(fiber = ?id, panic = panic_message(&*panic), "deactivation panicked");
+            if let Err(panic) = AssertUnwindSafe(instance.dispose()).catch_unwind().await {
+                tracing::error!(fiber = ?id, panic = panic_message(&*panic), "disposal panicked");
             }
             let _ = events.send(Event::Deactivated { id });
         });
     }
 
     fn deactivated(&mut self, id: FiberId) {
+        // The undo list retired the children; this catches any whose insertion raced with it.
+        self.retire_children(id);
         let fiber = &mut self.fibers[id];
         fiber.state = State::Inactive;
         if let Some(committed) = fiber.committed.take() {
@@ -765,12 +794,4 @@ impl Orchestrator {
             self.dirty.extend(watchers.iter().copied());
         }
     }
-}
-
-fn panic_message(panic: &(dyn Any + Send)) -> String {
-    panic
-        .downcast_ref::<&str>()
-        .map(|message| (*message).to_owned())
-        .or_else(|| panic.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "panic with a non-string payload".to_owned())
 }
