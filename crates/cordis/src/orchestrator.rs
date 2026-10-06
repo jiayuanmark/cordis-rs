@@ -13,7 +13,7 @@ use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::dispose::{Undo, panic_message};
+use crate::dispose::{Undo, UndoHandle, panic_message};
 use crate::erased::{Factory, Instance};
 use crate::realm::{Env, Slot};
 use crate::{Component, Dispose, Erased, Events, Key, KeyId, Realm, Scope};
@@ -44,7 +44,10 @@ pub enum Status {
 /// Handle to a running orchestrator.
 ///
 /// Clones share one orchestrator. The orchestrator stops when every handle is dropped; call
-/// [`shutdown`](App::shutdown) first to run every component's teardown in dependency order.
+/// [`shutdown`](App::shutdown) first to run every component's teardown in dependency order and
+/// wait for it. Without it, each run's undo list is still undone, consumers first, but only the
+/// synchronous part of each undo runs in order; the rest runs on the runtime and nothing waits
+/// for it.
 #[derive(Clone)]
 pub struct App {
     commands: mpsc::UnboundedSender<Command>,
@@ -217,7 +220,7 @@ pub(crate) struct Control {
     /// The context the fiber was inserted under, which its children inherit.
     env: Env,
     /// The undo list of this activation.
-    undo: Undo,
+    undo: UndoHandle,
 }
 
 impl Control {
@@ -229,7 +232,7 @@ impl Control {
         &self.env
     }
 
-    pub(crate) fn undo(&self) -> &Undo {
+    pub(crate) fn undo(&self) -> &UndoHandle {
         &self.undo
     }
 
@@ -380,7 +383,7 @@ struct Committed {
 
 enum State {
     Inactive,
-    Loading { token: u64, cancel: CancellationToken },
+    Loading { token: u64, cancel: CancellationToken, undo: UndoHandle },
     Active { instance: Box<dyn Instance> },
     Leaving { instance: Box<dyn Instance> },
     Deactivating,
@@ -463,7 +466,7 @@ impl Orchestrator {
             tokio::select! {
                 command = commands.recv() => match command {
                     Some(command) => self.command(command),
-                    None => break,
+                    None => return self.drop_consumers_first(),
                 },
                 Some(event) = events.recv() => self.event(event),
             }
@@ -546,7 +549,13 @@ impl Orchestrator {
     /// paper's `Unloading` state.
     fn owns_children(&self, owner: Owner) -> bool {
         self.fibers.get(owner.id).is_some_and(|fiber| {
-            fiber.owner == Some(owner.token) && matches!(fiber.state, State::Loading { .. } | State::Active { .. })
+            fiber.owner == Some(owner.token)
+                && match &fiber.state {
+                    // A failed or cancelled activation closes its list before it reports back.
+                    State::Loading { undo, .. } => undo.is_open(),
+                    State::Active { .. } => true,
+                    _ => false,
+                }
         })
     }
 
@@ -650,12 +659,12 @@ impl Orchestrator {
             commands: self.commands.clone(),
             owner: Owner { id, token },
             env: fiber.env.clone(),
-            undo: undo.clone(),
+            undo: undo.handle(),
         };
         let mut task = (fiber.factory.activate)(deps, fiber.config.clone(), self.bus.clone(), control);
         fiber.committed = Some(Committed { view, epoch: fiber.epoch });
         fiber.owner = Some(token);
-        fiber.state = State::Loading { token, cancel: cancel.clone() };
+        fiber.state = State::Loading { token, cancel: cancel.clone(), undo: undo.handle() };
 
         self.in_flight += 1;
         let events = self.events.clone();
@@ -791,6 +800,30 @@ impl Orchestrator {
         for provider in view.providers() {
             self.relied[provider] -= 1;
             self.try_unload(provider);
+        }
+    }
+
+    /// Every handle is gone, so nothing can wait for teardown any more, and each run's undo
+    /// list is undone at once as its fiber drops. Drops the fibers consumers first, the order
+    /// `shutdown` would undo them in, so a consumer's undos run while its providers' effects
+    /// are still in place.
+    fn drop_consumers_first(&mut self) {
+        loop {
+            let unrelied: Vec<FiberId> =
+                self.fibers.keys().filter(|id| self.relied.get(*id).is_none_or(|count| *count == 0)).collect();
+            // Committed views cannot form a cycle; if one ever did, the fibers left drop with
+            // the orchestrator.
+            if unrelied.is_empty() {
+                return;
+            }
+            for id in unrelied {
+                let fiber = self.fibers.remove(id).expect("listed above");
+                for provider in fiber.committed.iter().flat_map(|committed| committed.view.providers()) {
+                    if let Some(count) = self.relied.get_mut(provider) {
+                        *count -= 1;
+                    }
+                }
+            }
         }
     }
 

@@ -375,3 +375,57 @@ async fn an_undo_added_after_disposal_runs_at_once() {
     }));
     until(|| journal("late") == ["guard", "task stopped"]).await;
 }
+
+/// Consumes `dyn Store`, and keeps its `Cx` in a listener, the cycle a dropped app must break.
+#[component(config = Tag, deps(store: dyn Store))]
+struct Clinger;
+
+impl Component for Clinger {
+    async fn activate(cx: Cx<Self>, config: Tag) -> Result<Self> {
+        let tag = config.tag.clone();
+        let kept = cx.clone();
+        cx.on::<Ping>().listen(move |text| record(&tag, format!("heard {text}, live: {}", kept.is_live())));
+        let tag = config.tag;
+        cx.on_dispose(Guard::new(move || record(&tag, "clinger down")));
+        Ok(Clinger)
+    }
+}
+
+#[tokio::test]
+async fn dropping_the_app_undoes_consumers_first_even_when_a_listener_keeps_its_cx() {
+    let app = App::new();
+    app.insert::<MemoryStore>(tag("dropped")).await;
+    app.insert::<Clinger>(tag("dropped")).await;
+    app.settled().await;
+    let events = app.events().clone();
+    events.emit::<Ping>("before".into());
+
+    drop(app);
+    until(|| journal("dropped").len() == 3).await;
+    events.emit::<Ping>("after".into());
+    assert_eq!(journal("dropped"), ["heard before, live: true", "clinger down", "store down"]);
+}
+
+/// Fails, and tries to instantiate a child from its own undo.
+#[component(config = Tag)]
+struct LateParent;
+
+impl Component for LateParent {
+    async fn activate(cx: Cx<Self>, config: Tag) -> Result<Self> {
+        let kept = cx.clone();
+        cx.on_dispose(move || async move {
+            let tag = config.tag.clone();
+            let refused = kept.plugin::<Leaf>(Tag { tag: config.tag }).await.is_err();
+            record(&tag, format!("plugin refused: {refused}"));
+        });
+        Err("late parent failed".into())
+    }
+}
+
+#[tokio::test]
+async fn an_activation_that_ended_cannot_instantiate_children_while_it_is_undone() {
+    let app = App::new();
+    app.insert::<LateParent>(tag("late-parent")).await;
+    app.settled().await;
+    assert_eq!(journal("late-parent"), ["plugin refused: true"]);
+}
