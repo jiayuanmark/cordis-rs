@@ -250,11 +250,6 @@ impl<O> Flow<O> {
     pub fn map(self, f: impl FnOnce(O) -> O) -> Self {
         Self(f(self.0))
     }
-
-    /// Returns the output for inspection.
-    pub fn output(&self) -> &O {
-        &self.0
-    }
 }
 
 /// Where a registrar puts its registration's [`Guard`].

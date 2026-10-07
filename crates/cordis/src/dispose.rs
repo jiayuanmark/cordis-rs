@@ -8,14 +8,14 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use futures::FutureExt;
 use tokio::task::JoinHandle;
 
+use crate::Guard;
 use crate::erased::BoxFuture;
-use crate::{Guard, Guards};
 
 /// Something a fiber undoes when it is disposed. Pass it to [`Cx::on_dispose`](crate::Cx::on_dispose).
 ///
 /// Implemented for:
 ///
-/// - [`Guard`]: dropped, which runs its inverse; [`Guards`] likewise, newest first.
+/// - [`Guard`]: dropped, which runs its inverse.
 /// - Tokio's [`JoinHandle`]: the task is aborted, then awaited until it has stopped, so
 ///   everything it owns is dropped before the next undo starts. A `spawn_blocking` task cannot
 ///   be aborted once it has started, so disposal waits until its closure returns.
@@ -39,13 +39,6 @@ pub trait Dispose: Send + 'static {
 }
 
 impl Dispose for Guard {
-    fn dispose(self) -> impl Future<Output = ()> + Send + 'static {
-        drop(self);
-        std::future::ready(())
-    }
-}
-
-impl Dispose for Guards {
     fn dispose(self) -> impl Future<Output = ()> + Send + 'static {
         drop(self);
         std::future::ready(())

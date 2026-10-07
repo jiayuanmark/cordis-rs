@@ -7,7 +7,7 @@ A Rust realization of the context paradigm from *A Programming Paradigm for Spat
 | Path | Contents |
 |---|---|
 | `crates/cordis/src/key.rs` | `Key`, `KeyId`, `key!` |
-| `crates/cordis/src/guard.rs` | `Guard`, `Guards` |
+| `crates/cordis/src/guard.rs` | `Guard` |
 | `crates/cordis/src/dispose.rs` | `Dispose` and the undo list of a fiber run |
 | `crates/cordis/src/component.rs` | `Manifest`, `Component`, `Cx` |
 | `crates/cordis-macros/src/lib.rs` | The `#[component]` attribute, re-exported as `cordis::component` |

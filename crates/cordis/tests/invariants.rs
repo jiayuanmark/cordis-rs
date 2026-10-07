@@ -80,7 +80,6 @@ macro_rules! components {
         }
 
         impl Component for $component {
-            #[allow(unused_variables)]
             async fn activate(cx: Cx<Self>, config: Config) -> Result<Self> {
                 let reads: Vec<Arc<dyn Node>> = vec![$(cx.deps().$dep.clone()),*];
                 live(&cx, config, &[$($provided::NAME),*], reads).await.map(Self)
