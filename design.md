@@ -123,7 +123,7 @@ async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
 // Teardown: stop the task (3), unregister the tool (2), then flush (1).
 ```
 
-- **One method, three kinds of inverse.** `cx.on_dispose(x)` takes anything implementing `Dispose`: a `Guard` or `Guards` (dropped), a Tokio `JoinHandle` (aborted, then awaited until the task has stopped, so everything it owned is dropped), or an async closure (called and awaited). A type with an async close can implement `Dispose` itself.
+- **One method, three kinds of inverse.** `cx.on_dispose(x)` takes anything implementing `Dispose`: a `Guard` (dropped), a Tokio `JoinHandle` (aborted, then awaited until the task has stopped, so everything it owned is dropped), or an async closure (called and awaited). A type with an async close can implement `Dispose` itself.
 - **Listeners and children join the same list.** `cx.on` adds its listener's guard and `cx.plugin` adds the child's retirement, in the order they are made.
 - **Entries that end on their own are dropped early.** A finished task, or a child disposed through its handle, leaves the list (`Dispose::is_finished`), so a long-lived run that starts a task or a child per request doesn't accumulate them.
 - **Newest first, one at a time.** The list runs in reverse order of registration, the rule Rust uses for locals, and each undo finishes before the next starts. Adding each inverse right after its effect gives the right order (Theorem 16). A retired child is not waited for (O-Retire).

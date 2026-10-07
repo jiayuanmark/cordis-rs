@@ -97,23 +97,17 @@ pub struct Cx<C: Component> {
     deps: Arc<C::Deps>,
     events: Events,
     control: Control,
-    _component: PhantomData<fn() -> C>,
 }
 
 impl<C: Component> Clone for Cx<C> {
     fn clone(&self) -> Self {
-        Self {
-            deps: self.deps.clone(),
-            events: self.events.clone(),
-            control: self.control.clone(),
-            _component: PhantomData,
-        }
+        Self { deps: self.deps.clone(), events: self.events.clone(), control: self.control.clone() }
     }
 }
 
 impl<C: Component> Cx<C> {
     pub(crate) fn new(deps: Arc<C::Deps>, events: Events, control: Control) -> Self {
-        Self { deps, events, control, _component: PhantomData }
+        Self { deps, events, control }
     }
 
     /// Returns the id of the fiber this context belongs to.
