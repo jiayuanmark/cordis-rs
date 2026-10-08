@@ -1,10 +1,12 @@
-//! A miniature agent harness: independent components extend tool execution, session
-//! recording, and turn control through typed events, and configuration changes take effect
-//! without a restart.
+//! A miniature agent harness: an agent runs turns through a tool runtime, which reads a
+//! workspace and records to a session log. Independent components extend tool execution,
+//! session recording, and turn control through typed events, and configuration changes take
+//! effect without a restart, restarting exactly the components whose dependencies changed.
 //!
 //! Run with `cargo run --example harness`.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use cordis::{App, Catalog, Component, Cx, Events, Flow, Loader, Result, component, event, key};
 use futures::future::BoxFuture;
@@ -21,6 +23,7 @@ pub struct ToolCall {
 #[derive(Clone, Debug)]
 pub enum ToolResult {
     Ok(String),
+    Failed(String),
     Denied(String),
 }
 
@@ -47,29 +50,106 @@ event!(
     pub TurnStopping = "agent/turn-stopping", Serial(TurnState) -> String
 );
 
+/// The files tools may read.
+pub trait Workspace: Send + Sync {
+    fn read(&self, path: &str) -> Option<String>;
+}
+key!(dyn Workspace = "workspace");
+
+/// The durable record of a session.
+pub trait Session: Send + Sync {
+    fn append(&self, event: SessionEvent);
+    fn count(&self) -> usize;
+}
+key!(dyn Session = "session");
+
 pub trait Tools: Send + Sync {
     fn run(&self, call: ToolCall) -> BoxFuture<'static, ToolResult>;
 }
 key!(dyn Tools = "tools");
 
+pub trait Agent: Send + Sync {
+    fn turn(&self, calls: Vec<ToolCall>) -> BoxFuture<'static, ()>;
+}
+key!(dyn Agent = "agent");
+
+// ---- Services the runtime builds on ------------------------------------------------------
+
+#[derive(Deserialize)]
+struct WorkspaceConfig {
+    files: HashMap<String, String>,
+}
+
+/// A workspace held in memory, with its files taken from configuration.
+#[component(config = WorkspaceConfig, provides(dyn Workspace))]
+struct MemoryWorkspace {
+    files: HashMap<String, String>,
+}
+
+impl Workspace for MemoryWorkspace {
+    fn read(&self, path: &str) -> Option<String> {
+        self.files.get(path).cloned()
+    }
+}
+
+impl Component for MemoryWorkspace {
+    async fn activate(_: Cx<Self>, config: WorkspaceConfig) -> Result<Self> {
+        Ok(Self { files: config.files })
+    }
+}
+
+/// Keeps session events in memory and announces each one on the event bus.
+#[component(provides(dyn Session))]
+struct SessionLog {
+    events: Events,
+    log: Mutex<Vec<Arc<SessionEvent>>>,
+}
+
+impl Session for SessionLog {
+    fn append(&self, event: SessionEvent) {
+        let event = Arc::new(event);
+        self.log.lock().unwrap().push(event.clone());
+        self.events.emit::<SessionAppended>(event);
+    }
+
+    fn count(&self) -> usize {
+        self.log.lock().unwrap().len()
+    }
+}
+
+impl Component for SessionLog {
+    async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+        Ok(Self { events: cx.events().clone(), log: Mutex::default() })
+    }
+}
+
 // ---- The tool runtime: owns execution and dispatches the events around it --------------
 
-#[component(provides(dyn Tools))]
+#[component(deps(workspace: dyn Workspace, session: dyn Session), provides(dyn Tools))]
 struct ToolRuntime {
-    events: Events,
+    cx: Cx<Self>,
 }
 
 impl Tools for ToolRuntime {
     fn run(&self, call: ToolCall) -> BoxFuture<'static, ToolResult> {
-        let events = self.events.clone();
+        let cx = self.cx.clone();
         Box::pin(async move {
-            events.emit::<SessionAppended>(Arc::new(SessionEvent::ToolCall(call.clone())));
-            let result = events
+            let deps = cx.deps();
+            deps.session.append(SessionEvent::ToolCall(call.clone()));
+            let workspace = deps.workspace.clone();
+            let result = cx
+                .events()
                 .waterfall::<ToolsExecute>(call, |call| async move {
-                    ToolResult::Ok(format!("{} output for `{}`", call.tool, call.input))
+                    match call.tool.as_str() {
+                        "read" => match workspace.read(&call.input) {
+                            Some(text) => ToolResult::Ok(text),
+                            None => ToolResult::Failed(format!("no such file `{}`", call.input)),
+                        },
+                        tool => ToolResult::Ok(format!("{tool} output for `{}`", call.input)),
+                    }
                 })
                 .await;
-            events.emit::<SessionAppended>(Arc::new(SessionEvent::ToolResult(result.clone())));
+            deps.session.append(SessionEvent::ToolResult(result.clone()));
             result
         })
     }
@@ -77,7 +157,38 @@ impl Tools for ToolRuntime {
 
 impl Component for ToolRuntime {
     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
-        Ok(Self { events: cx.events().clone() })
+        Ok(Self { cx })
+    }
+}
+
+// ---- The agent: runs a turn through whatever tools are active ----------------------------
+
+#[component(deps(tools: dyn Tools, session: dyn Session), provides(dyn Agent))]
+struct ScriptedAgent {
+    cx: Cx<Self>,
+}
+
+impl Agent for ScriptedAgent {
+    fn turn(&self, calls: Vec<ToolCall>) -> BoxFuture<'static, ()> {
+        let cx = self.cx.clone();
+        Box::pin(async move {
+            let deps = cx.deps();
+            for (steps, call) in (1..).zip(calls) {
+                let result = deps.tools.run(call).await;
+                println!("step {steps}: {result:?}");
+                if let Some(reason) = cx.events().serial::<TurnStopping>(TurnState { steps }).await {
+                    println!("turn stopped: {reason}");
+                    break;
+                }
+            }
+            println!("session holds {} events", deps.session.count());
+        })
+    }
+}
+
+impl Component for ScriptedAgent {
+    async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+        Ok(Self { cx })
     }
 }
 
@@ -159,57 +270,65 @@ impl Component for StepBudget {
     }
 }
 
-// ---- A scripted agent turn ---------------------------------------------------------------
-
-async fn turn(app: &App, calls: &[(&str, &str)]) {
-    let tools = app.get::<dyn Tools>().await.expect("the tool runtime is active");
-    for (steps, (tool, input)) in (1..).zip(calls) {
-        let result = tools.run(ToolCall { tool: tool.to_string(), input: input.to_string() }).await;
-        println!("step {steps}: {result:?}");
-        if let Some(reason) = app.events().serial::<TurnStopping>(TurnState { steps }).await {
-            println!("turn stopped: {reason}");
-            return;
-        }
-    }
-}
+// ---- Running it --------------------------------------------------------------------------
 
 const CONFIG: &str = r#"
 plugins:
+  - { id: agent, use: scripted-agent }
   - { id: tools, use: tool-runtime }
+  - { id: session, use: session-log }
+  - { id: workspace, use: memory-workspace, config: { files: { src/main.rs: "fn main() {}" } } }
   - { id: approval, use: approval-policy, config: { deny: ["rm "] } }
   - { id: limit, use: output-limit, config: { max_chars: 24 } }
   - { id: transcript, use: transcript }
   - { id: budget, use: step-budget, config: { max_steps: 3 } }
 "#;
 
+async fn turn(app: &App) {
+    let calls = [("bash", "ls -la"), ("bash", "rm -rf build"), ("read", "src/main.rs"), ("read", "README.md")];
+    let calls = calls.iter().map(|(tool, input)| ToolCall { tool: tool.to_string(), input: input.to_string() });
+    let agent = app.get::<dyn Agent>().await.expect("the agent and everything it needs are active");
+    agent.turn(calls.collect()).await;
+}
+
 #[tokio::main]
 async fn main() {
     let app = App::new();
     let mut catalog = Catalog::new();
     catalog
+        .register::<ScriptedAgent>("scripted-agent")
         .register::<ToolRuntime>("tool-runtime")
+        .register::<SessionLog>("session-log")
+        .register::<MemoryWorkspace>("memory-workspace")
         .register::<ApprovalPolicy>("approval-policy")
         .register::<OutputLimit>("output-limit")
         .register::<Transcript>("transcript")
         .register::<StepBudget>("step-budget");
     let mut loader = Loader::new(app.clone(), catalog);
-    let calls = [("bash", "ls -la"), ("bash", "rm -rf build"), ("read", "src/main.rs"), ("bash", "echo unreachable")];
 
+    // Rows are listed consumers first: the orchestrator activates each one once its
+    // dependencies are active, whatever the order.
     println!("== full profile");
     loader.apply_yaml(CONFIG).await.unwrap();
     app.settled().await;
-    turn(&app, &calls).await;
+    turn(&app).await;
 
-    println!("\n== transcript and approval removed, budget raised; no restart");
+    // The workspace's configuration changes, so it restarts, and so do the tool runtime and
+    // the agent that depend on it; the session log does not, and keeps its events.
+    println!("\n== transcript and approval removed, budget raised, README added; no restart");
     let patched = CONFIG
         .lines()
         .filter(|line| !line.contains("id: transcript") && !line.contains("id: approval"))
         .collect::<Vec<_>>()
         .join("\n")
-        .replace("max_steps: 3", "max_steps: 10");
+        .replace("max_steps: 3", "max_steps: 10")
+        .replace(
+            r#"src/main.rs: "fn main() {}""#,
+            r#"src/main.rs: "fn main() {}", README.md: "A miniature agent harness built on cordis""#,
+        );
     loader.apply_yaml(&patched).await.unwrap();
     app.settled().await;
-    turn(&app, &calls).await;
+    turn(&app).await;
 
     app.shutdown().await;
 }

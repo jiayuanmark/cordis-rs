@@ -24,7 +24,7 @@ A Rust realization of the context paradigm from *A Programming Paradigm for Spat
 | `crates/cordis/tests/layers.rs` | Layer merge tests |
 | `crates/cordis/tests/realms.rs` | Isolation and interception tests |
 | `crates/cordis/tests/invariants.rs` | The lifecycle guarantees, checked under random changes |
-| `crates/cordis/examples/harness.rs` | A miniature agent harness built on events (`cargo run --example harness`) |
+| `crates/cordis/examples/harness.rs` | A miniature agent harness: services, dependencies, and events (`cargo run --example harness`) |
 | `crates/cordis/examples/profiles.rs` | Profiles composed from YAML layers in `examples/config/` (`cargo run --example profiles`) |
 
 ## Example
