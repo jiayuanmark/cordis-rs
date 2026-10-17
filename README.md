@@ -69,4 +69,4 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-`rust-toolchain.toml` pins Rust 1.95.0.
+`rust-toolchain.toml` pins Rust 1.95.0. CI (`.github/workflows/ci.yml`) runs these on every pull request and every push to `main`, plus `cargo doc` with warnings denied and each example.
