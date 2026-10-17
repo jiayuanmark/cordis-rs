@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch or PR cancels the run still in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test, doc, examples
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup is preinstalled on the runner; this installs the toolchain
+      # pinned in rust-toolchain.toml (with clippy and rustfmt).
+      - name: Install toolchain
+        run: rustup toolchain install
+
+      # Caches ~/.cargo and target/ between runs, keyed on Cargo.lock and
+      # the toolchain version.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Doc
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Examples
+        run: |
+          for f in crates/cordis/examples/*.rs; do
+            name=$(basename "$f" .rs)
+            echo "::group::example $name"
+            cargo run --locked -p cordis --example "$name"
+            echo "::endgroup::"
+          done
