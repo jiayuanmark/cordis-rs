@@ -63,11 +63,13 @@ pub trait Session: Send + Sync {
 }
 key!(dyn Session = "session");
 
+/// Runs tool calls, with every listener of [`ToolsExecute`] around each one.
 pub trait Tools: Send + Sync {
     fn run(&self, call: ToolCall) -> BoxFuture<'static, ToolResult>;
 }
 key!(dyn Tools = "tools");
 
+/// Drives a turn of tool calls until a listener of [`TurnStopping`] stops it.
 pub trait Agent: Send + Sync {
     fn turn(&self, calls: Vec<ToolCall>) -> BoxFuture<'static, ()>;
 }
@@ -313,8 +315,9 @@ async fn main() {
     app.settled().await;
     turn(&app).await;
 
-    // The workspace's configuration changes, so it restarts, and so do the tool runtime and
-    // the agent that depend on it; the session log does not, and keeps its events.
+    // The workspace's configuration changes, so it restarts. The tool runtime depends on it
+    // and the agent on the runtime, so both restart too. The session log does not, and keeps
+    // its events.
     println!("\n== transcript and approval removed, budget raised, README added; no restart");
     let patched = CONFIG
         .lines()
