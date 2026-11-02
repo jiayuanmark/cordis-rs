@@ -38,7 +38,7 @@ impl Catalog {
     fn key(&self, name: &str) -> Option<KeyId> {
         self.entries
             .values()
-            .flat_map(|factory| factory.deps.iter().chain(&factory.provides))
+            .flat_map(|factory| factory.deps.iter().chain(&factory.optional).chain(&factory.provides))
             .copied()
             .find(|key| key.name() == name)
     }

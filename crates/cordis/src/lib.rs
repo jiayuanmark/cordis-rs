@@ -24,7 +24,7 @@ mod loader;
 mod orchestrator;
 mod realm;
 
-pub use component::{Component, Cx, Manifest};
+pub use component::{Component, Cx, Manifest, Optional, When, WhenAction};
 /// Declares a component's configuration, dependencies, and provisions by implementing
 /// [`Manifest`] for the type it is attached to, and generates a struct of its
 /// resolved dependencies.
@@ -67,12 +67,17 @@ pub use component::{Component, Cx, Manifest};
 /// Generic types are supported; the generated impls carry the type's generics and `where`
 /// clause.
 ///
-/// - `deps(name: Key, ...)` generates `{Type}Deps`, a struct with one `pub name: Arc<Key::Value>`
-///   field per entry and the visibility of the component type, and sets it as
-///   [`Manifest::Deps`]. The orchestrator resolves it once before activation, and components read
-///   it through [`Cx::deps`]. Only listed keys have a field, so reading an undeclared key does
-///   not compile, and listing a key twice is rejected. Without `deps`, `Manifest::Deps` is `()` and no struct is generated. The struct
-///   is not generic, so on a generic component the keys may not name its type parameters.
+/// - `deps(name: Key, ...)` generates `{Type}Deps`, a struct with one field per entry and the
+///   visibility of the component type, and sets it as [`Manifest::Deps`]. A required entry
+///   `name: Key` generates `pub name: Arc<Key::Value>`, resolved once before activation; the
+///   component waits for `Key` to have an active provider and reloads when it changes. An
+///   optional entry `name?: Key` generates `pub name: Optional<Key>` (see [`Optional`]); the
+///   component activates without waiting for `Key`, does not reload when `Key` changes, and reads
+///   its current provider through `cx.deps().name.get()` (for reactive effects tied to an optional
+///   key's lifetime, use [`Cx::when`]). Only listed keys have a field, so reading an undeclared
+///   key does not compile, and listing a key twice is rejected. Without `deps`,
+///   `Manifest::Deps` is `()` and no struct is generated. The struct is not generic, so on a
+///   generic component the keys may not name its type parameters.
 /// - `provides(...)` publishes the component's `Arc` as `Arc<K::Value>` for each listed key
 ///   `K`. The coercion is written once per key, so it fails to compile when the component
 ///   does not implement the key's value type:

@@ -1,5 +1,6 @@
 //! Components and their declared dependencies and provisions.
 
+use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -8,7 +9,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::events::{Held, On};
-use crate::orchestrator::Control;
+use crate::orchestrator::{Control, WeakTable};
+use crate::realm::Env;
 use crate::{Dispose, Erased, Event, Events, Fiber, FiberId, Key, KeyId, Realm, Resolve, Result, Scope};
 
 /// A component's declarations: its configuration type, the keys it depends on, and the keys
@@ -27,6 +29,14 @@ pub trait Manifest: Sized + 'static {
     /// Returns the declared dependency keys in declaration order.
     fn deps() -> Vec<KeyId>;
 
+    /// Returns the declared optional dependency keys in declaration order.
+    ///
+    /// Optional dependencies do not gate activation or trigger reloads when their providers
+    /// change; they are read on demand through [`Optional::get`].
+    fn optional() -> Vec<KeyId> {
+        Vec::new()
+    }
+
     /// Returns the provided keys.
     fn provides() -> Vec<KeyId>;
 
@@ -37,6 +47,136 @@ pub trait Manifest: Sized + 'static {
     /// Coerces the component to the value type of each provided key.
     #[doc(hidden)]
     fn publish(component: &Arc<Self>) -> Vec<(KeyId, Erased)>;
+}
+
+/// Handle to an optional dependency declared with `deps(name?: Key)` in
+/// [`#[component]`](crate::component).
+///
+/// Unlike a required dependency, an optional dependency is not part of the fiber's view: the
+/// fiber activates whether or not `K` has a provider, and does not reload when `K`'s provider
+/// starts, reloads, or stops. Instead, [`get`](Optional::get) reads the active provider of `K` in
+/// the fiber's realm at the moment of the call, with any [`intercept`](Cx::intercept) on `K`
+/// applied.
+///
+/// Use `Optional<K>` when the component runs without `K` and checks for it when doing work (such
+/// as logging or recording a metric). When the component should run a block of effects—such as
+/// registering a tool or listener—for the lifetime of `K`'s provider, use [`Cx::when`] instead.
+///
+/// ```
+/// use cordis::{Component, Cx, Result, component, key};
+///
+/// pub trait Metrics: Send + Sync {
+///     fn increment(&self, counter: &str);
+/// }
+/// key!(dyn Metrics = "metrics");
+///
+/// #[component(deps(metrics?: dyn Metrics))]
+/// struct Cache {
+///     cx: Cx<Self>,
+/// }
+///
+/// impl Cache {
+///     fn read(&self, _key: &str) {
+///         if let Some(metrics) = self.cx.deps().metrics.get() {
+///             metrics.increment("cache.read");
+///         }
+///     }
+/// }
+///
+/// impl Component for Cache {
+///     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+///         Ok(Cache { cx })
+///     }
+/// }
+/// ```
+pub struct Optional<K: Key + ?Sized> {
+    env: Env,
+    table: WeakTable,
+    _key: PhantomData<fn() -> K>,
+}
+
+impl<K: Key + ?Sized> Clone for Optional<K> {
+    fn clone(&self) -> Self {
+        Self { env: self.env.clone(), table: self.table.clone(), _key: PhantomData }
+    }
+}
+
+impl<K: Key + ?Sized> fmt::Debug for Optional<K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Optional").field("key", &KeyId::of::<K>()).field("present", &self.get().is_some()).finish()
+    }
+}
+
+impl<K: Key + ?Sized> Optional<K> {
+    pub(crate) fn new(env: Env, table: WeakTable) -> Self {
+        Self { env, table, _key: PhantomData }
+    }
+
+    /// Returns the active provider of `K` in this fiber's realm, with any interception of `K`
+    /// applied, or `None` when no provider of `K` is currently active there (or the app has
+    /// stopped).
+    ///
+    /// Does not cache the value: each call reads the current provider, and keeping an
+    /// `Optional<K>` never keeps a provider or the app alive.
+    pub fn get(&self) -> Option<Arc<K::Value>> {
+        let id = KeyId::of::<K>();
+        let value = self.table.get(&self.env.slot(id))?;
+        Some(self.env.remap(id, value).get::<K>())
+    }
+}
+
+/// The component type of a fiber instantiated by [`Cx::when`], [`Scope::when`], or
+/// [`App::when`](crate::App::when).
+///
+/// A `when::<K>` closure receives a `Cx<When<K>>` as its first argument, giving it the same
+/// context operations as any [`Component::activate`]: [`on_dispose`](Cx::on_dispose),
+/// [`on`](Cx::on), [`plugin`](Cx::plugin), [`when`](Cx::when), [`isolate`](Cx::isolate),
+/// [`intercept`](Cx::intercept), and [`cancelled`](Cx::cancelled). [`cx.deps()`](Cx::deps)
+/// returns the `&Arc<K::Value>` also passed as the closure's second argument.
+pub struct When<K: Key + ?Sized>(pub(crate) PhantomData<fn() -> K>);
+
+impl<K: Key + ?Sized> Manifest for When<K> {
+    type Config = ();
+    type Deps = Arc<K::Value>;
+
+    fn deps() -> Vec<KeyId> {
+        vec![KeyId::of::<K>()]
+    }
+
+    fn provides() -> Vec<KeyId> {
+        Vec::new()
+    }
+
+    fn resolve(resolved: &Resolve<'_>) -> Self::Deps {
+        resolved.get::<K>()
+    }
+
+    fn publish(_: &Arc<Self>) -> Vec<(KeyId, Erased)> {
+        Vec::new()
+    }
+}
+
+impl<K: Key + ?Sized> Component for When<K> {
+    async fn activate(_: Cx<Self>, (): ()) -> Result<Self> {
+        Ok(Self(PhantomData))
+    }
+}
+
+/// The body of a [`Cx::when`], [`Scope::when`], or [`App::when`](crate::App::when) fiber: an
+/// async closure from the fiber's [`Cx`] and the provider of `K` to [`Result<()>`]. Implemented
+/// for every such closure.
+pub trait WhenAction<K: Key + ?Sized>: Fn(Cx<When<K>>, Arc<K::Value>) -> Self::Future + Send + Sync + 'static {
+    #[doc(hidden)]
+    type Future: Future<Output = Result<()>> + Send + 'static;
+}
+
+impl<K, F, Fut> WhenAction<K> for F
+where
+    K: Key + ?Sized,
+    F: Fn(Cx<When<K>>, Arc<K::Value>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    type Future = Fut;
 }
 
 /// A component: the effects of activation, under the declarations of its [`Manifest`].
@@ -165,6 +305,57 @@ impl<C: Component> Cx<C> {
     /// each case no child runs.
     pub async fn plugin<D: Component>(&self, config: impl Serialize) -> Result<Fiber> {
         self.control.scope().plugin::<D>(config).await
+    }
+
+    /// Instantiates a child fiber under this fiber that runs `run` whenever `K` has an active
+    /// provider.
+    ///
+    /// This fiber does not depend on `K`, so it activates whether or not `K` is present and is
+    /// unaffected when `K` changes. The child fiber depends on `K`: each time `K` becomes active,
+    /// `run` is called with the child's [`Cx`] and the provider of `K`; when `K` unloads or
+    /// reloads, or when this fiber's activation ends, the child's [`on_dispose`](Cx::on_dispose)
+    /// list is undone before `K`'s provider tears down.
+    ///
+    /// This is the idiomatic way to attach optional effects—such as registering a tool, route, or
+    /// metric collector—to a service that may not be loaded, or that may reload independently of
+    /// this component:
+    ///
+    /// ```
+    /// use cordis::{Component, Cx, Guard, Result, component, key};
+    ///
+    /// pub trait Tools: Send + Sync {
+    ///     fn register(&self, name: &str) -> Guard;
+    /// }
+    /// key!(dyn Tools = "tools");
+    ///
+    /// #[component]
+    /// struct Search;
+    ///
+    /// impl Component for Search {
+    ///     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+    ///         // `Search` is active even without `dyn Tools`. Whenever `dyn Tools` is active,
+    ///         // the `"search"` tool is registered, and unregistered before `dyn Tools` unloads
+    ///         // or when `Search` unloads.
+    ///         cx.when::<dyn Tools>(|cx, tools| async move {
+    ///             cx.on_dispose(tools.register("search"));
+    ///             Ok(())
+    ///         })
+    ///         .await?;
+    ///         Ok(Search)
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// To capture state from `self` across reloads of `K`, clone an `Arc` (or `cx.clone()`)
+    /// outside the closure and clone it into the async block on each call. For reading an
+    /// optional provider on demand without a child fiber, see [`Optional`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this fiber is leaving or its activation has ended (see
+    /// [`is_live`](Cx::is_live)), or when the app has stopped. In each case no child runs.
+    pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> Result<Fiber> {
+        self.control.scope().when::<K>(run).await
     }
 
     /// Returns a scope where `K` resolves in a fresh realm, for children that share a private

@@ -2,22 +2,23 @@
 
 use std::any::Any;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use serde_json::Value;
 
 use crate::dispose::Undo;
-use crate::orchestrator::Control;
+use crate::orchestrator::{Control, WeakTable};
 use crate::realm::Env;
-use crate::{Component, Cx, Events, Key, KeyId, Manifest, Result};
+use crate::{Component, Cx, Events, Key, KeyId, Manifest, Optional, Result, When, WhenAction};
 
 pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 /// The provider value of each dependency key, resolved for one activation.
 pub(crate) type Resolved = Vec<(KeyId, Erased)>;
 
-type Activate = fn(Resolved, Value, Events, Control) -> BoxFuture<Result<Box<dyn Instance>>>;
+type Activate = Box<dyn Fn(Resolved, Value, Events, Control) -> BoxFuture<Result<Box<dyn Instance>>> + Send + Sync>;
 
 /// A provided value with its type erased.
 ///
@@ -47,6 +48,7 @@ impl Erased {
 pub struct Resolve<'a> {
     values: &'a [(KeyId, Erased)],
     env: &'a Env,
+    table: &'a WeakTable,
 }
 
 impl Resolve<'_> {
@@ -64,11 +66,18 @@ impl Resolve<'_> {
         let id = KeyId::of::<K>();
         self.env.remap(id, self.find(id).clone()).get::<K>()
     }
+
+    /// Returns a handle that reads the current provider of an optional dependency `K` under the
+    /// context's realm and interception.
+    pub fn optional<K: Key + ?Sized>(&self) -> Optional<K> {
+        Optional::new(self.env.clone(), self.table.clone())
+    }
 }
 
 /// The operations of one component type, with the type erased.
 pub(crate) struct Factory {
     pub(crate) deps: Vec<KeyId>,
+    pub(crate) optional: Vec<KeyId>,
     pub(crate) provides: Vec<KeyId>,
     pub(crate) validate: fn(&Value) -> Result<(), String>,
     pub(crate) activate: Activate,
@@ -78,9 +87,34 @@ impl Factory {
     pub(crate) fn of<C: Component>() -> Self {
         Self {
             deps: <C as Manifest>::deps(),
+            optional: <C as Manifest>::optional(),
             provides: <C as Manifest>::provides(),
             validate: validate::<C>,
-            activate: activate::<C>,
+            activate: Box::new(activate::<C>),
+        }
+    }
+
+    pub(crate) fn when<K: Key + ?Sized>(run: impl WhenAction<K>) -> Self {
+        let run = Arc::new(run);
+        Self {
+            deps: <When<K> as Manifest>::deps(),
+            optional: Vec::new(),
+            provides: Vec::new(),
+            validate: validate::<When<K>>,
+            activate: Box::new(move |deps, _config, events, control| {
+                let run = run.clone();
+                Box::pin(async move {
+                    let provider = <When<K> as Manifest>::resolve(&Resolve {
+                        values: &deps,
+                        env: control.env(),
+                        table: control.table(),
+                    });
+                    let undo = control.undo().upgrade().expect("the activation task holds its run's undo list");
+                    let cx = Cx::new(Arc::new(provider.clone()), events, control);
+                    run(cx, provider).await?;
+                    Ok(Box::new(Active { component: Arc::new(When::<K>(PhantomData)), undo }) as Box<dyn Instance>)
+                })
+            }),
         }
     }
 }
@@ -97,7 +131,7 @@ fn activate<C: Component>(
 ) -> BoxFuture<Result<Box<dyn Instance>>> {
     Box::pin(async move {
         let config: C::Config = serde_json::from_value(config)?;
-        let deps = Arc::new(C::resolve(&Resolve { values: &deps, env: control.env() }));
+        let deps = Arc::new(C::resolve(&Resolve { values: &deps, env: control.env(), table: control.table() }));
         let undo = control.undo().upgrade().expect("the activation task holds its run's undo list");
         let component = C::activate(Cx::new(deps, events, control), config).await?;
         Ok(Box::new(Active { component: Arc::new(component), undo }) as Box<dyn Instance>)

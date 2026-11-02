@@ -68,7 +68,7 @@ pub trait Report: Send + Sync {
 }
 key!(dyn Report = "report");
 
-#[component(deps(named: dyn Named, counter: dyn Counter), provides(dyn Report))]
+#[component(deps(named: dyn Named, counter?: dyn Counter), provides(dyn Report))]
 struct Consumer {
     cx: Cx<Self>,
 }
@@ -76,7 +76,7 @@ struct Consumer {
 impl Report for Consumer {
     fn describe(&self) -> String {
         let ConsumerDeps { named, counter } = self.cx.deps();
-        format!("{} {}", named.name(), counter.count())
+        format!("{} {}", named.name(), counter.get().map_or(0, |c| c.count()))
     }
 }
 
@@ -90,8 +90,9 @@ impl Component for Consumer {
 fn the_attribute_declares_keys_in_order() {
     assert_eq!(Provider::<Alpha>::provides(), [KeyId::of::<dyn Named>()]);
     assert!(Provider::<Alpha>::deps().is_empty());
-    assert!(Bare::deps().is_empty() && Bare::provides().is_empty());
-    assert_eq!(Consumer::deps(), [KeyId::of::<dyn Named>(), KeyId::of::<dyn Counter>()]);
+    assert!(Bare::deps().is_empty() && Bare::optional().is_empty() && Bare::provides().is_empty());
+    assert_eq!(Consumer::deps(), [KeyId::of::<dyn Named>()]);
+    assert_eq!(Consumer::optional(), [KeyId::of::<dyn Counter>()]);
     let _: <Bare as Manifest>::Deps = ();
 }
 

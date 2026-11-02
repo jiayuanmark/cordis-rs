@@ -11,7 +11,7 @@ use serde::Serialize;
 use crate::erased::Erased;
 use crate::erased::Factory;
 use crate::orchestrator::Spawner;
-use crate::{Component, Fiber, Key, KeyId, Result};
+use crate::{Component, Fiber, Key, KeyId, Result, WhenAction};
 
 /// A namespace of provisions.
 ///
@@ -245,5 +245,21 @@ impl Scope {
     pub async fn plugin<D: Component>(&self, config: impl Serialize) -> Result<Fiber> {
         let config = serde_json::to_value(config)?;
         self.spawner.insert(Arc::new(Factory::of::<D>()), config, self.env.clone()).await
+    }
+
+    /// Instantiates a fiber under this scope that runs `run` whenever `K` has an active provider
+    /// in this scope's realm for `K`.
+    ///
+    /// Like [`plugin`](Scope::plugin), the fiber waits while `K` has no provider, runs `run` once
+    /// `K` is active, and undoes the run's [`on_dispose`](crate::Cx::on_dispose) list—before `K`'s
+    /// provider tears down—when `K` leaves or reloads, or when the parent activation ends. See
+    /// [`Cx::when`](crate::Cx::when).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fiber the scope was taken from can no longer instantiate
+    /// children, or when the app has stopped. In each case no fiber runs.
+    pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> Result<Fiber> {
+        self.spawner.insert(Arc::new(Factory::when::<K>(run)), serde_json::Value::Null, self.env.clone()).await
     }
 }

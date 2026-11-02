@@ -3,8 +3,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock, Weak};
 
 use futures::FutureExt;
 use serde_json::Value;
@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::dispose::{Undo, UndoHandle, panic_message};
 use crate::erased::{Factory, Instance};
 use crate::realm::{Env, Slot};
-use crate::{Component, Dispose, Erased, Events, Key, KeyId, Realm, Scope};
+use crate::{Component, Dispose, Erased, Events, Key, KeyId, Realm, Scope, WhenAction};
 
 new_key_type! {
     /// Identity of a fiber: one configured instance of a component.
@@ -107,6 +107,19 @@ impl App {
         remap: impl Fn(Arc<K::Value>) -> Arc<K::Value> + Send + Sync + 'static,
     ) -> Scope {
         self.scope().intercept::<K>(remap)
+    }
+
+    /// Inserts a root fiber that runs `run` whenever `K` has an active provider in the shared
+    /// realm.
+    ///
+    /// The returned [`Fiber`] reads its status or disposes of it. To watch `K` in another realm,
+    /// call [`Scope::when`] on [`isolate_in`](App::isolate_in). See [`Cx::when`](crate::Cx::when).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the app has stopped.
+    pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> crate::Result<Fiber> {
+        self.scope().when::<K>(run).await
     }
 
     fn scope(&self) -> Scope {
@@ -244,12 +257,57 @@ pub(crate) struct Owner {
     token: u64,
 }
 
+/// Active provisions, by key and realm, with the activation that published each. Only `Active`
+/// fibers appear here. Shared with [`Optional`](crate::Optional) handles so a fiber can read an
+/// optional key's current provider without round-tripping through the command channel.
+#[derive(Clone, Default)]
+pub(crate) struct Table(Arc<RwLock<HashMap<Slot, (Owner, Erased)>>>);
+
+/// A non-owning reference to [`Table`], carried by [`Control`] and [`Optional`](crate::Optional)
+/// so a kept `Cx` or `Optional` does not keep providers alive after the app is dropped.
+#[derive(Clone)]
+pub(crate) struct WeakTable(Weak<RwLock<HashMap<Slot, (Owner, Erased)>>>);
+
+impl Table {
+    fn downgrade(&self) -> WeakTable {
+        WeakTable(Arc::downgrade(&self.0))
+    }
+
+    fn get(&self, slot: &Slot) -> Option<(Owner, Erased)> {
+        self.0.read().expect("table lock is never poisoned").get(slot).cloned()
+    }
+
+    fn insert(&self, slot: Slot, entry: (Owner, Erased)) {
+        self.0.write().expect("table lock is never poisoned").insert(slot, entry);
+    }
+
+    fn remove_if_owned(&self, slot: &Slot, id: FiberId) -> bool {
+        let mut entries = self.0.write().expect("table lock is never poisoned");
+        if entries.get(slot).is_some_and(|(provider, _)| provider.id == id) {
+            entries.remove(slot);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl WeakTable {
+    pub(crate) fn get(&self, slot: &Slot) -> Option<Erased> {
+        let table = self.0.upgrade()?;
+        let entries = table.read().expect("table lock is never poisoned");
+        entries.get(slot).map(|(_, value)| value.clone())
+    }
+}
+
 /// A fiber's handle to the orchestrator, carried by its `Cx`.
 ///
-/// The sender is weak, so a `Cx` a component keeps does not keep the orchestrator running.
+/// The sender and table reference are weak, so a `Cx` a component keeps does not keep the
+/// orchestrator or providers alive.
 #[derive(Clone)]
 pub(crate) struct Control {
     commands: WeakUnboundedSender<Command>,
+    table: WeakTable,
     owner: Owner,
     /// The context the fiber was inserted under, which its children inherit.
     env: Env,
@@ -266,6 +324,10 @@ impl Control {
 
     pub(crate) fn env(&self) -> &Env {
         &self.env
+    }
+
+    pub(crate) fn table(&self) -> &WeakTable {
+        &self.table
     }
 
     pub(crate) fn undo(&self) -> &UndoHandle {
@@ -472,7 +534,7 @@ struct Orchestrator {
     fibers: SlotMap<FiberId, Entry>,
     /// Active provisions, by key and realm, with the activation that published each. Only
     /// `Active` fibers appear here.
-    table: HashMap<Slot, (Owner, Erased)>,
+    table: Table,
     /// The fiber that holds each provided slot, from the start of its activation until it has
     /// fully stopped. A slot has at most one holder, so two providers never run at once.
     holders: HashMap<Slot, FiberId>,
@@ -493,7 +555,7 @@ impl Orchestrator {
         Self {
             commands,
             fibers: SlotMap::with_key(),
-            table: HashMap::new(),
+            table: Table::default(),
             holders: HashMap::new(),
             watchers: HashMap::new(),
             relied: SecondaryMap::new(),
@@ -587,7 +649,7 @@ impl Orchestrator {
                 let _ = reply.send(self.fibers.get(id).and_then(|fiber| fiber.parent).map(|parent| parent.id));
             }
             Command::Get { slot, reply } => {
-                let _ = reply.send(self.table.get(&slot).map(|(_, value)| value.clone()));
+                let _ = reply.send(self.table.get(&slot).map(|(_, value)| value));
             }
             Command::Settled { reply } => self.waiters.push(reply),
         }
@@ -644,7 +706,7 @@ impl Orchestrator {
         fiber
             .deps
             .iter()
-            .map(|slot| self.table.get(slot).map(|(provider, _)| (slot.clone(), *provider)))
+            .map(|slot| self.table.get(slot).map(|(provider, _)| (slot.clone(), provider)))
             .collect::<Option<Vec<_>>>()
             .map(View)
     }
@@ -694,7 +756,14 @@ impl Orchestrator {
         for provider in view.providers() {
             self.relied[provider] += 1;
         }
-        let deps = view.0.iter().map(|(slot, _)| (slot.key, self.table[slot].1.clone())).collect();
+        let deps = view
+            .0
+            .iter()
+            .map(|(slot, _)| {
+                let (_, value) = self.table.get(slot).expect("every slot in a target view is in the table");
+                (slot.key, value)
+            })
+            .collect();
         let token = self.next_token;
         self.next_token += 1;
         let cancel = CancellationToken::new();
@@ -706,6 +775,7 @@ impl Orchestrator {
         let undo = Undo::new();
         let control = Control {
             commands: self.commands.clone(),
+            table: self.table.downgrade(),
             owner: Owner { id, token },
             env: fiber.env.clone(),
             undo: undo.handle(),
@@ -802,8 +872,7 @@ impl Orchestrator {
         fiber.state = State::Leaving { instance };
         let provides = fiber.provides.clone();
         for slot in provides {
-            if self.table.get(&slot).is_some_and(|(provider, _)| provider.id == id) {
-                self.table.remove(&slot);
+            if self.table.remove_if_owned(&slot, id) {
                 self.mark(&slot);
             }
         }
@@ -882,7 +951,14 @@ impl Orchestrator {
             }
             for id in unrelied {
                 let fiber = self.fibers.remove(id).expect("listed above");
-                for provider in fiber.committed.iter().flat_map(|committed| committed.view.providers()) {
+                let provides = fiber.provides.clone();
+                let providers: Vec<FiberId> =
+                    fiber.committed.iter().flat_map(|committed| committed.view.providers()).collect();
+                drop(fiber);
+                for slot in &provides {
+                    self.table.remove_if_owned(slot, id);
+                }
+                for provider in providers {
                     if let Some(count) = self.relied.get_mut(provider) {
                         *count -= 1;
                     }
