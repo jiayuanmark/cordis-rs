@@ -27,7 +27,7 @@ pub trait Metrics: Send + Sync {
 }
 key!(dyn Metrics = "metrics");
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct MetricsConfig {
     #[serde(default)]
     tag: String,
@@ -61,7 +61,7 @@ pub trait Probe: Send + Sync {
 }
 key!(dyn Probe = "probe");
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct ServiceConfig {
     tag: String,

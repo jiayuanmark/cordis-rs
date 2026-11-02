@@ -5,9 +5,6 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use serde::Serialize;
-use serde::de::DeserializeOwned;
-
 use crate::events::{Held, On};
 use crate::orchestrator::{Control, WeakTable};
 use crate::realm::Env;
@@ -19,8 +16,15 @@ use crate::{Dispose, Erased, Event, Events, Fiber, FiberId, Key, KeyId, Realm, R
 /// Implement it with [`#[component]`](crate::component), which also generates the
 /// [`Deps`](Manifest::Deps) struct.
 pub trait Manifest: Sized + 'static {
-    /// Configuration deserialized from the component's configuration row.
-    type Config: DeserializeOwned + Send + 'static;
+    /// Configuration passed to [`Component::activate`].
+    ///
+    /// A component instantiated in Rust with [`Cx::plugin`], [`Scope::plugin`], or
+    /// [`App::plugin`](crate::App::plugin) needs only `Config: Clone + Send + Sync + 'static`, so
+    /// its configuration may carry in-memory handles, channels, or trait objects without
+    /// implementing `Serialize` or `Deserialize`. A component loaded from configuration through
+    /// [`Catalog::register`](crate::Catalog::register) or [`App::insert`](crate::App::insert)
+    /// requires `Config: DeserializeOwned`.
+    type Config: Send + 'static;
 
     /// The resolved dependencies, with one typed field per declared key. `()` when the
     /// component declares none.
@@ -300,10 +304,13 @@ impl<C: Component> Cx<C> {
     ///
     /// # Errors
     ///
-    /// Returns an error when `config` fails to serialize, when this fiber is leaving or its
-    /// activation has ended (see [`is_live`](Cx::is_live)), or when the app has stopped. In
-    /// each case no child runs.
-    pub async fn plugin<D: Component>(&self, config: impl Serialize) -> Result<Fiber> {
+    /// Returns an error when this fiber is leaving or its activation has ended (see
+    /// [`is_live`](Cx::is_live)), or when the app has stopped. In each case no child runs.
+    pub async fn plugin<D>(&self, config: D::Config) -> Result<Fiber>
+    where
+        D: Component,
+        D::Config: Clone + Sync,
+    {
         self.control.scope().plugin::<D>(config).await
     }
 

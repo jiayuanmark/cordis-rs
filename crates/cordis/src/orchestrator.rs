@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
 use futures::FutureExt;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use slotmap::{SecondaryMap, SlotMap, new_key_type};
 use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender};
@@ -14,7 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::dispose::{Undo, UndoHandle, panic_message};
-use crate::erased::{Factory, Instance};
+use crate::erased::{Config, Factory, Instance};
 use crate::realm::{Env, Slot};
 use crate::{Component, Dispose, Erased, Events, Key, KeyId, Realm, Scope, WhenAction};
 
@@ -74,18 +75,37 @@ impl App {
         &self.events
     }
 
-    /// Inserts a fiber of component `C` with `config`.
+    /// Inserts a fiber of component `C` with a JSON `config`.
     ///
     /// # Returns
     ///
-    /// The new fiber's id. The fiber activates once its dependencies are available.
-    pub async fn insert<C: Component>(&self, config: Value) -> FiberId {
+    /// The new fiber's id. The fiber activates once its dependencies are available. For components
+    /// whose configuration does not implement `Deserialize`, use [`plugin`](App::plugin).
+    pub async fn insert<C>(&self, config: Value) -> FiberId
+    where
+        C: Component,
+        C::Config: DeserializeOwned,
+    {
         self.insert_factory(Arc::new(Factory::of::<C>()), config, Env::default()).await
+    }
+
+    /// Instantiates a root fiber of component `C` with a typed `config`, passed in memory without
+    /// serialization. See [`Scope::plugin`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the app has stopped.
+    pub async fn plugin<C>(&self, config: C::Config) -> crate::Result<Fiber>
+    where
+        C: Component,
+        C::Config: Clone + Sync,
+    {
+        self.scope().plugin::<C>(config).await
     }
 
     pub(crate) async fn insert_factory(&self, factory: Arc<Factory>, config: Value, env: Env) -> FiberId {
         let (reply, answer) = oneshot::channel();
-        self.send(Command::Insert { factory, config, env, parent: None, reply });
+        self.send(Command::Insert { factory, config: Config::Json(config), env, parent: None, reply });
         answer.await.expect("the orchestrator replies to every command").expect("a root fiber is always inserted")
     }
 
@@ -126,9 +146,9 @@ impl App {
         Scope::new(Env::default(), Spawner::App(self.commands.downgrade()))
     }
 
-    /// Replaces a fiber's configuration; an active fiber reloads, and its consumers with it.
+    /// Replaces a fiber's JSON configuration; an active fiber reloads, and its consumers with it.
     pub fn update(&self, id: FiberId, config: Value) {
-        self.send(Command::Update { id, config });
+        self.send(Command::Update { id, config: Config::Json(config) });
     }
 
     /// Retires a fiber. It deactivates after its consumers, then is discarded.
@@ -215,14 +235,14 @@ impl Default for App {
 pub(crate) enum Command {
     Insert {
         factory: Arc<Factory>,
-        config: Value,
+        config: Config,
         env: Env,
         parent: Option<Owner>,
         reply: oneshot::Sender<Option<FiberId>>,
     },
     Update {
         id: FiberId,
-        config: Value,
+        config: Config,
     },
     Remove {
         id: FiberId,
@@ -369,7 +389,7 @@ impl Spawner {
         }
     }
 
-    pub(crate) async fn insert(&self, factory: Arc<Factory>, config: Value, env: Env) -> crate::Result<Fiber> {
+    pub(crate) async fn insert(&self, factory: Arc<Factory>, config: Config, env: Env) -> crate::Result<Fiber> {
         let commands = self.commands().ok_or(Refused::Stopped)?;
         let parent = match self {
             Spawner::App(_) => None,
@@ -414,14 +434,8 @@ impl Fiber {
     }
 
     /// Replaces the fiber's configuration; an active fiber reloads, and its consumers with it.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when `config` fails to serialize.
-    pub fn update(&self, config: impl serde::Serialize) -> crate::Result<()> {
-        let config = serde_json::to_value(config)?;
-        self.send(Command::Update { id: self.id, config });
-        Ok(())
+    pub fn update<C: Clone + Send + Sync + 'static>(&self, config: C) {
+        self.send(Command::Update { id: self.id, config: Config::Typed(Arc::new(config)) });
     }
 
     /// Retires the fiber now. It deactivates after its consumers, then is discarded.
@@ -511,7 +525,7 @@ impl State {
 
 struct Entry {
     factory: Arc<Factory>,
-    config: Value,
+    config: Config,
     /// The context the fiber was inserted under.
     env: Env,
     /// Where each dependency key resolves under `env`, in declaration order.
@@ -642,7 +656,10 @@ impl Orchestrator {
                 let _ = reply.send(self.fibers.get(id).map(|fiber| fiber.state.status()));
             }
             Command::Config { id, reply } => {
-                let config = self.fibers.get(id).filter(|fiber| !fiber.retired).map(|fiber| fiber.config.clone());
+                let config = self.fibers.get(id).filter(|fiber| !fiber.retired).and_then(|fiber| match &fiber.config {
+                    Config::Json(value) => Some(value.clone()),
+                    Config::Typed(_) => None,
+                });
                 let _ = reply.send(config);
             }
             Command::Parent { id, reply } => {

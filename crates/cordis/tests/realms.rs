@@ -14,7 +14,7 @@ pub trait Tools: Send + Sync {
 }
 key!(dyn Tools = "tools");
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Named {
     name: String,
 }
@@ -68,15 +68,19 @@ impl Component for Reviewer {
     }
 }
 
-fn named(name: &str) -> serde_json::Value {
+fn named(name: &str) -> Named {
+    Named { name: name.into() }
+}
+
+fn named_json(name: &str) -> serde_json::Value {
     json!({ "name": name })
 }
 
 #[tokio::test]
 async fn an_isolated_key_resolves_to_the_provider_inside_the_realm() {
     let app = App::new();
-    app.insert::<Registry>(named("root")).await;
-    let reviewer = app.insert::<Reviewer>(named("iso")).await;
+    app.insert::<Registry>(named_json("root")).await;
+    let reviewer = app.insert::<Reviewer>(named_json("iso")).await;
     app.settled().await;
 
     // Two providers of one key run at once, one per realm.
@@ -93,7 +97,7 @@ async fn an_isolated_key_resolves_to_the_provider_inside_the_realm() {
 #[tokio::test]
 async fn a_consumer_in_a_realm_without_a_provider_waits() {
     let app = App::new();
-    app.insert::<Registry>(named("shared")).await;
+    app.insert::<Registry>(named_json("shared")).await;
     let alone = app.isolate::<dyn Tools>().plugin::<Agent>(named("alone")).await.unwrap();
     app.settled().await;
     assert_eq!(alone.status().await, Some(Status::Inactive));
@@ -134,7 +138,7 @@ impl Component for Spawner {
 #[tokio::test]
 async fn descendants_inherit_the_realms_of_their_scope() {
     let app = App::new();
-    app.insert::<Registry>(named("root")).await;
+    app.insert::<Registry>(named_json("root")).await;
     let realm = Realm::new();
     let sub = app.isolate_in::<dyn Tools>(&realm);
     sub.plugin::<Registry>(named("private")).await.unwrap();
@@ -222,9 +226,9 @@ impl Component for Sandbox {
 async fn interception_changes_only_the_view_of_consumers_under_the_scope() {
     let app = App::new();
     app.insert::<LocalFs>(json!(null)).await;
-    app.insert::<Reader>(named("plain")).await;
+    app.insert::<Reader>(named_json("plain")).await;
     app.intercept::<dyn Fs>(|fs| Arc::new(Under("/work", fs))).plugin::<Reader>(named("work")).await.unwrap();
-    app.insert::<Sandbox>(named("sandboxed")).await;
+    app.insert::<Sandbox>(named_json("sandboxed")).await;
     app.settled().await;
 
     assert_eq!(view("plain"), "/");

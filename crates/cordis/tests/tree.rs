@@ -5,9 +5,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use cordis::{App, Component, Cx, FiberId, Result, Status, component, key};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 
 // Journal shared by the components below. Tests run in parallel, so each entry carries the
 // test's tag.
@@ -47,7 +47,7 @@ impl Component for StaticPrompt {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone)]
 struct ChildConfig {
     tag: String,
     name: String,
@@ -285,4 +285,54 @@ async fn a_leaving_fiber_cannot_instantiate_children() {
     WATCH_GATE.notify_one();
     app.settled().await;
     assert_eq!(journal("leaving"), ["first up", "parent down", "first down"]);
+}
+
+/// Non-serializable configuration carrying an in-memory channel sender.
+#[derive(Clone)]
+struct ChannelConfig {
+    label: &'static str,
+    tx: mpsc::UnboundedSender<String>,
+}
+
+#[component(config = ChannelConfig, deps(prompt: dyn Prompt))]
+struct ChannelChild;
+
+impl Component for ChannelChild {
+    async fn activate(cx: Cx<Self>, config: ChannelConfig) -> Result<Self> {
+        let _ = config.tx.send(format!("{}:{}", config.label, cx.deps().prompt.text()));
+        Ok(ChannelChild)
+    }
+}
+
+#[tokio::test]
+async fn a_child_config_need_not_be_serializable_and_survives_reloads_and_updates() {
+    let (app, prompt, _parent) = start("non_serde", json!({})).await;
+    app.settled().await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let child =
+        context("non_serde").plugin::<ChannelChild>(ChannelConfig { label: "v1", tx: tx.clone() }).await.unwrap();
+    app.settled().await;
+    assert_eq!(rx.try_recv().unwrap(), "v1:first");
+
+    // Updating the child's dependency reloads the child with its cloned in-memory config.
+    app.update(prompt, json!({ "text": "second" }));
+    // Wait: `parent` depends on `prompt`, so reloading `prompt` reloads `parent` and retires `child`.
+    // Test `app.plugin` / `child.update` directly for a fiber that survives `prompt` reload:
+    app.settled().await;
+    assert_eq!(child.status().await, None);
+
+    let root_child = app.plugin::<ChannelChild>(ChannelConfig { label: "r1", tx: tx.clone() }).await.unwrap();
+    app.settled().await;
+    assert_eq!(rx.try_recv().unwrap(), "r1:second");
+
+    // Reloading `prompt` reloads `root_child` by cloning `ChannelConfig` in memory.
+    app.update(prompt, json!({ "text": "third" }));
+    app.settled().await;
+    assert_eq!(rx.try_recv().unwrap(), "r1:third");
+
+    // Updating `root_child` through its `Fiber` handle replaces the in-memory config.
+    root_child.update(ChannelConfig { label: "r2", tx });
+    app.settled().await;
+    assert_eq!(rx.try_recv().unwrap(), "r2:third");
 }
