@@ -2,7 +2,6 @@
 
 use std::any::Any;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -12,7 +11,7 @@ use serde_json::Value;
 use crate::dispose::Undo;
 use crate::orchestrator::Control;
 use crate::realm::Env;
-use crate::{Component, Cx, Events, Key, KeyId, Manifest, Result, When, WhenAction};
+use crate::{Component, Cx, Events, Key, KeyId, Manifest, Result};
 
 pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
@@ -28,7 +27,7 @@ pub(crate) enum Config {
     Typed(Arc<dyn Any + Send + Sync>),
 }
 
-type Activate = Box<dyn Fn(Resolved, Config, Events, Control) -> BoxFuture<Result<Box<dyn Instance>>> + Send + Sync>;
+type Activate = fn(Resolved, Config, Events, Control) -> BoxFuture<Result<Box<dyn Instance>>>;
 
 /// A provided value with its type erased.
 ///
@@ -98,7 +97,7 @@ impl Factory {
             optional: <C as Manifest>::optional(),
             provides: <C as Manifest>::provides(),
             validate: validate::<C>,
-            activate: Box::new(activate_json::<C>),
+            activate: activate_json::<C>,
         }
     }
 
@@ -112,27 +111,7 @@ impl Factory {
             optional: <C as Manifest>::optional(),
             provides: <C as Manifest>::provides(),
             validate: |_| Ok(()),
-            activate: Box::new(activate_typed::<C>),
-        }
-    }
-
-    pub(crate) fn when<K: Key + ?Sized>(run: impl WhenAction<K>) -> Self {
-        let run = Arc::new(run);
-        Self {
-            deps: <When<K> as Manifest>::deps(),
-            optional: Vec::new(),
-            provides: Vec::new(),
-            validate: validate::<When<K>>,
-            activate: Box::new(move |deps, _config, events, control| {
-                let run = run.clone();
-                Box::pin(async move {
-                    let provider = <When<K> as Manifest>::resolve(&Resolve { values: &deps, env: control.env() });
-                    let undo = control.undo().upgrade().expect("the activation task holds its run's undo list");
-                    let cx = Cx::new(Arc::new(provider.clone()), events, control);
-                    run(cx, provider).await?;
-                    Ok(Box::new(Active { component: Arc::new(When::<K>(PhantomData)), undo }) as Box<dyn Instance>)
-                })
-            }),
+            activate: activate_typed::<C>,
         }
     }
 }

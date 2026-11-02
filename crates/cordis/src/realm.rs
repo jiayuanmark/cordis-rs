@@ -6,6 +6,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::component::WhenRun;
 use crate::erased::{Config, Erased, Factory};
 use crate::orchestrator::Spawner;
 use crate::{Component, Fiber, Key, KeyId, Result, When, WhenAction};
@@ -261,7 +262,9 @@ impl Scope {
     /// Returns an error when the fiber the scope was taken from can no longer instantiate
     /// children, or when the app has stopped. In each case no fiber runs.
     pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> Result<Fiber<When<K>>> {
-        let config = Config::Typed(Arc::new(()));
-        self.spawner.insert(Arc::new(Factory::when::<K>(run)), config, self.env.clone()).await
+        // `plugin::<When<K>>` without its `Config: Clone + Sync` bound, which the compiler cannot
+        // prove for every lifetime when `K` is a trait object.
+        let config = Config::Typed(Arc::new(WhenRun::new(run)));
+        self.spawner.insert(Arc::new(Factory::typed::<When<K>>()), config, self.env.clone()).await
     }
 }

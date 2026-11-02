@@ -4,6 +4,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use crate::erased::BoxFuture;
 use crate::events::{Held, On};
 use crate::orchestrator::Control;
 use crate::{Dispose, Erased, Event, Events, Fiber, FiberId, Key, KeyId, Realm, Resolve, Result, Scope};
@@ -62,10 +63,12 @@ pub trait Manifest: Sized + 'static {
 /// [`on`](Cx::on), [`plugin`](Cx::plugin), [`when`](Cx::when), [`isolate`](Cx::isolate),
 /// [`intercept`](Cx::intercept), and [`cancelled`](Cx::cancelled). [`cx.deps()`](Cx::deps)
 /// returns the `&Arc<K::Value>` also passed as the closure's second argument.
-pub struct When<K: Key + ?Sized>(pub(crate) PhantomData<fn() -> K>);
+///
+/// It is an ordinary component whose configuration is the closure.
+pub struct When<K: Key + ?Sized>(PhantomData<fn() -> K>);
 
 impl<K: Key + ?Sized> Manifest for When<K> {
-    type Config = ();
+    type Config = WhenRun<K>;
     type Deps = Arc<K::Value>;
 
     fn deps() -> Vec<KeyId> {
@@ -86,8 +89,29 @@ impl<K: Key + ?Sized> Manifest for When<K> {
 }
 
 impl<K: Key + ?Sized> Component for When<K> {
-    async fn activate(_: Cx<Self>, (): ()) -> Result<Self> {
+    async fn activate(cx: Cx<Self>, run: WhenRun<K>) -> Result<Self> {
+        let provider = cx.deps().clone();
+        (run.0)(cx, provider).await?;
         Ok(Self(PhantomData))
+    }
+}
+
+/// The configuration of a [`When`] fiber: its closure, with the future boxed so the type can be
+/// named.
+#[doc(hidden)]
+pub struct WhenRun<K: Key + ?Sized>(Arc<WhenFn<K>>);
+
+type WhenFn<K> = dyn Fn(Cx<When<K>>, Arc<<K as Key>::Value>) -> BoxFuture<Result<()>> + Send + Sync;
+
+impl<K: Key + ?Sized> WhenRun<K> {
+    pub(crate) fn new(run: impl WhenAction<K>) -> Self {
+        Self(Arc::new(move |cx, provider| Box::pin(run(cx, provider))))
+    }
+}
+
+impl<K: Key + ?Sized> Clone for WhenRun<K> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
 }
 
