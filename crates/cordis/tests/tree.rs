@@ -305,34 +305,38 @@ impl Component for ChannelChild {
 }
 
 #[tokio::test]
-async fn a_child_config_need_not_be_serializable_and_survives_reloads_and_updates() {
-    let (app, prompt, _parent) = start("non_serde", json!({})).await;
+async fn a_child_config_need_not_be_serializable() {
+    let (app, _prompt, _parent) = start("non_serde", json!({})).await;
     app.settled().await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let child =
-        context("non_serde").plugin::<ChannelChild>(ChannelConfig { label: "v1", tx: tx.clone() }).await.unwrap();
+    context("non_serde").plugin::<ChannelChild>(ChannelConfig { label: "child", tx }).await.unwrap();
+    app.settled().await;
+    assert_eq!(rx.try_recv().unwrap(), "child:first");
+}
+
+#[tokio::test]
+async fn a_typed_config_is_cloned_across_reloads_and_replaced_through_the_handle() {
+    let app = App::new();
+    let prompt = app.insert::<StaticPrompt>(json!({ "text": "first" })).await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let fiber = app.plugin::<ChannelChild>(ChannelConfig { label: "v1", tx: tx.clone() }).await.unwrap();
     app.settled().await;
     assert_eq!(rx.try_recv().unwrap(), "v1:first");
 
-    // Updating the child's dependency reloads the child with its cloned in-memory config.
+    // Reloading the dependency reloads the fiber with a clone of its config.
     app.update(prompt, json!({ "text": "second" }));
-    // Wait: `parent` depends on `prompt`, so reloading `prompt` reloads `parent` and retires `child`.
-    // Test `app.plugin` / `child.update` directly for a fiber that survives `prompt` reload:
     app.settled().await;
-    assert_eq!(child.status().await, None);
+    assert_eq!(rx.try_recv().unwrap(), "v1:second");
 
-    let root_child = app.plugin::<ChannelChild>(ChannelConfig { label: "r1", tx: tx.clone() }).await.unwrap();
+    // The handle's `update` takes the component's own config type.
+    fiber.update(ChannelConfig { label: "v2", tx });
     app.settled().await;
-    assert_eq!(rx.try_recv().unwrap(), "r1:second");
+    assert_eq!(rx.try_recv().unwrap(), "v2:second");
 
-    // Reloading `prompt` reloads `root_child` by cloning `ChannelConfig` in memory.
-    app.update(prompt, json!({ "text": "third" }));
+    // A JSON update of a typed fiber is ignored: the fiber keeps running as it was.
+    app.update(fiber.id(), json!({ "label": "v3" }));
     app.settled().await;
-    assert_eq!(rx.try_recv().unwrap(), "r1:third");
-
-    // Updating `root_child` through its `Fiber` handle replaces the in-memory config.
-    root_child.update(ChannelConfig { label: "r2", tx });
-    app.settled().await;
-    assert_eq!(rx.try_recv().unwrap(), "r2:third");
+    assert_eq!(fiber.status().await, Some(Status::Active));
+    assert!(rx.try_recv().is_err());
 }

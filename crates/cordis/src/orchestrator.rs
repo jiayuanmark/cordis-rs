@@ -1,7 +1,9 @@
 //! The orchestrator: one task that owns every fiber and applies lifecycle transitions.
 
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use crate::dispose::{Undo, UndoHandle, panic_message};
 use crate::erased::{Config, Factory, Instance};
 use crate::realm::{Env, Slot};
-use crate::{Component, Dispose, Erased, Events, Key, KeyId, Realm, Scope, WhenAction};
+use crate::{Component, Dispose, Erased, Events, Key, KeyId, Realm, Scope, When, WhenAction};
 
 new_key_type! {
     /// Identity of a fiber: one configured instance of a component.
@@ -95,7 +97,7 @@ impl App {
     /// # Errors
     ///
     /// Returns an error when the app has stopped.
-    pub async fn plugin<C>(&self, config: C::Config) -> crate::Result<Fiber>
+    pub async fn plugin<C>(&self, config: C::Config) -> crate::Result<Fiber<C>>
     where
         C: Component,
         C::Config: Clone + Sync,
@@ -138,7 +140,7 @@ impl App {
     /// # Errors
     ///
     /// Returns an error when the app has stopped.
-    pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> crate::Result<Fiber> {
+    pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> crate::Result<Fiber<When<K>>> {
         self.scope().when::<K>(run).await
     }
 
@@ -147,6 +149,10 @@ impl App {
     }
 
     /// Replaces a fiber's JSON configuration; an active fiber reloads, and its consumers with it.
+    ///
+    /// Applies to fibers inserted with [`insert`](App::insert) or by a [`Loader`](crate::Loader).
+    /// A fiber instantiated with a `plugin` method is updated through its [`Fiber`] handle; a JSON
+    /// update of one is ignored with a warning, and the fiber keeps running as it was.
     pub fn update(&self, id: FiberId, config: Value) {
         self.send(Command::Update { id, config: Config::Json(config) });
     }
@@ -340,7 +346,12 @@ impl Spawner {
         }
     }
 
-    pub(crate) async fn insert(&self, factory: Arc<Factory>, config: Config, env: Env) -> crate::Result<Fiber> {
+    pub(crate) async fn insert<C: 'static>(
+        &self,
+        factory: Arc<Factory>,
+        config: Config,
+        env: Env,
+    ) -> crate::Result<Fiber<C>> {
         let commands = self.commands().ok_or(Refused::Stopped)?;
         let parent = match self {
             Spawner::App(_) => None,
@@ -349,7 +360,7 @@ impl Spawner {
         let (reply, answer) = oneshot::channel();
         commands.send(Command::Insert { factory, config, env, parent, reply }).map_err(|_| Refused::Stopped)?;
         let id = answer.await.map_err(|_| Refused::Stopped)?.ok_or(Refused::Ended)?;
-        let fiber = Fiber { id, commands: commands.downgrade(), disposed: Arc::default() };
+        let fiber = Fiber { id, commands: commands.downgrade(), disposed: Arc::default(), component: PhantomData };
         if let Spawner::Fiber(control) = self {
             control.undo.push(Retire(fiber.clone()));
         }
@@ -357,21 +368,70 @@ impl Spawner {
     }
 }
 
-/// A view of a child fiber, returned by [`Cx::plugin`](crate::Cx::plugin).
+/// A view of a fiber of component `C`, returned by [`Cx::plugin`](crate::Cx::plugin) and the
+/// other `plugin` and `when` methods.
 ///
 /// The handle does not own the fiber: dropping it changes nothing, and the parent's activation
 /// retires the child when it ends. Use [`dispose`](Fiber::dispose) to retire it sooner, for
 /// example when an agent finishes its task. Clones refer to the same fiber, and the handle does
 /// not keep the app running.
-#[derive(Clone, Debug)]
-pub struct Fiber {
+pub struct Fiber<C> {
     id: FiberId,
     commands: WeakUnboundedSender<Command>,
     /// Set by `dispose` on any clone.
     disposed: Arc<AtomicBool>,
+    component: PhantomData<fn() -> C>,
 }
 
-impl Fiber {
+impl<C> Clone for Fiber<C> {
+    fn clone(&self) -> Self {
+        Self { id: self.id, commands: self.commands.clone(), disposed: self.disposed.clone(), component: PhantomData }
+    }
+}
+
+impl<C> fmt::Debug for Fiber<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Fiber").field("id", &self.id).field("disposed", &self.disposed).finish_non_exhaustive()
+    }
+}
+
+impl<C: Component> Fiber<C>
+where
+    C::Config: Clone + Sync,
+{
+    /// Replaces the fiber's configuration, passed in memory like the one it was instantiated
+    /// with; an active fiber reloads, and its consumers with it.
+    ///
+    /// The handle knows its component, so a configuration of another type does not compile:
+    ///
+    /// ```compile_fail
+    /// # use cordis::{App, Component, Cx, Result, component};
+    /// #[derive(Clone)]
+    /// struct Settings {
+    ///     limit: u32,
+    /// }
+    ///
+    /// #[component(config = Settings)]
+    /// struct Worker;
+    ///
+    /// impl Component for Worker {
+    ///     async fn activate(_: Cx<Self>, _: Settings) -> Result<Self> {
+    ///         Ok(Worker)
+    ///     }
+    /// }
+    ///
+    /// # async fn run(app: App) -> Result<()> {
+    /// let worker = app.plugin::<Worker>(Settings { limit: 1 }).await?;
+    /// worker.update(serde_json::json!({ "limit": 2 }));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn update(&self, config: C::Config) {
+        self.send(Command::Update { id: self.id, config: Config::Typed(Arc::new(config)) });
+    }
+}
+
+impl<C> Fiber<C> {
     /// Returns the fiber's id, for use with [`App`].
     pub fn id(&self) -> FiberId {
         self.id
@@ -382,11 +442,6 @@ impl Fiber {
         let (reply, answer) = oneshot::channel();
         self.send(Command::Status { id: self.id, reply });
         answer.await.ok().flatten()
-    }
-
-    /// Replaces the fiber's configuration; an active fiber reloads, and its consumers with it.
-    pub fn update<C: Clone + Send + Sync + 'static>(&self, config: C) {
-        self.send(Command::Update { id: self.id, config: Config::Typed(Arc::new(config)) });
     }
 
     /// Retires the fiber now. It deactivates after its consumers, then is discarded.
@@ -406,9 +461,9 @@ impl Fiber {
 /// place in that run's undo list. The parent does not wait for the child to leave. Once the
 /// child has been disposed through its handle, the entry is finished and the list can drop it,
 /// so a parent that runs a child per request doesn't accumulate them.
-struct Retire(Fiber);
+struct Retire<C>(Fiber<C>);
 
-impl Dispose for Retire {
+impl<C: 'static> Dispose for Retire<C> {
     fn dispose(self) -> impl Future<Output = ()> + Send + 'static {
         self.0.dispose();
         std::future::ready(())
@@ -593,6 +648,15 @@ impl Orchestrator {
             }
             Command::Update { id, config } => {
                 if let Some(fiber) = self.fibers.get_mut(id) {
+                    // A fiber keeps the kind of configuration it was inserted with: its factory
+                    // reads either JSON or a typed value, never both.
+                    if matches!(fiber.config, Config::Json(_)) != matches!(config, Config::Json(_)) {
+                        tracing::warn!(
+                            fiber = ?id,
+                            "ignored a JSON update of a fiber instantiated with `plugin`; update it through its `Fiber` handle"
+                        );
+                        return;
+                    }
                     fiber.config = config;
                     fiber.epoch += 1;
                     self.dirty.push_back(id);
@@ -614,6 +678,7 @@ impl Orchestrator {
                 let _ = reply.send(self.fibers.get(id).map(|fiber| fiber.state.status()));
             }
             Command::Config { id, reply } => {
+                // Only the loader asks, and its fibers are always configured with JSON.
                 let config = self.fibers.get(id).filter(|fiber| !fiber.retired).and_then(|fiber| match &fiber.config {
                     Config::Json(value) => Some(value.clone()),
                     Config::Typed(_) => None,
@@ -977,7 +1042,12 @@ mod tests {
     #[test]
     fn a_child_disposed_through_its_handle_is_a_finished_entry() {
         let (commands, _receiver) = mpsc::unbounded_channel();
-        let child = Fiber { id: FiberId::default(), commands: commands.downgrade(), disposed: Arc::default() };
+        let child: Fiber<()> = Fiber {
+            id: FiberId::default(),
+            commands: commands.downgrade(),
+            disposed: Arc::default(),
+            component: PhantomData,
+        };
         let retire = Retire(child.clone());
         assert!(!retire.is_finished());
         child.dispose();

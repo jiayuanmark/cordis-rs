@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::erased::{Config, Erased, Factory};
 use crate::orchestrator::Spawner;
-use crate::{Component, Fiber, Key, KeyId, Result, WhenAction};
+use crate::{Component, Fiber, Key, KeyId, Result, When, WhenAction};
 
 /// A namespace of provisions.
 ///
@@ -239,7 +239,7 @@ impl Scope {
     ///
     /// Returns an error when the fiber the scope was taken from can no longer instantiate
     /// children, or when the app has stopped. In each case no fiber runs.
-    pub async fn plugin<D>(&self, config: D::Config) -> Result<Fiber>
+    pub async fn plugin<D>(&self, config: D::Config) -> Result<Fiber<D>>
     where
         D: Component,
         D::Config: Clone + Sync,
@@ -260,7 +260,7 @@ impl Scope {
     ///
     /// Returns an error when the fiber the scope was taken from can no longer instantiate
     /// children, or when the app has stopped. In each case no fiber runs.
-    pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> Result<Fiber> {
+    pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> Result<Fiber<When<K>>> {
         let config = Config::Typed(Arc::new(()));
         self.spawner.insert(Arc::new(Factory::when::<K>(run)), config, self.env.clone()).await
     }

@@ -230,7 +230,7 @@ impl<C: Component> Cx<C> {
     ///
     /// Returns an error when this fiber is leaving or its activation has ended (see
     /// [`is_live`](Cx::is_live)), or when the app has stopped. In each case no child runs.
-    pub async fn plugin<D>(&self, config: D::Config) -> Result<Fiber>
+    pub async fn plugin<D>(&self, config: D::Config) -> Result<Fiber<D>>
     where
         D: Component,
         D::Config: Clone + Sync,
@@ -288,7 +288,7 @@ impl<C: Component> Cx<C> {
     ///
     /// Returns an error when this fiber is leaving or its activation has ended (see
     /// [`is_live`](Cx::is_live)), or when the app has stopped. In each case no child runs.
-    pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> Result<Fiber> {
+    pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> Result<Fiber<When<K>>> {
         self.control.scope().when::<K>(run).await
     }
 
