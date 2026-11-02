@@ -76,7 +76,7 @@ struct Consumer {
 impl Report for Consumer {
     fn describe(&self) -> String {
         let ConsumerDeps { named, counter } = self.cx.deps();
-        format!("{} {}", named.name(), counter.get().map_or(0, |c| c.count()))
+        format!("{} {}", named.name(), counter.as_ref().map_or(0, |c| c.count()))
     }
 }
 

@@ -10,9 +10,9 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::dispose::Undo;
-use crate::orchestrator::{Control, WeakTable};
+use crate::orchestrator::Control;
 use crate::realm::Env;
-use crate::{Component, Cx, Events, Key, KeyId, Manifest, Optional, Result, When, WhenAction};
+use crate::{Component, Cx, Events, Key, KeyId, Manifest, Result, When, WhenAction};
 
 pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
@@ -58,29 +58,23 @@ impl Erased {
 pub struct Resolve<'a> {
     values: &'a [(KeyId, Erased)],
     env: &'a Env,
-    table: &'a WeakTable,
 }
 
 impl Resolve<'_> {
-    fn find(&self, id: KeyId) -> &Erased {
-        &self
-            .values
-            .iter()
-            .find(|(key, _)| *key == id)
-            .expect("the orchestrator resolves every declared key before activation")
-            .1
+    fn find(&self, id: KeyId) -> Option<&Erased> {
+        self.values.iter().find(|(key, _)| *key == id).map(|(_, value)| value)
     }
 
     /// Returns the provider of `K`, with the context's interception of `K` applied, if any.
     pub fn get<K: Key + ?Sized>(&self) -> Arc<K::Value> {
-        let id = KeyId::of::<K>();
-        self.env.remap(id, self.find(id).clone()).get::<K>()
+        self.optional::<K>().expect("the orchestrator resolves every required key before activation")
     }
 
-    /// Returns a handle that reads the current provider of an optional dependency `K` under the
-    /// context's realm and interception.
-    pub fn optional<K: Key + ?Sized>(&self) -> Optional<K> {
-        Optional::new(self.env.clone(), self.table.clone())
+    /// Returns the provider of an optional dependency `K`, with the context's interception of `K`
+    /// applied, or `None` when `K` had no provider when this activation began.
+    pub fn optional<K: Key + ?Sized>(&self) -> Option<Arc<K::Value>> {
+        let id = KeyId::of::<K>();
+        Some(self.env.remap(id, self.find(id)?.clone()).get::<K>())
     }
 }
 
@@ -132,11 +126,7 @@ impl Factory {
             activate: Box::new(move |deps, _config, events, control| {
                 let run = run.clone();
                 Box::pin(async move {
-                    let provider = <When<K> as Manifest>::resolve(&Resolve {
-                        values: &deps,
-                        env: control.env(),
-                        table: control.table(),
-                    });
+                    let provider = <When<K> as Manifest>::resolve(&Resolve { values: &deps, env: control.env() });
                     let undo = control.undo().upgrade().expect("the activation task holds its run's undo list");
                     let cx = Cx::new(Arc::new(provider.clone()), events, control);
                     run(cx, provider).await?;
@@ -202,7 +192,7 @@ async fn activate_with<C: Component>(
     events: Events,
     control: Control,
 ) -> Result<Box<dyn Instance>> {
-    let deps = Arc::new(C::resolve(&Resolve { values: &deps, env: control.env(), table: control.table() }));
+    let deps = Arc::new(C::resolve(&Resolve { values: &deps, env: control.env() }));
     let undo = control.undo().upgrade().expect("the activation task holds its run's undo list");
     let component = C::activate(Cx::new(deps, events, control), config).await?;
     Ok(Box::new(Active { component: Arc::new(component), undo }) as Box<dyn Instance>)

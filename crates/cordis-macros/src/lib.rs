@@ -87,7 +87,7 @@ impl Declaration {
             let doc = format!("Resolved dependencies of [`{name}`], one field per entry of its `deps(...)`.");
             let fields = deps.iter().map(|Dep { name, key, optional }| {
                 if *optional {
-                    quote_spanned! {key.span()=> pub #name: ::cordis::Optional<#key> }
+                    quote_spanned! {key.span()=> pub #name: ::std::option::Option<::std::sync::Arc<<#key as ::cordis::Key>::Value>> }
                 } else {
                     quote_spanned! {key.span()=> pub #name: ::std::sync::Arc<<#key as ::cordis::Key>::Value> }
                 }
