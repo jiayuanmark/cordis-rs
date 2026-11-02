@@ -28,7 +28,7 @@ pub trait Metrics: Send + Sync {
 }
 key!(dyn Metrics = "metrics");
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct MetricsConfig {
     #[serde(default)]
     tag: String,

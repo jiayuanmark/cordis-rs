@@ -4,9 +4,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use serde::Serialize;
-use serde::de::DeserializeOwned;
-
+use crate::erased::BoxFuture;
 use crate::events::{Held, On};
 use crate::orchestrator::Control;
 use crate::{Dispose, Erased, Event, Events, Fiber, FiberId, Key, KeyId, Realm, Resolve, Result, Scope};
@@ -17,8 +15,15 @@ use crate::{Dispose, Erased, Event, Events, Fiber, FiberId, Key, KeyId, Realm, R
 /// Implement it with [`#[component]`](crate::component), which also generates the
 /// [`Deps`](Manifest::Deps) struct.
 pub trait Manifest: Sized + 'static {
-    /// Configuration deserialized from the component's configuration row.
-    type Config: DeserializeOwned + Send + 'static;
+    /// Configuration passed to [`Component::activate`].
+    ///
+    /// A component instantiated in Rust with [`Cx::plugin`], [`Scope::plugin`], or
+    /// [`App::plugin`](crate::App::plugin) needs only `Config: Clone + Send + Sync + 'static`, so
+    /// its configuration may carry in-memory handles, channels, or trait objects without
+    /// implementing `Serialize` or `Deserialize`. A component loaded from configuration through
+    /// [`Catalog::register`](crate::Catalog::register) or [`App::insert`](crate::App::insert)
+    /// requires `Config: DeserializeOwned`.
+    type Config: Send + 'static;
 
     /// The resolved dependencies, with one typed field per declared key. `()` when the
     /// component declares none.
@@ -58,10 +63,12 @@ pub trait Manifest: Sized + 'static {
 /// [`on`](Cx::on), [`plugin`](Cx::plugin), [`when`](Cx::when), [`isolate`](Cx::isolate),
 /// [`intercept`](Cx::intercept), and [`cancelled`](Cx::cancelled). [`cx.deps()`](Cx::deps)
 /// returns the `&Arc<K::Value>` also passed as the closure's second argument.
-pub struct When<K: Key + ?Sized>(pub(crate) PhantomData<fn() -> K>);
+///
+/// It is an ordinary component whose configuration is the closure.
+pub struct When<K: Key + ?Sized>(PhantomData<fn() -> K>);
 
 impl<K: Key + ?Sized> Manifest for When<K> {
-    type Config = ();
+    type Config = WhenRun<K>;
     type Deps = Arc<K::Value>;
 
     fn deps() -> Vec<KeyId> {
@@ -82,8 +89,29 @@ impl<K: Key + ?Sized> Manifest for When<K> {
 }
 
 impl<K: Key + ?Sized> Component for When<K> {
-    async fn activate(_: Cx<Self>, (): ()) -> Result<Self> {
+    async fn activate(cx: Cx<Self>, run: WhenRun<K>) -> Result<Self> {
+        let provider = cx.deps().clone();
+        (run.0)(cx, provider).await?;
         Ok(Self(PhantomData))
+    }
+}
+
+/// The configuration of a [`When`] fiber: its closure, with the future boxed so the type can be
+/// named.
+#[doc(hidden)]
+pub struct WhenRun<K: Key + ?Sized>(Arc<WhenFn<K>>);
+
+type WhenFn<K> = dyn Fn(Cx<When<K>>, Arc<<K as Key>::Value>) -> BoxFuture<Result<()>> + Send + Sync;
+
+impl<K: Key + ?Sized> WhenRun<K> {
+    pub(crate) fn new(run: impl WhenAction<K>) -> Self {
+        Self(Arc::new(move |cx, provider| Box::pin(run(cx, provider))))
+    }
+}
+
+impl<K: Key + ?Sized> Clone for WhenRun<K> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
 }
 
@@ -225,10 +253,13 @@ impl<C: Component> Cx<C> {
     ///
     /// # Errors
     ///
-    /// Returns an error when `config` fails to serialize, when this fiber is leaving or its
-    /// activation has ended (see [`is_live`](Cx::is_live)), or when the app has stopped. In
-    /// each case no child runs.
-    pub async fn plugin<D: Component>(&self, config: impl Serialize) -> Result<Fiber> {
+    /// Returns an error when this fiber is leaving or its activation has ended (see
+    /// [`is_live`](Cx::is_live)), or when the app has stopped. In each case no child runs.
+    pub async fn plugin<D>(&self, config: D::Config) -> Result<Fiber<D>>
+    where
+        D: Component,
+        D::Config: Clone + Sync,
+    {
         self.control.scope().plugin::<D>(config).await
     }
 
@@ -282,7 +313,7 @@ impl<C: Component> Cx<C> {
     ///
     /// Returns an error when this fiber is leaving or its activation has ended (see
     /// [`is_live`](Cx::is_live)), or when the app has stopped. In each case no child runs.
-    pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> Result<Fiber> {
+    pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> Result<Fiber<When<K>>> {
         self.control.scope().when::<K>(run).await
     }
 

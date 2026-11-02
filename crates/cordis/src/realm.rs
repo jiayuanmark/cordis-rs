@@ -6,12 +6,10 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde::Serialize;
-
-use crate::erased::Erased;
-use crate::erased::Factory;
+use crate::component::WhenRun;
+use crate::erased::{Config, Erased, Factory};
 use crate::orchestrator::Spawner;
-use crate::{Component, Fiber, Key, KeyId, Result, WhenAction};
+use crate::{Component, Fiber, Key, KeyId, Result, When, WhenAction};
 
 /// A namespace of provisions.
 ///
@@ -233,18 +231,22 @@ impl Scope {
 
     /// Instantiates a fiber of component `D` with `config` under this scope.
     ///
-    /// From a scope taken from a `Cx`, the fiber is a child of that fiber's current activation;
-    /// see [`Cx::plugin`](crate::Cx::plugin). From a scope taken from an `App`, it is a root
-    /// fiber, which [`Fiber::dispose`] or [`App::remove`](crate::App::remove) retires.
+    /// `config` is passed directly in memory (`D::Config: Clone + Send + Sync + 'static`), without
+    /// serialization. From a scope taken from a `Cx`, the fiber is a child of that fiber's current
+    /// activation; see [`Cx::plugin`](crate::Cx::plugin). From a scope taken from an `App`, it is
+    /// a root fiber, which [`Fiber::dispose`] or [`App::remove`](crate::App::remove) retires.
     ///
     /// # Errors
     ///
-    /// Returns an error when `config` fails to serialize, when the fiber the scope was taken
-    /// from can no longer instantiate children, or when the app has stopped. In each case no
-    /// fiber runs.
-    pub async fn plugin<D: Component>(&self, config: impl Serialize) -> Result<Fiber> {
-        let config = serde_json::to_value(config)?;
-        self.spawner.insert(Arc::new(Factory::of::<D>()), config, self.env.clone()).await
+    /// Returns an error when the fiber the scope was taken from can no longer instantiate
+    /// children, or when the app has stopped. In each case no fiber runs.
+    pub async fn plugin<D>(&self, config: D::Config) -> Result<Fiber<D>>
+    where
+        D: Component,
+        D::Config: Clone + Sync,
+    {
+        let config = Config::Typed(Arc::new(config));
+        self.spawner.insert(Arc::new(Factory::typed::<D>()), config, self.env.clone()).await
     }
 
     /// Instantiates a fiber under this scope that runs `run` whenever `K` has an active provider
@@ -259,7 +261,10 @@ impl Scope {
     ///
     /// Returns an error when the fiber the scope was taken from can no longer instantiate
     /// children, or when the app has stopped. In each case no fiber runs.
-    pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> Result<Fiber> {
-        self.spawner.insert(Arc::new(Factory::when::<K>(run)), serde_json::Value::Null, self.env.clone()).await
+    pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> Result<Fiber<When<K>>> {
+        // `plugin::<When<K>>` without its `Config: Clone + Sync` bound, which the compiler cannot
+        // prove for every lifetime when `K` is a trait object.
+        let config = Config::Typed(Arc::new(WhenRun::new(run)));
+        self.spawner.insert(Arc::new(Factory::typed::<When<K>>()), config, self.env.clone()).await
     }
 }

@@ -5,9 +5,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use cordis::{App, Component, Cx, FiberId, Result, Status, component, key};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 
 // Journal shared by the components below. Tests run in parallel, so each entry carries the
 // test's tag.
@@ -47,7 +47,7 @@ impl Component for StaticPrompt {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone)]
 struct ChildConfig {
     tag: String,
     name: String,
@@ -285,4 +285,58 @@ async fn a_leaving_fiber_cannot_instantiate_children() {
     WATCH_GATE.notify_one();
     app.settled().await;
     assert_eq!(journal("leaving"), ["first up", "parent down", "first down"]);
+}
+
+/// Non-serializable configuration carrying an in-memory channel sender.
+#[derive(Clone)]
+struct ChannelConfig {
+    label: &'static str,
+    tx: mpsc::UnboundedSender<String>,
+}
+
+#[component(config = ChannelConfig, deps(prompt: dyn Prompt))]
+struct ChannelChild;
+
+impl Component for ChannelChild {
+    async fn activate(cx: Cx<Self>, config: ChannelConfig) -> Result<Self> {
+        let _ = config.tx.send(format!("{}:{}", config.label, cx.deps().prompt.text()));
+        Ok(ChannelChild)
+    }
+}
+
+#[tokio::test]
+async fn a_child_config_need_not_be_serializable() {
+    let (app, _prompt, _parent) = start("non_serde", json!({})).await;
+    app.settled().await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    context("non_serde").plugin::<ChannelChild>(ChannelConfig { label: "child", tx }).await.unwrap();
+    app.settled().await;
+    assert_eq!(rx.try_recv().unwrap(), "child:first");
+}
+
+#[tokio::test]
+async fn a_typed_config_is_cloned_across_reloads_and_replaced_through_the_handle() {
+    let app = App::new();
+    let prompt = app.insert::<StaticPrompt>(json!({ "text": "first" })).await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let fiber = app.plugin::<ChannelChild>(ChannelConfig { label: "v1", tx: tx.clone() }).await.unwrap();
+    app.settled().await;
+    assert_eq!(rx.try_recv().unwrap(), "v1:first");
+
+    // Reloading the dependency reloads the fiber with a clone of its config.
+    app.update(prompt, json!({ "text": "second" }));
+    app.settled().await;
+    assert_eq!(rx.try_recv().unwrap(), "v1:second");
+
+    // The handle's `update` takes the component's own config type.
+    fiber.update(ChannelConfig { label: "v2", tx });
+    app.settled().await;
+    assert_eq!(rx.try_recv().unwrap(), "v2:second");
+
+    // A JSON update of a typed fiber is ignored: the fiber keeps running as it was.
+    app.update(fiber.id(), json!({ "label": "v3" }));
+    app.settled().await;
+    assert_eq!(fiber.status().await, Some(Status::Active));
+    assert!(rx.try_recv().is_err());
 }

@@ -73,9 +73,10 @@ A component is a type. Its value is the service it provides. What it did is undo
 
 ```rust
 pub trait Manifest: Sized + 'static {
-    type Config: DeserializeOwned + Send + 'static;
+    type Config: Send + 'static;  // `DeserializeOwned` too, to load it from YAML or JSON
     type Deps: Send + Sync + 'static; // one typed field per key in d
     fn deps() -> Vec<KeyId>;      // d
+    fn optional() -> Vec<KeyId>;  // optional keys, `deps(name?: Key)`
     fn provides() -> Vec<KeyId>;  // p
 }
 
@@ -211,7 +212,7 @@ Both adjust how keys resolve for part of the fiber tree without touching the sha
 // A reviewer runs its own tool registry; the agent inside sees it, nothing outside does.
 let sub = cx.isolate::<dyn Tools>();
 sub.plugin::<ToolRegistry>(()).await?;
-sub.plugin::<AgentLoop>(json!({ "role": "reviewer" })).await?;
+sub.plugin::<AgentLoop>(AgentConfig { role: "reviewer".into() }).await?;
 
 // A sandboxed agent receives a read-only file system without being changed.
 cx.intercept::<dyn Fs>(|fs| Arc::new(ReadOnly(fs)))
@@ -328,7 +329,7 @@ A component instantiates a child fiber with `cx.plugin::<C>(config)`, from `acti
 - **The orchestrator owns the link.** Each fiber records the activation it was instantiated under (`parent: Option<Owner>`, an id plus the activation token). The parent's `Cx` carries a weak sender to the orchestrator, so a kept `Cx` never keeps the orchestrator alive.
 - **Retirement follows the parent's activation.** The child is an entry in the parent's undo list, so it is retired in its place when that list runs: when the activation is cancelled, fails, or unloads. Once the list has run, the orchestrator retires any child still left. A reload is an unload and a fresh activation, so a reloaded parent gets fresh children.
 - **The parent does not wait.** As in the paper's O-Retire, retirement is unconditional, and a parent may finish unloading while a child is still unloading (§4.2.1). Children do not count toward the parent's "relied upon" guard.
-- **A child is an ordinary fiber otherwise.** It activates when its own dependencies have providers and reloads when they change. `plugin` returns a `Fiber` handle with `status`, `update`, and `dispose`, so a parent can retire a child early, such as an agent that finished its task. Like a TS fiber, the handle is a view: dropping it changes nothing. `App::parent` reports the link.
+- **A child is an ordinary fiber otherwise.** It activates when its own dependencies have providers and reloads when they change. Its configuration is the component's own `C::Config` value, passed in memory and cloned for each activation, so it can hold channels or `Arc<dyn Trait>` and needs no serde; only rows loaded from YAML or JSON (`Catalog::register`, `App::insert`) require `DeserializeOwned`. `plugin` returns a typed `Fiber<C>` handle with `status`, `update` (which takes `C::Config`, so a wrong type does not compile), and `dispose`, so a parent can retire a child early, such as an agent that finished its task. Like a TS fiber, the handle is a view: dropping it changes nothing. `App::parent` reports the link.
 - **Late requests are refused.** A fiber that is leaving or whose activation has ended gets an error from `plugin`; in the paper's `Unloading` state a fiber performs no more effects. The orchestrator makes the check, so a race cannot leave an orphan.
 
 ### Leaks

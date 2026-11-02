@@ -48,7 +48,7 @@ async fn until(mut done: impl FnMut() -> bool) {
     panic!("condition not reached");
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Tag {
     tag: String,
 }
