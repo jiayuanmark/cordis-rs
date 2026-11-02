@@ -13,7 +13,9 @@
 //!
 //! At checkpoints the test waits for the app to settle (Theorem 73) and checks that every fiber
 //! is in the state its providers allow: active when it can run, failed only when it fails
-//! against them, inactive only when a provider is missing or another fiber holds its key.
+//! against them, inactive only when a provider is missing or another fiber holds its key. An
+//! active fiber's run must have read exactly the active providers of its keys, including an
+//! optional key's provider when there is one.
 //!
 //! The changes come from a seeded generator, so re-running a failing seed replays the same
 //! changes. The runtime may interleave task completions with them differently from run to run,
@@ -92,7 +94,18 @@ components! {
     Source: deps(), provides(A);
     Middle: deps(a: A), provides(B);
     Top: deps(a: A, b: B), provides(C);
-    Leaf: deps(b: B, c: C), provides();
+}
+
+// `Leaf` uses `C` when it has a provider, so it reloads when one appears or leaves.
+#[component(config = Config, deps(b: B, c?: C))]
+struct Leaf;
+
+impl Component for Leaf {
+    async fn activate(cx: Cx<Self>, config: Config) -> Result<Self> {
+        let deps = cx.deps();
+        let reads: Vec<Arc<dyn Node>> = std::iter::once(deps.b.clone()).chain(deps.c.clone()).collect();
+        live(&cx, config, &[], reads).await.map(|_| Leaf)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -111,7 +124,14 @@ impl Kind {
             Kind::Source => &[],
             Kind::Middle => &["a"],
             Kind::Top => &["a", "b"],
-            Kind::Leaf => &["b", "c"],
+            Kind::Leaf => &["b"],
+        }
+    }
+
+    fn optional(self) -> &'static [&'static str] {
+        match self {
+            Kind::Leaf => &["c"],
+            _ => &[],
         }
     }
 
@@ -413,6 +433,7 @@ async fn check_settled(app: &App, world: u64, planted: &BTreeMap<u32, Planted>) 
                 .kind
                 .deps()
                 .iter()
+                .chain(fiber.kind.optional())
                 .any(|key| active.get(key).is_some_and(|provider| planted[provider].config.poison));
         let allowed = match status {
             _ if missing || held => matches!(status, Status::Inactive | Status::Failed(_)),
@@ -449,6 +470,29 @@ async fn check_settled(app: &App, world: u64, planted: &BTreeMap<u32, Planted>) 
     }
     if let Some((name, runs)) = live.into_iter().next() {
         return Err(format!("removed fiber {name} still has {runs} live runs"));
+    }
+    // Each active fiber's run read the current run of each active provider of its keys, and
+    // nothing else.
+    let run_of = |name: u32| w.runs.iter().find(|(_, run)| run.fiber == name).map(|(id, _)| *id);
+    for (name, fiber) in planted {
+        if statuses[name] != Status::Active {
+            continue;
+        }
+        let run = run_of(*name).expect("an active fiber has one live run");
+        let mut expected: Vec<u64> = fiber
+            .kind
+            .deps()
+            .iter()
+            .chain(fiber.kind.optional())
+            .filter_map(|key| active.get(key))
+            .map(|provider| run_of(*provider).expect("an active provider has one live run"))
+            .collect();
+        let mut reads = w.runs[&run].reads.clone();
+        expected.sort_unstable();
+        reads.sort_unstable();
+        if reads != expected {
+            return Err(format!("fiber {name} runs against providers {reads:?}, but the active ones are {expected:?}"));
+        }
     }
     if w.effects.len() != w.runs.len() || w.runs.keys().any(|run| !w.effects.contains(run)) {
         return Err("the effects in place are not those of the live runs".to_owned());

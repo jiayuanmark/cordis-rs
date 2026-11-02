@@ -73,7 +73,7 @@ pub use component::{Component, Cx, Manifest, When, WhenAction};
 ///   entry `name: Key` generates `pub name: Arc<Key::Value>`, and the fiber waits until `Key` has
 ///   an active provider. An optional entry `name?: Key` generates
 ///   `pub name: Option<Arc<Key::Value>>`, and the fiber activates with `None` when `Key` has no
-///   provider, but waits while one is starting or stopping. Either way the fiber reloads when
+///   provider (a reloading provider is waited for). Either way the fiber reloads when
 ///   the provider appears, reloads, or leaves, so its undo list runs before the provider's. (To restart only a block of effects when an optional
 ///   key comes and goes, use [`Cx::when`].) Only listed keys have a field, so reading an
 ///   undeclared key does not compile, and listing a key twice is rejected. Without `deps`,

@@ -667,14 +667,20 @@ impl Orchestrator {
             .iter()
             .map(|slot| provider(slot).map(|provider| (slot.clone(), Some(provider))))
             .collect::<Option<Vec<_>>>()?;
-        // An optional dependency without a provider does not hold the fiber back, but one whose
-        // provider is starting or stopping does: the fiber waits for it rather than running
-        // without it in between, so a provider's reload reloads its consumers once. Whether it
-        // has a provider is part of the view, so its arrival or departure reloads the fiber.
+        // An optional dependency without a provider does not hold the fiber back. Whether it has
+        // one is part of the view, so its arrival or departure reloads the fiber. While a
+        // provider is starting or stopping, a fiber that is not already running without it
+        // waits for it rather than running without it in between, so a provider's reload
+        // reloads its consumers once. A fiber already running without it keeps running until
+        // the provider is active, and is not disturbed at all if the provider fails.
+        let runs_without = |slot: &Slot| {
+            matches!(fiber.state, State::Active { .. })
+                && fiber.committed.as_ref().is_some_and(|committed| committed.view.0.contains(&(slot.clone(), None)))
+        };
         for slot in &fiber.optional {
             match provider(slot) {
                 Some(provider) => view.push((slot.clone(), Some(provider))),
-                None if self.holders.contains_key(slot) => return None,
+                None if self.holders.contains_key(slot) && !runs_without(slot) => return None,
                 None => view.push((slot.clone(), None)),
             }
         }

@@ -102,14 +102,11 @@ async fn an_optional_dep_does_not_hold_back_activation_and_reloads_with_its_prov
     assert_eq!(journal("live"), ["service(none) up"]);
     assert_eq!(app.get::<dyn Probe>().await.unwrap().current_metrics(), None);
 
-    // The provider arrives: `Service` stops when the provider starts (the two run side by
-    // side), then starts again once the provider is active, and sees it.
+    // The provider arrives: `Service` keeps running until the provider is active, then reloads
+    // and sees it.
     let metrics = app.insert::<Recorder>(json!({ "tag": "live", "name": "v1" })).await;
     app.settled().await;
-    let mut arrival = journal("live")[1..3].to_vec();
-    arrival.sort();
-    assert_eq!(arrival, ["metrics:v1 up", "service(none) down"]);
-    assert_eq!(journal("live")[3..], ["service(v1) up"]);
+    assert_eq!(journal("live")[1..], ["metrics:v1 up", "service(none) down", "service(v1) up"]);
     assert_eq!(app.get::<dyn Probe>().await.unwrap().current_metrics().as_deref(), Some("v1"));
 
     // The provider reloads: `Service` is undone before the old provider, as with a required
@@ -124,6 +121,35 @@ async fn an_optional_dep_does_not_hold_back_activation_and_reloads_with_its_prov
     assert_eq!(app.status(service).await, Some(Status::Active));
     assert_eq!(journal("live")[8..], ["service(v2) down", "metrics:v2 down", "service(none) up"]);
     assert_eq!(app.get::<dyn Probe>().await.unwrap().current_metrics(), None);
+}
+
+#[component(provides(dyn Metrics))]
+struct BrokenMetrics;
+
+impl Metrics for BrokenMetrics {
+    fn name(&self) -> String {
+        "broken".into()
+    }
+}
+
+impl Component for BrokenMetrics {
+    async fn activate(_: Cx<Self>, _: ()) -> Result<Self> {
+        record("broken", "metrics starting");
+        Err("metrics failed".into())
+    }
+}
+
+#[tokio::test]
+async fn a_failing_optional_provider_leaves_a_running_consumer_alone() {
+    let app = App::new();
+    let service = app.insert::<Service>(json!({ "tag": "broken" })).await;
+    app.settled().await;
+    let broken = app.insert::<BrokenMetrics>(json!(null)).await;
+    app.settled().await;
+
+    assert!(matches!(app.status(broken).await, Some(Status::Failed(_))));
+    assert_eq!(app.status(service).await, Some(Status::Active));
+    assert_eq!(journal("broken"), ["service(none) up", "metrics starting"]);
 }
 
 struct PrefixedMetrics(&'static str, Arc<dyn Metrics>);
