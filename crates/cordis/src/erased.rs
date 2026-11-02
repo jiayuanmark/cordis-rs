@@ -156,9 +156,9 @@ where
     C::Config: DeserializeOwned,
 {
     Box::pin(async move {
-        let Config::Json(config) = config else {
-            return Err("expected JSON configuration".into());
-        };
+        // Only `App::insert` and the loader create JSON fibers, and the orchestrator ignores a
+        // typed update of one.
+        let Config::Json(config) = config else { unreachable!("a JSON fiber is never given typed configuration") };
         let config: C::Config = serde_json::from_value(config)?;
         activate_with::<C>(deps, config, events, control).await
     })
@@ -175,13 +175,11 @@ where
     C::Config: Clone + Sync,
 {
     Box::pin(async move {
-        let Config::Typed(config) = config else {
-            return Err("expected typed configuration".into());
-        };
-        let config = config
-            .downcast_ref::<C::Config>()
-            .ok_or("configuration type does not match the component's Config type")?
-            .clone();
+        // `Fiber<C>::update` takes `C::Config`, and the orchestrator ignores a JSON update of a
+        // typed fiber, so the configuration always has this component's type.
+        let Config::Typed(config) = config else { unreachable!("a typed fiber is never given JSON configuration") };
+        let config =
+            config.downcast_ref::<C::Config>().expect("a typed fiber's configuration is its `C::Config`").clone();
         activate_with::<C>(deps, config, events, control).await
     })
 }
