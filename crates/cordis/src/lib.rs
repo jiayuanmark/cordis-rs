@@ -24,7 +24,7 @@ mod loader;
 mod orchestrator;
 mod realm;
 
-pub use component::{Component, Cx, Manifest, Optional, When, WhenAction};
+pub use component::{Component, Cx, Manifest, When, WhenAction};
 /// Declares a component's configuration, dependencies, and provisions by implementing
 /// [`Manifest`] for the type it is attached to, and generates a struct of its
 /// resolved dependencies.
@@ -68,14 +68,15 @@ pub use component::{Component, Cx, Manifest, Optional, When, WhenAction};
 /// clause.
 ///
 /// - `deps(name: Key, ...)` generates `{Type}Deps`, a struct with one field per entry and the
-///   visibility of the component type, and sets it as [`Manifest::Deps`]. A required entry
-///   `name: Key` generates `pub name: Arc<Key::Value>`, resolved once before activation; the
-///   component waits for `Key` to have an active provider and reloads when it changes. An
-///   optional entry `name?: Key` generates `pub name: Optional<Key>` (see [`Optional`]); the
-///   component activates without waiting for `Key`, does not reload when `Key` changes, and reads
-///   its current provider through `cx.deps().name.get()` (for reactive effects tied to an optional
-///   key's lifetime, use [`Cx::when`]). Only listed keys have a field, so reading an undeclared
-///   key does not compile, and listing a key twice is rejected. Without `deps`,
+///   visibility of the component type, and sets it as [`Manifest::Deps`]. The orchestrator
+///   resolves it once before activation, and components read it through [`Cx::deps`]. A required
+///   entry `name: Key` generates `pub name: Arc<Key::Value>`, and the fiber waits until `Key` has
+///   an active provider. An optional entry `name?: Key` generates
+///   `pub name: Option<Arc<Key::Value>>`, and the fiber activates with `None` when `Key` has no
+///   provider, but waits while one is starting or stopping. Either way the fiber reloads when
+///   the provider appears, reloads, or leaves, so its undo list runs before the provider's. (To restart only a block of effects when an optional
+///   key comes and goes, use [`Cx::when`].) Only listed keys have a field, so reading an
+///   undeclared key does not compile, and listing a key twice is rejected. Without `deps`,
 ///   `Manifest::Deps` is `()` and no struct is generated. The struct is not generic, so on a
 ///   generic component the keys may not name its type parameters.
 /// - `provides(...)` publishes the component's `Arc` as `Arc<K::Value>` for each listed key

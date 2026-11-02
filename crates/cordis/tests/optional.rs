@@ -1,10 +1,11 @@
-//! Optional dependencies: live handle (`deps(k?: Key)` / `Optional<K>`) and reactive child fiber
-//! (`Cx::when`, `Scope::when`, `App::when`).
+//! Optional dependencies: `deps(name?: Key)` fields and reactive child fibers (`Cx::when`,
+//! `Scope::when`, `App::when`).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cordis::{
-    App, Catalog, Component, Cx, Guard, KeyId, Loader, Manifest, Optional, Realm, Result, Status, component, key,
+    App, Catalog, Component, Cx, Guard, KeyId, LoadWarning, Loader, Manifest, Realm, Result, Status, component, key,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -57,11 +58,10 @@ impl Component for Recorder {
 
 pub trait Probe: Send + Sync {
     fn current_metrics(&self) -> Option<String>;
-    fn optional_handle(&self) -> Optional<dyn Metrics>;
 }
 key!(dyn Probe = "probe");
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct ServiceConfig {
     tag: String,
@@ -69,28 +69,27 @@ struct ServiceConfig {
 
 #[component(config = ServiceConfig, deps(metrics?: dyn Metrics), provides(dyn Probe))]
 struct Service {
-    metrics: Optional<dyn Metrics>,
+    cx: Cx<Self>,
 }
 
 impl Probe for Service {
     fn current_metrics(&self) -> Option<String> {
-        self.metrics.get().map(|m| m.name())
-    }
-
-    fn optional_handle(&self) -> Optional<dyn Metrics> {
-        self.metrics.clone()
+        self.cx.deps().metrics.as_ref().map(|metrics| metrics.name())
     }
 }
 
 impl Component for Service {
     async fn activate(cx: Cx<Self>, config: ServiceConfig) -> Result<Self> {
-        record(&config.tag, "service up");
-        Ok(Self { metrics: cx.deps().metrics.clone() })
+        let ServiceConfig { tag } = config;
+        let seen = cx.deps().metrics.as_ref().map_or("none".to_owned(), |metrics| metrics.name());
+        record(&tag, format!("service({seen}) up"));
+        cx.on_dispose(move || async move { record(&tag, format!("service({seen}) down")) });
+        Ok(Self { cx })
     }
 }
 
 #[tokio::test]
-async fn optional_dep_activates_without_provider_and_tracks_live_table_without_reloading() {
+async fn an_optional_dep_does_not_hold_back_activation_and_reloads_with_its_provider() {
     assert!(Service::deps().is_empty());
     assert_eq!(Service::optional(), [KeyId::of::<dyn Metrics>()]);
 
@@ -100,38 +99,31 @@ async fn optional_dep_activates_without_provider_and_tracks_live_table_without_r
 
     // Activates even though `dyn Metrics` has no provider.
     assert_eq!(app.status(service).await, Some(Status::Active));
-    let probe = app.get::<dyn Probe>().await.unwrap();
-    assert_eq!(journal("live"), ["service up"]);
-    assert_eq!(probe.current_metrics(), None);
+    assert_eq!(journal("live"), ["service(none) up"]);
+    assert_eq!(app.get::<dyn Probe>().await.unwrap().current_metrics(), None);
 
-    // Provider arrives: `Optional::get` sees it immediately, without reloading `Service`.
+    // The provider arrives: `Service` stops when the provider starts (the two run side by
+    // side), then starts again once the provider is active, and sees it.
     let metrics = app.insert::<Recorder>(json!({ "tag": "live", "name": "v1" })).await;
     app.settled().await;
-    assert_eq!(journal("live"), ["service up", "metrics:v1 up"]);
-    assert_eq!(probe.current_metrics().as_deref(), Some("v1"));
+    let mut arrival = journal("live")[1..3].to_vec();
+    arrival.sort();
+    assert_eq!(arrival, ["metrics:v1 up", "service(none) down"]);
+    assert_eq!(journal("live")[3..], ["service(v1) up"]);
+    assert_eq!(app.get::<dyn Probe>().await.unwrap().current_metrics().as_deref(), Some("v1"));
 
-    // Provider reloads: `Optional::get` sees the new provider, still without reloading `Service`.
+    // The provider reloads: `Service` is undone before the old provider, as with a required
+    // dependency, and waits for the new one instead of running without it in between.
     app.update(metrics, json!({ "tag": "live", "name": "v2" }));
     app.settled().await;
-    assert_eq!(journal("live"), ["service up", "metrics:v1 up", "metrics:v1 down", "metrics:v2 up"]);
-    assert_eq!(probe.current_metrics().as_deref(), Some("v2"));
+    assert_eq!(journal("live")[4..], ["service(v1) down", "metrics:v1 down", "metrics:v2 up", "service(v2) up"]);
 
-    // Provider leaves: `Optional::get` returns `None`, `Service` stays `Active`.
+    // The provider leaves: `Service` is undone first, then runs again without it.
     app.remove(metrics);
     app.settled().await;
     assert_eq!(app.status(service).await, Some(Status::Active));
-    assert_eq!(journal("live"), ["service up", "metrics:v1 up", "metrics:v1 down", "metrics:v2 up", "metrics:v2 down"]);
-    assert_eq!(probe.current_metrics(), None);
-
-    // A kept `Optional<K>` returns `None` once the app is dropped and the orchestrator stops.
-    let _metrics2 = app.insert::<Recorder>(json!({ "tag": "live", "name": "v3" })).await;
-    app.settled().await;
-    let handle = probe.optional_handle();
-    assert_eq!(handle.get().unwrap().name(), "v3");
-    drop(probe);
-    drop(app);
-    tokio::task::yield_now().await;
-    assert!(handle.get().is_none());
+    assert_eq!(journal("live")[8..], ["service(v2) down", "metrics:v2 down", "service(none) up"]);
+    assert_eq!(app.get::<dyn Probe>().await.unwrap().current_metrics(), None);
 }
 
 struct PrefixedMetrics(&'static str, Arc<dyn Metrics>);
@@ -143,34 +135,67 @@ impl Metrics for PrefixedMetrics {
 }
 
 #[tokio::test]
-async fn optional_dep_respects_realms_and_interception() {
+async fn an_optional_dep_resolves_in_its_realm_and_is_intercepted_once_per_activation() {
     let app = App::new();
     let realm = Realm::named("isolated");
+    let remaps = Arc::new(AtomicUsize::new(0));
 
-    // Shared provider has name "shared"; isolated realm has no provider yet.
+    // The shared realm has a provider; the isolated realm has none yet.
     app.insert::<Recorder>(json!({ "tag": "realm", "name": "shared" })).await;
+    let counted = remaps.clone();
     app.isolate_in::<dyn Metrics>(&realm)
-        .intercept::<dyn Metrics>(|m| Arc::new(PrefixedMetrics("iso:", m)))
+        .intercept::<dyn Metrics>(move |m| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Arc::new(PrefixedMetrics("iso:", m))
+        })
         .plugin::<Service>(ServiceConfig { tag: "realm".into() })
         .await
         .unwrap();
     app.settled().await;
+    assert_eq!(app.get::<dyn Probe>().await.unwrap().current_metrics(), None);
 
-    let probe = app.get::<dyn Probe>().await.unwrap();
-    assert_eq!(probe.current_metrics(), None);
-
-    // Inserting a provider in the isolated realm makes it visible with interception applied.
-    let iso_metrics = app
+    // A provider in the isolated realm is seen with the interception applied.
+    let local = app
         .isolate_in::<dyn Metrics>(&realm)
         .plugin::<Recorder>(MetricsConfig { tag: "realm".into(), name: "local".into() })
         .await
         .unwrap();
     app.settled().await;
-    assert_eq!(probe.current_metrics().as_deref(), Some("iso:local"));
+    let probe = app.get::<dyn Probe>().await.unwrap();
+    for _ in 0..3 {
+        assert_eq!(probe.current_metrics().as_deref(), Some("iso:local"));
+    }
+    assert_eq!(remaps.load(Ordering::SeqCst), 1);
 
-    iso_metrics.dispose();
+    local.dispose();
     app.settled().await;
-    assert_eq!(probe.current_metrics(), None);
+    assert_eq!(app.get::<dyn Probe>().await.unwrap().current_metrics(), None);
+}
+
+#[component(deps(metrics?: dyn Metrics), provides(dyn Metrics))]
+struct Fallback;
+
+impl Metrics for Fallback {
+    fn name(&self) -> String {
+        "fallback".into()
+    }
+}
+
+impl Component for Fallback {
+    async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+        // The fiber's own provision is not its optional dependency, so it settles.
+        assert!(cx.deps().metrics.is_none());
+        record("own", "fallback up");
+        Ok(Fallback)
+    }
+}
+
+#[tokio::test]
+async fn an_optional_dep_on_a_key_the_fiber_provides_does_not_reload_it() {
+    let app = App::new();
+    app.insert::<Fallback>(json!(null)).await;
+    app.settled().await;
+    assert_eq!(journal("own"), ["fallback up"]);
 }
 
 #[component(deps(probe?: dyn Probe), provides(dyn Metrics))]
@@ -189,14 +214,13 @@ impl Component for MutualMetrics {
 }
 
 #[tokio::test]
-async fn loader_accepts_optional_deps_without_missing_or_cycle_warnings_and_isolates_them() {
+async fn the_loader_never_reports_an_optional_dep_missing_but_reports_its_cycles() {
     let app = App::new();
     let mut catalog = Catalog::new();
     catalog.register::<Service>("service").register::<MutualMetrics>("mutual");
     let mut loader = Loader::new(app.clone(), catalog);
 
-    // `service` has an optional dep on `metrics` and `isolate: { metrics: tenant }`, while no
-    // `metrics` provider is enabled. No warning or UnknownKey error is produced.
+    // `service` optionally uses `metrics` and isolates it, while no row provides `metrics`.
     let warnings = loader
         .apply_yaml("plugins:\n  - { id: svc, use: service, config: {}, isolate: { metrics: tenant } }\n")
         .await
@@ -205,15 +229,15 @@ async fn loader_accepts_optional_deps_without_missing_or_cycle_warnings_and_isol
     app.settled().await;
     assert_eq!(app.status(loader.fiber("svc").unwrap()).await, Some(Status::Active));
 
-    // Mutual optional dependencies (`service` -> `metrics?`, `mutual` -> `probe?`) do not form a
-    // dependency cycle.
-    let warnings = loader
+    // `service` -> `metrics?` and `mutual` -> `probe?` would reload each other forever, so the
+    // loader reports the cycle. (The app is dropped without settling.)
+    let mut catalog = Catalog::new();
+    catalog.register::<Service>("service").register::<MutualMetrics>("mutual");
+    let warnings = Loader::new(App::new(), catalog)
         .apply_yaml("plugins:\n  - { id: svc, use: service, config: {} }\n  - { id: mut, use: mutual }\n")
         .await
         .unwrap();
-    assert!(warnings.is_empty());
-    app.settled().await;
-    assert_eq!(app.get::<dyn Probe>().await.unwrap().current_metrics().as_deref(), Some("mutual"));
+    assert!(matches!(warnings.as_slice(), [LoadWarning::Cycle(rows)] if rows.len() == 3), "{warnings:?}");
 }
 
 #[component(config = ServiceConfig)]
