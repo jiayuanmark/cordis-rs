@@ -35,8 +35,9 @@ pub trait Manifest: Sized + 'static {
     ///
     /// An optional dependency does not hold back activation: the fiber activates with `None` when
     /// the key has no provider. Like a required dependency, it is resolved once per activation,
-    /// and the fiber reloads when its provider appears, reloads, or leaves; while a provider of
-    /// the key is starting or stopping, the fiber waits for it.
+    /// and the fiber reloads when its provider appears, reloads, or leaves. While a provider is
+    /// reloading, the fiber waits for it rather than running without it in between; a fiber
+    /// already running without it keeps running until a new provider is active.
     fn optional() -> Vec<KeyId> {
         Vec::new()
     }
