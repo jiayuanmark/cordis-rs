@@ -86,11 +86,9 @@ impl Declaration {
             let deps_name = format_ident!("{}Deps", name);
             let doc = format!("Resolved dependencies of [`{name}`], one field per entry of its `deps(...)`.");
             let fields = deps.iter().map(|Dep { name, key, optional }| {
-                if *optional {
-                    quote_spanned! {key.span()=> pub #name: ::std::option::Option<::std::sync::Arc<<#key as ::cordis::Key>::Value>> }
-                } else {
-                    quote_spanned! {key.span()=> pub #name: ::std::sync::Arc<<#key as ::cordis::Key>::Value> }
-                }
+                let value = quote_spanned! {key.span()=> ::std::sync::Arc<<#key as ::cordis::Key>::Value> };
+                let value = if *optional { quote!(::std::option::Option<#value>) } else { value };
+                quote_spanned! {key.span()=> pub #name: #value }
             });
             let struct_def = quote! {
                 #[doc = #doc]
@@ -103,15 +101,12 @@ impl Declaration {
             (quote!(#deps_name), struct_def)
         };
         let resolve = deps.iter().map(|Dep { name, key, optional }| {
-            if *optional {
-                quote! { #name: resolved.optional::<#key>() }
-            } else {
-                quote! { #name: resolved.get::<#key>() }
-            }
+            let read = if *optional { quote!(optional) } else { quote!(get) };
+            quote! { #name: resolved.#read::<#key>() }
         });
         let resolve = if deps.is_empty() { quote!() } else { quote!(#deps_type { #(#resolve),* }) };
-        let keys = deps.iter().filter(|dep| !dep.optional).map(|dep| &dep.key);
-        let optional = deps.iter().filter(|dep| dep.optional).map(|dep| &dep.key);
+        let (optional, keys): (Vec<_>, Vec<_>) = deps.iter().partition(|dep| dep.optional);
+        let (keys, optional) = (keys.iter().map(|dep| &dep.key), optional.iter().map(|dep| &dep.key));
         quote! {
             #deps_struct
 

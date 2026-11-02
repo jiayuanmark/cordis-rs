@@ -489,8 +489,9 @@ enum Event {
 
 /// The provider of each dependency, required ones first and then optional ones, each in
 /// declaration order: the provider fiber and the activation of it that published the key, or
-/// `None` for an optional dependency with no provider. A provider that appears or leaves, or that is replaced, reloaded, or restarted after a
-/// failure changes the view, so its consumers reload or retry. (The paper reinserts a revised
+/// `None` for an optional dependency with no provider. A provider that appears, leaves, is
+/// replaced, reloads, or restarts after a failure changes the view, so its consumers reload or
+/// retry. (The paper reinserts a revised
 /// fiber as a new one, §4.4; a `FiberId` survives a configuration change, so the activation tells
 /// them apart.)
 #[derive(Clone, Debug, PartialEq, Eq)]

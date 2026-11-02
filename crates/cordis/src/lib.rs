@@ -69,16 +69,18 @@ pub use component::{Component, Cx, Manifest, When, WhenAction};
 ///
 /// - `deps(name: Key, ...)` generates `{Type}Deps`, a struct with one field per entry and the
 ///   visibility of the component type, and sets it as [`Manifest::Deps`]. The orchestrator
-///   resolves it once before activation, and components read it through [`Cx::deps`]. A required
-///   entry `name: Key` generates `pub name: Arc<Key::Value>`, and the fiber waits until `Key` has
-///   an active provider. An optional entry `name?: Key` generates
-///   `pub name: Option<Arc<Key::Value>>`, and the fiber activates with `None` when `Key` has no
-///   provider (a reloading provider is waited for). Either way the fiber reloads when
-///   the provider appears, reloads, or leaves, so its undo list runs before the provider's. (To restart only a block of effects when an optional
-///   key comes and goes, use [`Cx::when`].) Only listed keys have a field, so reading an
-///   undeclared key does not compile, and listing a key twice is rejected. Without `deps`,
-///   `Manifest::Deps` is `()` and no struct is generated. The struct is not generic, so on a
-///   generic component the keys may not name its type parameters.
+///   resolves it once before activation, and components read it through [`Cx::deps`].
+///   - A required entry `name: Key` generates `pub name: Arc<Key::Value>`; the fiber waits until
+///     `Key` has an active provider.
+///   - An optional entry `name?: Key` generates `pub name: Option<Arc<Key::Value>>`; the fiber
+///     activates with `None` when `Key` has no provider.
+///
+///   Either way the fiber reloads when the provider appears, reloads, or leaves, so its undo
+///   list runs before the provider's. (To restart only a block of effects when an optional key
+///   comes and goes, use [`Cx::when`].) Only listed keys have a field, so reading an undeclared
+///   key does not compile, and listing a key twice is rejected. Without `deps`, `Manifest::Deps`
+///   is `()` and no struct is generated. The struct is not generic, so on a generic component
+///   the keys may not name its type parameters.
 /// - `provides(...)` publishes the component's `Arc` as `Arc<K::Value>` for each listed key
 ///   `K`. The coercion is written once per key, so it fails to compile when the component
 ///   does not implement the key's value type:
