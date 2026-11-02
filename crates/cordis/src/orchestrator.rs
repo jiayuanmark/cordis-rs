@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::dispose::{Undo, UndoHandle, panic_message};
 use crate::erased::{Factory, Instance};
 use crate::realm::{Env, Slot};
-use crate::{Component, Dispose, Erased, Events, Key, KeyId, Realm, Scope};
+use crate::{Component, Dispose, Erased, Events, Key, KeyId, Realm, Scope, WhenAction};
 
 new_key_type! {
     /// Identity of a fiber: one configured instance of a component.
@@ -107,6 +107,19 @@ impl App {
         remap: impl Fn(Arc<K::Value>) -> Arc<K::Value> + Send + Sync + 'static,
     ) -> Scope {
         self.scope().intercept::<K>(remap)
+    }
+
+    /// Inserts a root fiber that runs `run` whenever `K` has an active provider in the shared
+    /// realm.
+    ///
+    /// The returned [`Fiber`] reads its status or disposes of it. To watch `K` in another realm,
+    /// call [`Scope::when`] on [`isolate_in`](App::isolate_in). See [`Cx::when`](crate::Cx::when).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the app has stopped.
+    pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> crate::Result<Fiber> {
+        self.scope().when::<K>(run).await
     }
 
     fn scope(&self) -> Scope {
@@ -405,17 +418,19 @@ enum Event {
     },
 }
 
-/// The provider of each dependency, in declaration order: the provider fiber and the activation
-/// of it that published the key. A provider that is replaced, reloaded, or restarted after a
-/// failure changes the view, so its consumers reload or retry. (The paper reinserts a revised
+/// The provider of each dependency, required ones first and then optional ones, each in
+/// declaration order: the provider fiber and the activation of it that published the key, or
+/// `None` for an optional dependency with no provider. A provider that appears, leaves, is
+/// replaced, reloads, or restarts after a failure changes the view, so its consumers reload or
+/// retry. (The paper reinserts a revised
 /// fiber as a new one, §4.4; a `FiberId` survives a configuration change, so the activation tells
 /// them apart.)
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct View(Vec<(Slot, Owner)>);
+struct View(Vec<(Slot, Option<Owner>)>);
 
 impl View {
     fn providers(&self) -> impl Iterator<Item = FiberId> + '_ {
-        self.0.iter().map(|(_, provider)| provider.id)
+        self.0.iter().filter_map(|(_, provider)| provider.map(|provider| provider.id))
     }
 }
 
@@ -454,6 +469,9 @@ struct Entry {
     env: Env,
     /// Where each dependency key resolves under `env`, in declaration order.
     deps: Vec<Slot>,
+    /// Where each optional dependency key resolves under `env`, in declaration order. Leaves out
+    /// keys the fiber provides itself, which would reload it each time it publishes.
+    optional: Vec<Slot>,
     /// Where each provided key is published under `env`.
     provides: Vec<Slot>,
     /// The activation this fiber was instantiated under, or `None` for a root fiber.
@@ -536,12 +554,15 @@ impl Orchestrator {
                 }
                 let deps: Vec<Slot> = factory.deps.iter().map(|key| env.slot(*key)).collect();
                 let provides: Vec<Slot> = factory.provides.iter().map(|key| env.slot(*key)).collect();
-                let watched: Vec<Slot> = deps.iter().chain(&provides).cloned().collect();
+                let optional: Vec<Slot> =
+                    factory.optional.iter().map(|key| env.slot(*key)).filter(|slot| !provides.contains(slot)).collect();
+                let watched: Vec<Slot> = deps.iter().chain(&optional).chain(&provides).cloned().collect();
                 let id = self.fibers.insert(Entry {
                     factory,
                     config,
                     env,
                     deps,
+                    optional,
                     provides,
                     parent,
                     owner: None,
@@ -641,12 +662,30 @@ impl Orchestrator {
         if contested {
             return None;
         }
-        fiber
+        let provider = |slot: &Slot| self.table.get(slot).map(|(provider, _)| *provider);
+        let mut view = fiber
             .deps
             .iter()
-            .map(|slot| self.table.get(slot).map(|(provider, _)| (slot.clone(), *provider)))
-            .collect::<Option<Vec<_>>>()
-            .map(View)
+            .map(|slot| provider(slot).map(|provider| (slot.clone(), Some(provider))))
+            .collect::<Option<Vec<_>>>()?;
+        // An optional dependency without a provider does not hold the fiber back. Whether it has
+        // one is part of the view, so its arrival or departure reloads the fiber. While a
+        // provider is starting or stopping, a fiber that is not already running without it
+        // waits for it rather than running without it in between, so a provider's reload
+        // reloads its consumers once. A fiber already running without it keeps running until
+        // the provider is active, and is not disturbed at all if the provider fails.
+        let runs_without = |slot: &Slot| {
+            matches!(fiber.state, State::Active { .. })
+                && fiber.committed.as_ref().is_some_and(|committed| committed.view.0.contains(&(slot.clone(), None)))
+        };
+        for slot in &fiber.optional {
+            match provider(slot) {
+                Some(provider) => view.push((slot.clone(), Some(provider))),
+                None if self.holders.contains_key(slot) && !runs_without(slot) => return None,
+                None => view.push((slot.clone(), None)),
+            }
+        }
+        Some(View(view))
     }
 
     fn is_current(&self, id: FiberId, target: Option<&View>) -> bool {
@@ -694,13 +733,22 @@ impl Orchestrator {
         for provider in view.providers() {
             self.relied[provider] += 1;
         }
-        let deps = view.0.iter().map(|(slot, _)| (slot.key, self.table[slot].1.clone())).collect();
+        let deps = view
+            .0
+            .iter()
+            .filter(|(_, provider)| provider.is_some())
+            .map(|(slot, _)| (slot.key, self.table[slot].1.clone()))
+            .collect();
         let token = self.next_token;
         self.next_token += 1;
         let cancel = CancellationToken::new();
 
         for slot in self.fibers[id].provides.clone() {
-            self.holders.insert(slot, id);
+            // A provider taking a free key holds back the key's optional consumers until it is
+            // active.
+            if self.holders.insert(slot.clone(), id).is_none() {
+                self.mark(&slot);
+            }
         }
         let fiber = &mut self.fibers[id];
         let undo = Undo::new();
@@ -893,7 +941,7 @@ impl Orchestrator {
 
     fn discard(&mut self, id: FiberId) {
         let fiber = self.fibers.remove(id).expect("a discarded fiber exists");
-        for slot in fiber.deps.iter().chain(&fiber.provides) {
+        for slot in fiber.deps.iter().chain(&fiber.optional).chain(&fiber.provides) {
             if let Some(watchers) = self.watchers.get_mut(slot) {
                 watchers.retain(|watcher| *watcher != id);
                 if watchers.is_empty() {

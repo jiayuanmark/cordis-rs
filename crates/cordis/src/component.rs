@@ -27,6 +27,17 @@ pub trait Manifest: Sized + 'static {
     /// Returns the declared dependency keys in declaration order.
     fn deps() -> Vec<KeyId>;
 
+    /// Returns the declared optional dependency keys in declaration order.
+    ///
+    /// An optional dependency does not hold back activation: the fiber activates with `None` when
+    /// the key has no provider. Like a required dependency, it is resolved once per activation,
+    /// and the fiber reloads when its provider appears, reloads, or leaves. While a provider is
+    /// reloading, the fiber waits for it rather than running without it in between; a fiber
+    /// already running without it keeps running until a new provider is active.
+    fn optional() -> Vec<KeyId> {
+        Vec::new()
+    }
+
     /// Returns the provided keys.
     fn provides() -> Vec<KeyId>;
 
@@ -37,6 +48,60 @@ pub trait Manifest: Sized + 'static {
     /// Coerces the component to the value type of each provided key.
     #[doc(hidden)]
     fn publish(component: &Arc<Self>) -> Vec<(KeyId, Erased)>;
+}
+
+/// The component type of a fiber instantiated by [`Cx::when`], [`Scope::when`], or
+/// [`App::when`](crate::App::when).
+///
+/// A `when::<K>` closure receives a `Cx<When<K>>` as its first argument, giving it the same
+/// context operations as any [`Component::activate`]: [`on_dispose`](Cx::on_dispose),
+/// [`on`](Cx::on), [`plugin`](Cx::plugin), [`when`](Cx::when), [`isolate`](Cx::isolate),
+/// [`intercept`](Cx::intercept), and [`cancelled`](Cx::cancelled). [`cx.deps()`](Cx::deps)
+/// returns the `&Arc<K::Value>` also passed as the closure's second argument.
+pub struct When<K: Key + ?Sized>(pub(crate) PhantomData<fn() -> K>);
+
+impl<K: Key + ?Sized> Manifest for When<K> {
+    type Config = ();
+    type Deps = Arc<K::Value>;
+
+    fn deps() -> Vec<KeyId> {
+        vec![KeyId::of::<K>()]
+    }
+
+    fn provides() -> Vec<KeyId> {
+        Vec::new()
+    }
+
+    fn resolve(resolved: &Resolve<'_>) -> Self::Deps {
+        resolved.get::<K>()
+    }
+
+    fn publish(_: &Arc<Self>) -> Vec<(KeyId, Erased)> {
+        Vec::new()
+    }
+}
+
+impl<K: Key + ?Sized> Component for When<K> {
+    async fn activate(_: Cx<Self>, (): ()) -> Result<Self> {
+        Ok(Self(PhantomData))
+    }
+}
+
+/// The body of a [`Cx::when`], [`Scope::when`], or [`App::when`](crate::App::when) fiber: an
+/// async closure from the fiber's [`Cx`] and the provider of `K` to [`Result<()>`]. Implemented
+/// for every such closure.
+pub trait WhenAction<K: Key + ?Sized>: Fn(Cx<When<K>>, Arc<K::Value>) -> Self::Future + Send + Sync + 'static {
+    #[doc(hidden)]
+    type Future: Future<Output = Result<()>> + Send + 'static;
+}
+
+impl<K, F, Fut> WhenAction<K> for F
+where
+    K: Key + ?Sized,
+    F: Fn(Cx<When<K>>, Arc<K::Value>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    type Future = Fut;
 }
 
 /// A component: the effects of activation, under the declarations of its [`Manifest`].
@@ -165,6 +230,60 @@ impl<C: Component> Cx<C> {
     /// each case no child runs.
     pub async fn plugin<D: Component>(&self, config: impl Serialize) -> Result<Fiber> {
         self.control.scope().plugin::<D>(config).await
+    }
+
+    /// Instantiates a child fiber under this fiber that runs `run` whenever `K` has an active
+    /// provider.
+    ///
+    /// This fiber does not depend on `K`, so it activates whether or not `K` is present and is
+    /// unaffected when `K` changes. The child fiber depends on `K`: each time `K` becomes active,
+    /// `run` is called with the child's [`Cx`] and the provider of `K`; when `K` unloads or
+    /// reloads, or when this fiber's activation ends, the child's [`on_dispose`](Cx::on_dispose)
+    /// list is undone before `K`'s provider tears down.
+    ///
+    /// This is the idiomatic way to attach optional effects—such as registering a tool, route, or
+    /// metric collector—to a service that may not be loaded, or that may reload independently of
+    /// this component:
+    ///
+    /// ```
+    /// use cordis::{Component, Cx, Guard, Result, component, key};
+    ///
+    /// pub trait Tools: Send + Sync {
+    ///     fn register(&self, name: &str) -> Guard;
+    /// }
+    /// key!(dyn Tools = "tools");
+    ///
+    /// #[component]
+    /// struct Search;
+    ///
+    /// impl Component for Search {
+    ///     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+    ///         // `Search` is active even without `dyn Tools`. Whenever `dyn Tools` is active,
+    ///         // the `"search"` tool is registered, and unregistered before `dyn Tools` unloads
+    ///         // or when `Search` unloads.
+    ///         cx.when::<dyn Tools>(|cx, tools| async move {
+    ///             cx.on_dispose(tools.register("search"));
+    ///             Ok(())
+    ///         })
+    ///         .await?;
+    ///         Ok(Search)
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// To capture state from `self` across reloads of `K`, clone an `Arc` (or `cx.clone()`)
+    /// outside the closure and clone it into the async block on each call.
+    ///
+    /// Compare an optional dependency, `deps(name?: K)` in [`#[component]`](crate::component):
+    /// it gives this fiber an `Option<Arc<K::Value>>` and reloads the whole fiber when `K`
+    /// appears or leaves. `when` restarts only the closure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this fiber is leaving or its activation has ended (see
+    /// [`is_live`](Cx::is_live)), or when the app has stopped. In each case no child runs.
+    pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> Result<Fiber> {
+        self.control.scope().when::<K>(run).await
     }
 
     /// Returns a scope where `K` resolves in a fresh realm, for children that share a private

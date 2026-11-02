@@ -85,8 +85,10 @@ impl Declaration {
         } else {
             let deps_name = format_ident!("{}Deps", name);
             let doc = format!("Resolved dependencies of [`{name}`], one field per entry of its `deps(...)`.");
-            let fields = deps.iter().map(|Dep { name, key }| {
-                quote_spanned! {key.span()=> pub #name: ::std::sync::Arc<<#key as ::cordis::Key>::Value> }
+            let fields = deps.iter().map(|Dep { name, key, optional }| {
+                let value = quote_spanned! {key.span()=> ::std::sync::Arc<<#key as ::cordis::Key>::Value> };
+                let value = if *optional { quote!(::std::option::Option<#value>) } else { value };
+                quote_spanned! {key.span()=> pub #name: #value }
             });
             let struct_def = quote! {
                 #[doc = #doc]
@@ -98,9 +100,13 @@ impl Declaration {
             };
             (quote!(#deps_name), struct_def)
         };
-        let resolve = deps.iter().map(|Dep { name, key }| quote! { #name: resolved.get::<#key>() });
+        let resolve = deps.iter().map(|Dep { name, key, optional }| {
+            let read = if *optional { quote!(optional) } else { quote!(get) };
+            quote! { #name: resolved.#read::<#key>() }
+        });
         let resolve = if deps.is_empty() { quote!() } else { quote!(#deps_type { #(#resolve),* }) };
-        let keys = deps.iter().map(|dep| &dep.key);
+        let (optional, keys): (Vec<_>, Vec<_>) = deps.iter().partition(|dep| dep.optional);
+        let (keys, optional) = (keys.iter().map(|dep| &dep.key), optional.iter().map(|dep| &dep.key));
         quote! {
             #deps_struct
 
@@ -110,6 +116,10 @@ impl Declaration {
 
                 fn deps() -> ::std::vec::Vec<::cordis::KeyId> {
                     ::std::vec![#(::cordis::KeyId::of::<#keys>()),*]
+                }
+
+                fn optional() -> ::std::vec::Vec<::cordis::KeyId> {
+                    ::std::vec![#(::cordis::KeyId::of::<#optional>()),*]
                 }
 
                 fn provides() -> ::std::vec::Vec<::cordis::KeyId> {
@@ -133,20 +143,28 @@ impl Declaration {
     }
 }
 
-/// One entry of `deps(...)`: the field name of the dependency and its key, `fs: dyn Fs`.
+/// One entry of `deps(...)`: the field name of the dependency, its key, and whether it is
+/// optional (`fs: dyn Fs` or `fs?: dyn Fs`).
 struct Dep {
     name: Ident,
     key: Type,
+    optional: bool,
 }
 
 impl Parse for Dep {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        if !(input.peek(Ident) && input.peek2(Token![:]) && !input.peek2(Token![::])) {
-            return Err(input.error("expected `name: Key`, for example `fs: dyn Fs`"));
+        let required = input.peek(Ident) && input.peek2(Token![:]) && !input.peek2(Token![::]);
+        let optional =
+            input.peek(Ident) && input.peek2(Token![?]) && input.peek3(Token![:]) && !input.peek3(Token![::]);
+        if !(required || optional) {
+            return Err(input.error("expected `name: Key` or `name?: Key`, for example `fs: dyn Fs`"));
         }
         let name = input.parse()?;
+        if optional {
+            input.parse::<Token![?]>()?;
+        }
         input.parse::<Token![:]>()?;
-        Ok(Self { name, key: input.parse()? })
+        Ok(Self { name, key: input.parse()?, optional })
     }
 }
 

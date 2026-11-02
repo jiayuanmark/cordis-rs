@@ -38,7 +38,7 @@ impl Catalog {
     fn key(&self, name: &str) -> Option<KeyId> {
         self.entries
             .values()
-            .flat_map(|factory| factory.deps.iter().chain(&factory.provides))
+            .flat_map(|factory| factory.deps.iter().chain(&factory.optional).chain(&factory.provides))
             .copied()
             .find(|key| key.name() == name)
     }
@@ -223,8 +223,9 @@ pub enum LoadWarning {
         /// The realm the row's `isolate` names for the key, or `None` for the shared realm.
         realm: Option<String>,
     },
-    /// Enabled rows depend on each other in a cycle, so none of them activates unless
-    /// something outside the cycle provides one of its keys.
+    /// Enabled rows depend on each other in a cycle. When every link is required, none of them
+    /// activates unless something outside the cycle provides one of its keys; when a link is
+    /// optional, they keep reloading each other.
     Cycle(Vec<String>),
 }
 
@@ -389,6 +390,11 @@ impl Loader {
                         realm: row.isolate.get(key.name()).cloned(),
                     }),
                 }
+            }
+            // An optional dependency never goes missing, but it can close a cycle: each arrival
+            // of its provider reloads the row, which can take the provider down again.
+            for key in &factory.optional {
+                targets.extend(providers.get(&env.slot(*key)).into_iter().flatten());
             }
             edges.push(targets);
         }

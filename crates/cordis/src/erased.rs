@@ -2,6 +2,7 @@
 
 use std::any::Any;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -10,14 +11,14 @@ use serde_json::Value;
 use crate::dispose::Undo;
 use crate::orchestrator::Control;
 use crate::realm::Env;
-use crate::{Component, Cx, Events, Key, KeyId, Manifest, Result};
+use crate::{Component, Cx, Events, Key, KeyId, Manifest, Result, When, WhenAction};
 
 pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 /// The provider value of each dependency key, resolved for one activation.
 pub(crate) type Resolved = Vec<(KeyId, Erased)>;
 
-type Activate = fn(Resolved, Value, Events, Control) -> BoxFuture<Result<Box<dyn Instance>>>;
+type Activate = Box<dyn Fn(Resolved, Value, Events, Control) -> BoxFuture<Result<Box<dyn Instance>>> + Send + Sync>;
 
 /// A provided value with its type erased.
 ///
@@ -50,25 +51,27 @@ pub struct Resolve<'a> {
 }
 
 impl Resolve<'_> {
-    fn find(&self, id: KeyId) -> &Erased {
-        &self
-            .values
-            .iter()
-            .find(|(key, _)| *key == id)
-            .expect("the orchestrator resolves every declared key before activation")
-            .1
+    fn find(&self, id: KeyId) -> Option<&Erased> {
+        self.values.iter().find(|(key, _)| *key == id).map(|(_, value)| value)
     }
 
     /// Returns the provider of `K`, with the context's interception of `K` applied, if any.
     pub fn get<K: Key + ?Sized>(&self) -> Arc<K::Value> {
+        self.optional::<K>().expect("the orchestrator resolves every required key before activation")
+    }
+
+    /// Returns the provider of an optional dependency `K`, with the context's interception of `K`
+    /// applied, or `None` when `K` had no provider when this activation began.
+    pub fn optional<K: Key + ?Sized>(&self) -> Option<Arc<K::Value>> {
         let id = KeyId::of::<K>();
-        self.env.remap(id, self.find(id).clone()).get::<K>()
+        Some(self.env.remap(id, self.find(id)?.clone()).get::<K>())
     }
 }
 
 /// The operations of one component type, with the type erased.
 pub(crate) struct Factory {
     pub(crate) deps: Vec<KeyId>,
+    pub(crate) optional: Vec<KeyId>,
     pub(crate) provides: Vec<KeyId>,
     pub(crate) validate: fn(&Value) -> Result<(), String>,
     pub(crate) activate: Activate,
@@ -78,9 +81,30 @@ impl Factory {
     pub(crate) fn of<C: Component>() -> Self {
         Self {
             deps: <C as Manifest>::deps(),
+            optional: <C as Manifest>::optional(),
             provides: <C as Manifest>::provides(),
             validate: validate::<C>,
-            activate: activate::<C>,
+            activate: Box::new(activate::<C>),
+        }
+    }
+
+    pub(crate) fn when<K: Key + ?Sized>(run: impl WhenAction<K>) -> Self {
+        let run = Arc::new(run);
+        Self {
+            deps: <When<K> as Manifest>::deps(),
+            optional: Vec::new(),
+            provides: Vec::new(),
+            validate: validate::<When<K>>,
+            activate: Box::new(move |deps, _config, events, control| {
+                let run = run.clone();
+                Box::pin(async move {
+                    let provider = <When<K> as Manifest>::resolve(&Resolve { values: &deps, env: control.env() });
+                    let undo = control.undo().upgrade().expect("the activation task holds its run's undo list");
+                    let cx = Cx::new(Arc::new(provider.clone()), events, control);
+                    run(cx, provider).await?;
+                    Ok(Box::new(Active { component: Arc::new(When::<K>(PhantomData)), undo }) as Box<dyn Instance>)
+                })
+            }),
         }
     }
 }
