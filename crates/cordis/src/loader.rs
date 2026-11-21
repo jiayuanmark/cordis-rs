@@ -5,6 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::erased::Factory;
@@ -28,7 +29,11 @@ impl Catalog {
     /// # Returns
     ///
     /// The catalog, for chaining.
-    pub fn register<C: Component>(&mut self, name: &str) -> &mut Self {
+    pub fn register<C>(&mut self, name: &str) -> &mut Self
+    where
+        C: Component,
+        C::Config: DeserializeOwned,
+    {
         self.entries.insert(name.to_owned(), Arc::new(Factory::of::<C>()));
         self
     }
