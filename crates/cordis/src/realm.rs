@@ -6,9 +6,10 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::component::WhenRun;
 use crate::erased::{Config, Erased, Factory};
 use crate::orchestrator::Spawner;
-use crate::{Component, Fiber, Key, KeyId, Result};
+use crate::{Component, Fiber, Key, KeyId, Result, When, WhenAction};
 
 /// A namespace of provisions.
 ///
@@ -246,5 +247,24 @@ impl Scope {
     {
         let config = Config::Typed(Arc::new(config));
         self.spawner.insert(Arc::new(Factory::typed::<D>()), config, self.env.clone()).await
+    }
+
+    /// Instantiates a fiber under this scope that runs `run` whenever `K` has an active provider
+    /// in this scope's realm for `K`.
+    ///
+    /// Like [`plugin`](Scope::plugin), the fiber waits while `K` has no provider, runs `run` once
+    /// `K` is active, and undoes the run's [`on_dispose`](crate::Cx::on_dispose) list—before `K`'s
+    /// provider tears down—when `K` leaves or reloads, or when the parent activation ends. See
+    /// [`Cx::when`](crate::Cx::when).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fiber the scope was taken from can no longer instantiate
+    /// children, or when the app has stopped. In each case no fiber runs.
+    pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> Result<Fiber<When<K>>> {
+        // `plugin::<When<K>>` without its `Config: Clone + Sync` bound, which the compiler cannot
+        // prove for every lifetime when `K` is a trait object.
+        let config = Config::Typed(Arc::new(WhenRun::new(run)));
+        self.spawner.insert(Arc::new(Factory::typed::<When<K>>()), config, self.env.clone()).await
     }
 }

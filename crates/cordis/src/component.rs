@@ -4,6 +4,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use crate::erased::BoxFuture;
 use crate::events::{Held, On};
 use crate::orchestrator::Control;
 use crate::{Dispose, Erased, Event, Events, Fiber, FiberId, Key, KeyId, Realm, Resolve, Result, Scope};
@@ -58,6 +59,83 @@ pub trait Component: Manifest + Send + Sync {
     /// therefore also wait on `cx.cancelled()` and return early; a cancelled activation that
     /// returns an error is not marked failed.
     fn activate(cx: Cx<Self>, config: Self::Config) -> impl Future<Output = Result<Self>> + Send;
+}
+
+/// The component type of a fiber instantiated by [`Cx::when`], [`Scope::when`], or
+/// [`App::when`](crate::App::when).
+///
+/// A `when::<K>` closure receives a `Cx<When<K>>` as its first argument, giving it the same
+/// context operations as any [`Component::activate`]: [`on_dispose`](Cx::on_dispose),
+/// [`on`](Cx::on), [`plugin`](Cx::plugin), [`when`](Cx::when), [`isolate`](Cx::isolate),
+/// [`intercept`](Cx::intercept), and [`cancelled`](Cx::cancelled). [`cx.deps()`](Cx::deps)
+/// returns the `&Arc<K::Value>` also passed as the closure's second argument.
+///
+/// It is an ordinary component whose configuration is the closure.
+pub struct When<K: Key + ?Sized>(PhantomData<fn() -> K>);
+
+impl<K: Key + ?Sized> Manifest for When<K> {
+    type Config = WhenRun<K>;
+    type Deps = Arc<K::Value>;
+
+    fn deps() -> Vec<KeyId> {
+        vec![KeyId::of::<K>()]
+    }
+
+    fn provides() -> Vec<KeyId> {
+        Vec::new()
+    }
+
+    fn resolve(resolved: &Resolve<'_>) -> Self::Deps {
+        resolved.get::<K>()
+    }
+
+    fn publish(_: &Arc<Self>) -> Vec<(KeyId, Erased)> {
+        Vec::new()
+    }
+}
+
+impl<K: Key + ?Sized> Component for When<K> {
+    async fn activate(cx: Cx<Self>, run: WhenRun<K>) -> Result<Self> {
+        let provider = cx.deps().clone();
+        (run.0)(cx, provider).await?;
+        Ok(Self(PhantomData))
+    }
+}
+
+/// The configuration of a [`When`] fiber: its closure, with the future boxed so the type can be
+/// named.
+#[doc(hidden)]
+pub struct WhenRun<K: Key + ?Sized>(Arc<WhenFn<K>>);
+
+type WhenFn<K> = dyn Fn(Cx<When<K>>, Arc<<K as Key>::Value>) -> BoxFuture<Result<()>> + Send + Sync;
+
+impl<K: Key + ?Sized> WhenRun<K> {
+    pub(crate) fn new(run: impl WhenAction<K>) -> Self {
+        Self(Arc::new(move |cx, provider| Box::pin(run(cx, provider))))
+    }
+}
+
+impl<K: Key + ?Sized> Clone for WhenRun<K> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+/// The body of a [`Cx::when`], [`Scope::when`], or [`App::when`](crate::App::when) fiber: an
+/// async closure from the fiber's [`Cx`] and the provider of `K` to [`Result<()>`]. Implemented
+/// for every such closure.
+pub trait WhenAction<K: Key + ?Sized>: Fn(Cx<When<K>>, Arc<K::Value>) -> Self::Future + Send + Sync + 'static {
+    #[doc(hidden)]
+    type Future: Future<Output = Result<()>> + Send + 'static;
+}
+
+impl<K, F, Fut> WhenAction<K> for F
+where
+    K: Key + ?Sized,
+    F: Fn(Cx<When<K>>, Arc<K::Value>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    type Future = Fut;
 }
 
 /// The context of one fiber run of `C`: its resolved dependencies, the event bus, and the
@@ -173,6 +251,56 @@ impl<C: Component> Cx<C> {
         D::Config: Clone + Sync,
     {
         self.control.scope().plugin::<D>(config).await
+    }
+
+    /// Instantiates a child fiber under this fiber that runs `run` whenever `K` has an active
+    /// provider.
+    ///
+    /// This fiber does not depend on `K`, so it activates whether or not `K` is present and is
+    /// unaffected when `K` changes. The child fiber depends on `K`: each time `K` becomes active,
+    /// `run` is called with the child's [`Cx`] and the provider of `K`; when `K` unloads or
+    /// reloads, or when this fiber's activation ends, the child's [`on_dispose`](Cx::on_dispose)
+    /// list is undone before `K`'s provider tears down.
+    ///
+    /// This is the idiomatic way to attach optional effects—such as registering a tool, route, or
+    /// metric collector—to a service that may not be loaded, or that may reload independently of
+    /// this component:
+    ///
+    /// ```
+    /// use cordis::{Component, Cx, Guard, Result, component, key};
+    ///
+    /// pub trait Tools: Send + Sync {
+    ///     fn register(&self, name: &str) -> Guard;
+    /// }
+    /// key!(dyn Tools = "tools");
+    ///
+    /// #[component]
+    /// struct Search;
+    ///
+    /// impl Component for Search {
+    ///     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+    ///         // `Search` is active even without `dyn Tools`. Whenever `dyn Tools` is active,
+    ///         // the `"search"` tool is registered, and unregistered before `dyn Tools` unloads
+    ///         // or when `Search` unloads.
+    ///         cx.when::<dyn Tools>(|cx, tools| async move {
+    ///             cx.on_dispose(tools.register("search"));
+    ///             Ok(())
+    ///         })
+    ///         .await?;
+    ///         Ok(Search)
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// To capture state from `self` across reloads of `K`, clone an `Arc` (or `cx.clone()`)
+    /// outside the closure and clone it into the async block on each call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this fiber is leaving or its activation has ended (see
+    /// [`is_live`](Cx::is_live)), or when the app has stopped. In each case no child runs.
+    pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> Result<Fiber<When<K>>> {
+        self.control.scope().when::<K>(run).await
     }
 
     /// Returns a scope where `K` resolves in a fresh realm, for children that share a private
