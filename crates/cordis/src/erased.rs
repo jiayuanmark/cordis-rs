@@ -5,6 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::dispose::Undo;
@@ -17,7 +18,16 @@ pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// The provider value of each dependency key, resolved for one activation.
 pub(crate) type Resolved = Vec<(KeyId, Erased)>;
 
-type Activate = fn(Resolved, Value, Events, Control) -> BoxFuture<Result<Box<dyn Instance>>>;
+/// Configuration of a fiber: either a JSON value (for fibers inserted through [`App::insert`] or
+/// [`Loader`](crate::Loader)) or a typed Rust value (for fibers instantiated through
+/// [`Cx::plugin`], [`Scope::plugin`], or [`App::plugin`](crate::App::plugin)).
+#[derive(Clone)]
+pub(crate) enum Config {
+    Json(Value),
+    Typed(Arc<dyn Any + Send + Sync>),
+}
+
+type Activate = fn(Resolved, Config, Events, Control) -> BoxFuture<Result<Box<dyn Instance>>>;
 
 /// A provided value with its type erased.
 ///
@@ -75,33 +85,90 @@ pub(crate) struct Factory {
 }
 
 impl Factory {
-    pub(crate) fn of<C: Component>() -> Self {
+    pub(crate) fn of<C>() -> Self
+    where
+        C: Component,
+        C::Config: DeserializeOwned,
+    {
         Self {
             deps: <C as Manifest>::deps(),
             provides: <C as Manifest>::provides(),
             validate: validate::<C>,
-            activate: activate::<C>,
+            activate: activate_json::<C>,
+        }
+    }
+
+    pub(crate) fn typed<C>() -> Self
+    where
+        C: Component,
+        C::Config: Clone + Sync,
+    {
+        Self {
+            deps: <C as Manifest>::deps(),
+            provides: <C as Manifest>::provides(),
+            validate: |_| Ok(()),
+            activate: activate_typed::<C>,
         }
     }
 }
 
-fn validate<C: Component>(config: &Value) -> Result<(), String> {
+fn validate<C>(config: &Value) -> Result<(), String>
+where
+    C: Component,
+    C::Config: DeserializeOwned,
+{
     serde_json::from_value::<C::Config>(config.clone()).map(drop).map_err(|error| error.to_string())
 }
 
-fn activate<C: Component>(
+fn activate_json<C>(
     deps: Resolved,
-    config: Value,
+    config: Config,
     events: Events,
     control: Control,
-) -> BoxFuture<Result<Box<dyn Instance>>> {
+) -> BoxFuture<Result<Box<dyn Instance>>>
+where
+    C: Component,
+    C::Config: DeserializeOwned,
+{
     Box::pin(async move {
+        // Only `App::insert` and the loader create JSON fibers, and the orchestrator ignores a
+        // typed update of one.
+        let Config::Json(config) = config else { unreachable!("a JSON fiber is never given typed configuration") };
         let config: C::Config = serde_json::from_value(config)?;
-        let deps = Arc::new(C::resolve(&Resolve { values: &deps, env: control.env() }));
-        let undo = control.undo().upgrade().expect("the activation task holds its run's undo list");
-        let component = C::activate(Cx::new(deps, events, control), config).await?;
-        Ok(Box::new(Active { component: Arc::new(component), undo }) as Box<dyn Instance>)
+        activate_with::<C>(deps, config, events, control).await
     })
+}
+
+fn activate_typed<C>(
+    deps: Resolved,
+    config: Config,
+    events: Events,
+    control: Control,
+) -> BoxFuture<Result<Box<dyn Instance>>>
+where
+    C: Component,
+    C::Config: Clone + Sync,
+{
+    Box::pin(async move {
+        // `Fiber<C>::update` takes `C::Config`, and the orchestrator ignores a JSON update of a
+        // typed fiber, so the configuration always has this component's type.
+        let Config::Typed(config) = config else { unreachable!("a typed fiber is never given JSON configuration") };
+        let config =
+            config.downcast_ref::<C::Config>().expect("a typed fiber's configuration is its `C::Config`").clone();
+        activate_with::<C>(deps, config, events, control).await
+    })
+}
+
+async fn activate_with<C: Component>(
+    deps: Resolved,
+    config: C::Config,
+    events: Events,
+    control: Control,
+) -> Result<Box<dyn Instance>> {
+    let deps = Arc::new(C::resolve(&Resolve { values: &deps, env: control.env() }));
+    let undo = control.undo().upgrade().expect("the activation task holds its run's undo list");
+    let component = C::activate(Cx::new(deps, events, control), config).await?;
+    Ok(Box::new(Active { component: Arc::new(component), undo }) as Box<dyn Instance>)
 }
 
 /// An activated component, with its type erased.

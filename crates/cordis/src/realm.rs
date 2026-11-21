@@ -6,10 +6,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde::Serialize;
-
-use crate::erased::Erased;
-use crate::erased::Factory;
+use crate::erased::{Config, Erased, Factory};
 use crate::orchestrator::Spawner;
 use crate::{Component, Fiber, Key, KeyId, Result};
 
@@ -233,17 +230,21 @@ impl Scope {
 
     /// Instantiates a fiber of component `D` with `config` under this scope.
     ///
-    /// From a scope taken from a `Cx`, the fiber is a child of that fiber's current activation;
-    /// see [`Cx::plugin`](crate::Cx::plugin). From a scope taken from an `App`, it is a root
-    /// fiber, which [`Fiber::dispose`] or [`App::remove`](crate::App::remove) retires.
+    /// `config` is passed directly in memory (`D::Config: Clone + Send + Sync + 'static`), without
+    /// serialization. From a scope taken from a `Cx`, the fiber is a child of that fiber's current
+    /// activation; see [`Cx::plugin`](crate::Cx::plugin). From a scope taken from an `App`, it is
+    /// a root fiber, which [`Fiber::dispose`] or [`App::remove`](crate::App::remove) retires.
     ///
     /// # Errors
     ///
-    /// Returns an error when `config` fails to serialize, when the fiber the scope was taken
-    /// from can no longer instantiate children, or when the app has stopped. In each case no
-    /// fiber runs.
-    pub async fn plugin<D: Component>(&self, config: impl Serialize) -> Result<Fiber> {
-        let config = serde_json::to_value(config)?;
-        self.spawner.insert(Arc::new(Factory::of::<D>()), config, self.env.clone()).await
+    /// Returns an error when the fiber the scope was taken from can no longer instantiate
+    /// children, or when the app has stopped. In each case no fiber runs.
+    pub async fn plugin<D>(&self, config: D::Config) -> Result<Fiber<D>>
+    where
+        D: Component,
+        D::Config: Clone + Sync,
+    {
+        let config = Config::Typed(Arc::new(config));
+        self.spawner.insert(Arc::new(Factory::typed::<D>()), config, self.env.clone()).await
     }
 }
