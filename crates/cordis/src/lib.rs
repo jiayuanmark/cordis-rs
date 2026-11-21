@@ -24,7 +24,7 @@ mod loader;
 mod orchestrator;
 mod realm;
 
-pub use component::{Component, Cx, Manifest};
+pub use component::{Component, Cx, Manifest, When, WhenAction};
 /// Declares a component's configuration, dependencies, and provisions by implementing
 /// [`Manifest`] for the type it is attached to, and generates a struct of its
 /// resolved dependencies.

@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use crate::dispose::{Undo, UndoHandle, panic_message};
 use crate::erased::{Config, Factory, Instance};
 use crate::realm::{Env, Slot};
-use crate::{Component, Dispose, Erased, Events, Key, KeyId, Realm, Scope};
+use crate::{Component, Dispose, Erased, Events, Key, KeyId, Realm, Scope, When, WhenAction};
 
 new_key_type! {
     /// Identity of a fiber: one configured instance of a component.
@@ -129,6 +129,19 @@ impl App {
         remap: impl Fn(Arc<K::Value>) -> Arc<K::Value> + Send + Sync + 'static,
     ) -> Scope {
         self.scope().intercept::<K>(remap)
+    }
+
+    /// Inserts a root fiber that runs `run` whenever `K` has an active provider in the shared
+    /// realm.
+    ///
+    /// The returned [`Fiber`] reads its status or disposes of it. To watch `K` in another realm,
+    /// call [`Scope::when`] on [`isolate_in`](App::isolate_in). See [`Cx::when`](crate::Cx::when).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the app has stopped.
+    pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> crate::Result<Fiber<When<K>>> {
+        self.scope().when::<K>(run).await
     }
 
     fn scope(&self) -> Scope {
@@ -356,7 +369,7 @@ impl Spawner {
 }
 
 /// A view of a fiber of component `C`, returned by [`Cx::plugin`](crate::Cx::plugin) and the
-/// other `plugin` methods.
+/// other `plugin` and `when` methods.
 ///
 /// The handle does not own the fiber: dropping it changes nothing, and the parent's activation
 /// retires the child when it ends. Use [`dispose`](Fiber::dispose) to retire it sooner, for
