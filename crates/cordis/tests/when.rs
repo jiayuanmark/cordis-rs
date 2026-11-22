@@ -371,3 +371,97 @@ async fn optional_respects_realms_intercepts_once_per_activation_and_supports_di
     assert_eq!(app.status(shared_metrics).await, Some(Status::Active));
     assert_eq!(iso_metrics.status().await, Some(Status::Active));
 }
+
+/// Holds an `Optional<dyn Metrics>` across an `.await` inside `Component::activate` (which must
+/// stay `Send` even when `K` is a `dyn Trait` key).
+#[component(provides(dyn Probe))]
+struct HeldAcrossAwait {
+    metrics: Optional<dyn Metrics>,
+}
+
+impl Probe for HeldAcrossAwait {
+    fn current_metrics(&self) -> Option<String> {
+        self.metrics.get().map(|metrics| metrics.name())
+    }
+
+    fn handle(&self) -> Optional<dyn Metrics> {
+        self.metrics.clone()
+    }
+}
+
+impl Component for HeldAcrossAwait {
+    async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+        let metrics = cx.optional::<dyn Metrics>().await?;
+        tokio::task::yield_now().await;
+        Ok(Self { metrics })
+    }
+}
+
+#[tokio::test]
+async fn optional_can_be_held_across_await_in_activate_and_spawned_tasks() {
+    let app = App::new();
+    app.insert::<HeldAcrossAwait>(json!(null)).await;
+    app.insert::<Recorder>(json!({ "tag": "held_await", "name": "live" })).await;
+    app.settled().await;
+
+    let handle = app.get::<dyn Probe>().await.unwrap().handle();
+    let seen = tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        handle.get().map(|metrics| metrics.name())
+    })
+    .await
+    .unwrap();
+    assert_eq!(seen.as_deref(), Some("live"));
+}
+
+#[derive(Clone)]
+struct CacheProbeConfig {
+    tx: tokio::sync::mpsc::UnboundedSender<Cx<CacheProbe>>,
+}
+
+#[component(config = CacheProbeConfig)]
+struct CacheProbe;
+
+impl Component for CacheProbe {
+    async fn activate(cx: Cx<Self>, config: CacheProbeConfig) -> Result<Self> {
+        let _ = config.tx.send(cx);
+        Ok(CacheProbe)
+    }
+}
+
+#[tokio::test]
+async fn cx_optional_reuses_one_child_fiber_per_key_for_an_activation() {
+    let app = App::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let owner = app.plugin::<CacheProbe>(CacheProbeConfig { tx }).await.unwrap();
+    let cx = rx.recv().await.unwrap();
+
+    // Concurrent calls on the first access deduplicate to a single backing child fiber.
+    let (a, b) = tokio::join!(cx.optional::<dyn Metrics>(), cx.optional::<dyn Metrics>());
+    let a = a.unwrap();
+    let b = b.unwrap();
+    assert_eq!(a.id(), b.id());
+    assert_eq!(app.parent(a.id()).await, Some(owner.id()));
+
+    // Repeated sequential calls reuse the exact same child fiber.
+    for _ in 0..100 {
+        let next = cx.optional::<dyn Metrics>().await.unwrap();
+        assert_eq!(next.id(), a.id());
+    }
+
+    // A derived scope's `optional` does not collide with `cx`'s own cached handle.
+    let isolated = cx.isolate::<dyn Metrics>().optional::<dyn Metrics>().await.unwrap();
+    assert_ne!(isolated.id(), a.id());
+
+    // Disposing the handle retires the backing fiber; a subsequent `cx.optional` starts a fresh one.
+    a.dispose();
+    app.settled().await;
+    assert_eq!(app.status(a.id()).await, None);
+    let fresh = cx.optional::<dyn Metrics>().await.unwrap();
+    assert_ne!(fresh.id(), a.id());
+
+    // After the owner unloads, a kept `Cx` cannot return a cached handle or start a new one.
+    owner.dispose();
+    app.settled().await;
+    assert!(cx.optional::<dyn Metrics>().await.is_err());
+}

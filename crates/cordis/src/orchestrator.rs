@@ -5,8 +5,8 @@ use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use futures::FutureExt;
 use serde::de::DeserializeOwned;
@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use crate::dispose::{Undo, UndoHandle, panic_message};
 use crate::erased::{Config, Factory, Instance};
 use crate::realm::{Env, Slot};
-use crate::{Component, Dispose, Erased, Events, Key, KeyId, Optional, Realm, Scope, When, WhenAction};
+use crate::{Component, Dispose, Erased, Events, Guard, Key, KeyId, Optional, Realm, Scope, When, WhenAction};
 
 new_key_type! {
     /// Identity of a fiber: one configured instance of a component.
@@ -147,8 +147,10 @@ impl App {
     /// Returns a live [`Optional<K>`] handle backed by a root [`when`](App::when) fiber in the
     /// shared realm.
     ///
-    /// Call [`Optional::dispose`] to retire the backing fiber early. To watch `K` in another
-    /// realm, call [`Scope::optional`] on [`isolate_in`](App::isolate_in). See [`Optional`].
+    /// Each call starts a new root [`When<K>`] fiber; create it once and store or clone the
+    /// handle, and call [`Optional::dispose`] to retire the backing fiber early. To watch `K` in
+    /// another realm, call [`Scope::optional`] on [`isolate_in`](App::isolate_in). See
+    /// [`Optional`].
     ///
     /// # Errors
     ///
@@ -296,6 +298,8 @@ pub(crate) struct Owner {
     token: u64,
 }
 
+type CachedOptional = (Arc<RwLock<Option<Erased>>>, Fiber<()>);
+
 /// A fiber's handle to the orchestrator, carried by its `Cx`.
 ///
 /// The sender is weak, so a `Cx` a component keeps does not keep the orchestrator running.
@@ -309,6 +313,9 @@ pub(crate) struct Control {
     undo: UndoHandle,
     /// Cancelled once this run should stop: its activation was diverted, or the fiber leaves.
     cancel: CancellationToken,
+    /// Cached `Optional<K>` handles created through `Cx::optional` for this activation, cleared
+    /// when the activation ends.
+    optionals: Arc<Mutex<HashMap<KeyId, CachedOptional>>>,
 }
 
 impl Control {
@@ -331,6 +338,45 @@ impl Control {
     /// Returns the fiber's own context, from which its children derive theirs.
     pub(crate) fn scope(&self) -> Scope {
         Scope::new(self.env.clone(), Spawner::Fiber(self.clone()))
+    }
+
+    /// Returns the cached [`Optional<K>`] for this activation, or spawns one backing [`When<K>`]
+    /// child fiber if none is cached (or the previous one was disposed).
+    pub(crate) fn optional<K: Key + ?Sized>(&self) -> impl Future<Output = crate::Result<Optional<K>>> + Send + use<K> {
+        let control = self.clone();
+        async move {
+            let key = KeyId::of::<K>();
+            if control.undo.is_open()
+                && let Some((slot, fiber)) =
+                    control.optionals.lock().expect("optional cache lock is never poisoned").get(&key)
+                && !fiber.is_disposed()
+            {
+                return Ok(Optional::new(slot.clone(), fiber.cast()));
+            }
+            let fresh = control.scope().optional::<K>().await?;
+            let (slot, fiber) = fresh.parts();
+            let mut cache = control.optionals.lock().expect("optional cache lock is never poisoned");
+            if !control.undo.is_open() {
+                fiber.dispose();
+                return Ok(fresh);
+            }
+            if let Some((existing_slot, existing_fiber)) = cache.get(&key)
+                && !existing_fiber.is_disposed()
+            {
+                fiber.dispose();
+                return Ok(Optional::new(existing_slot.clone(), existing_fiber.cast()));
+            }
+            let first = cache.is_empty();
+            cache.insert(key, (slot, fiber.erase()));
+            drop(cache);
+            if first {
+                let optionals = control.optionals.clone();
+                control.undo.push(Guard::new(move || {
+                    optionals.lock().expect("optional cache lock is never poisoned").clear();
+                }));
+            }
+            Ok(fresh)
+        }
     }
 }
 
@@ -461,6 +507,18 @@ impl<C> Fiber<C> {
     pub fn dispose(&self) {
         self.disposed.store(true, Ordering::Relaxed);
         self.send(Command::Remove { id: self.id });
+    }
+
+    pub(crate) fn is_disposed(&self) -> bool {
+        self.disposed.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn erase(self) -> Fiber<()> {
+        Fiber { id: self.id, commands: self.commands, disposed: self.disposed, component: PhantomData }
+    }
+
+    pub(crate) fn cast<D>(&self) -> Fiber<D> {
+        Fiber { id: self.id, commands: self.commands.clone(), disposed: self.disposed.clone(), component: PhantomData }
     }
 
     fn send(&self, command: Command) {
@@ -818,6 +876,7 @@ impl Orchestrator {
             env: fiber.env.clone(),
             undo: undo.handle(),
             cancel: cancel.clone(),
+            optionals: Arc::default(),
         };
         let task = (fiber.factory.activate)(deps, fiber.config.clone(), self.bus.clone(), control);
         fiber.committed = Some(Committed { view, epoch: fiber.epoch });

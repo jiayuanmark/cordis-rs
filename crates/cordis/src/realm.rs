@@ -274,7 +274,10 @@ impl Scope {
     ///
     /// The handle tracks the active provider of `K` in this scope's realm (with any interception
     /// on `K` applied once per activation of `K`'s provider) without restarting the owning fiber.
-    /// See [`Optional`] and [`Cx::optional`](crate::Cx::optional).
+    ///
+    /// Each call starts a new [`When<K>`] fiber under this scope; create the handle once and
+    /// store or clone it (unlike [`Cx::optional`](crate::Cx::optional), which reuses one child
+    /// fiber per key for the activation). See [`Optional`].
     ///
     /// # Errors
     ///
@@ -285,13 +288,13 @@ impl Scope {
         // `dyn Trait` keys `Send` when awaited inside `Component::activate` or `tokio::spawn`.
         let scope = self.clone();
         async move {
-            let slot: Arc<RwLock<Option<Arc<K::Value>>>> = Arc::new(RwLock::new(None));
+            let slot: Arc<RwLock<Option<Erased>>> = Arc::new(RwLock::new(None));
             let cell = slot.clone();
             let fiber = scope
                 .when::<K>(move |cx, provider| {
                     let cell = cell.clone();
                     async move {
-                        *cell.write().expect("optional slot lock is never poisoned") = Some(provider);
+                        *cell.write().expect("optional slot lock is never poisoned") = Some(Erased::new::<K>(provider));
                         let clear = cell.clone();
                         cx.on_dispose(Guard::new(move || {
                             *clear.write().expect("optional slot lock is never poisoned") = None;
