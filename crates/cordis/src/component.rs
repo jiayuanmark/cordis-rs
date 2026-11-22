@@ -180,7 +180,7 @@ where
 /// }
 /// ```
 pub struct Optional<K: Key + ?Sized> {
-    slot: Arc<RwLock<Option<Arc<K::Value>>>>,
+    slot: Arc<RwLock<Option<Erased>>>,
     fiber: Fiber<When<K>>,
 }
 
@@ -197,15 +197,24 @@ impl<K: Key + ?Sized> fmt::Debug for Optional<K> {
 }
 
 impl<K: Key + ?Sized> Optional<K> {
-    pub(crate) fn new(slot: Arc<RwLock<Option<Arc<K::Value>>>>, fiber: Fiber<When<K>>) -> Self {
+    pub(crate) fn new(slot: Arc<RwLock<Option<Erased>>>, fiber: Fiber<When<K>>) -> Self {
         Self { slot, fiber }
+    }
+
+    pub(crate) fn parts(&self) -> (Arc<RwLock<Option<Erased>>>, Fiber<When<K>>) {
+        (self.slot.clone(), self.fiber.clone())
+    }
+
+    /// Returns the id of the backing [`When<K>`] fiber.
+    pub fn id(&self) -> FiberId {
+        self.fiber.id()
     }
 
     /// Returns the active provider of `K` in this handle's realm, with any interception of `K`
     /// applied, or `None` when no provider of `K` is currently active there (or the handle has
     /// been disposed or its owning activation has ended).
     pub fn get(&self) -> Option<Arc<K::Value>> {
-        self.slot.read().expect("optional slot lock is never poisoned").clone()
+        self.slot.read().expect("optional slot lock is never poisoned").as_ref().map(Erased::get::<K>)
     }
 
     /// Retires the backing [`When<K>`] fiber early, clearing this handle to `None`.
@@ -387,14 +396,18 @@ impl<C: Component> Cx<C> {
     /// The handle tracks the active provider of `K` in this fiber's realm (with any interception
     /// on `K` applied once per activation of `K`'s provider) without restarting this fiber, and
     /// clears to `None` before `K`'s provider tears down or when this fiber's activation ends.
-    /// See [`Optional`].
+    ///
+    /// Create the handle once (typically in `activate`) and store it so the backing child fiber
+    /// is already running when methods call [`Optional::get`]. Repeated calls for the same `K`
+    /// within the same activation reuse that handle rather than spawning additional child fibers
+    /// (unless the handle was disposed with [`Optional::dispose`]). See [`Optional`].
     ///
     /// # Errors
     ///
     /// Returns an error when this fiber is leaving or its activation has ended (see
     /// [`is_live`](Cx::is_live)), or when the app has stopped. In each case no child runs.
     pub fn optional<K: Key + ?Sized>(&self) -> impl Future<Output = Result<Optional<K>>> + Send + use<C, K> {
-        self.control.scope().optional::<K>()
+        self.control.optional::<K>()
     }
 
     /// Returns a scope where `K` resolves in a fresh realm, for children that share a private
