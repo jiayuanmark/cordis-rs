@@ -1,8 +1,10 @@
-//! Inline reactive hooks: `Cx::when`, `Scope::when`, and `App::when`.
+//! Inline reactive hooks (`Cx::when`, `Scope::when`, `App::when`) and live optional handles
+//! (`Cx::optional`, `Scope::optional`, `App::optional`).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use cordis::{App, Component, Cx, Guard, Realm, Result, Status, component, key};
+use cordis::{App, Component, Cx, Guard, Optional, Realm, Result, Status, component, key};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -209,4 +211,163 @@ async fn when_works_on_app_and_scope_with_isolation_and_interception() {
     assert_eq!(iso_metrics.status().await, Some(Status::Active));
     assert_eq!(journal("app_when"), ["live up", "live down"]);
     assert_eq!(journal("scope_when"), ["iso:local up", "iso:local down"]);
+}
+
+pub trait Probe: Send + Sync {
+    fn current_metrics(&self) -> Option<String>;
+    fn handle(&self) -> Optional<dyn Metrics>;
+}
+key!(dyn Probe = "probe");
+
+#[component(config = ServiceConfig, provides(dyn Probe))]
+struct OptionalService {
+    metrics: Optional<dyn Metrics>,
+}
+
+impl Probe for OptionalService {
+    fn current_metrics(&self) -> Option<String> {
+        self.metrics.get().map(|metrics| metrics.name())
+    }
+
+    fn handle(&self) -> Optional<dyn Metrics> {
+        self.metrics.clone()
+    }
+}
+
+impl Component for OptionalService {
+    async fn activate(cx: Cx<Self>, config: ServiceConfig) -> Result<Self> {
+        record(&config.tag, "optional-service up");
+        let metrics = cx.optional::<dyn Metrics>().await?;
+        Ok(Self { metrics })
+    }
+}
+
+/// A `Metrics` provider that inspects an `Optional<dyn Metrics>` handle during its own teardown
+/// to verify that the handle was already cleared before the provider began unloading.
+#[derive(Clone)]
+struct ObservedMetricsConfig {
+    name: String,
+    observer: Optional<dyn Metrics>,
+    saw_cleared: Arc<Mutex<Vec<bool>>>,
+}
+
+#[component(config = ObservedMetricsConfig, provides(dyn Metrics))]
+struct ObservedMetrics(String);
+
+impl Metrics for ObservedMetrics {
+    fn name(&self) -> String {
+        self.0.clone()
+    }
+}
+
+impl Component for ObservedMetrics {
+    async fn activate(cx: Cx<Self>, config: ObservedMetricsConfig) -> Result<Self> {
+        let ObservedMetricsConfig { name, observer, saw_cleared } = config;
+        cx.on_dispose(move || async move {
+            saw_cleared.lock().unwrap().push(observer.get().is_none());
+        });
+        Ok(Self(name))
+    }
+}
+
+#[tokio::test]
+async fn optional_tracks_provider_without_restarting_owner_and_clears_before_provider_teardown() {
+    let app = App::new();
+    let service = app.insert::<OptionalService>(json!({ "tag": "opt" })).await;
+    app.settled().await;
+
+    assert_eq!(app.status(service).await, Some(Status::Active));
+    let probe = app.get::<dyn Probe>().await.unwrap();
+    let handle = probe.handle();
+    assert_eq!(journal("opt"), ["optional-service up"]);
+    assert_eq!(probe.current_metrics(), None);
+
+    // Provider arrives: handle sees it without restarting `OptionalService`.
+    let saw_cleared = Arc::new(Mutex::new(Vec::new()));
+    let metrics = app
+        .plugin::<ObservedMetrics>(ObservedMetricsConfig {
+            name: "v1".into(),
+            observer: handle.clone(),
+            saw_cleared: saw_cleared.clone(),
+        })
+        .await
+        .unwrap();
+    app.settled().await;
+    assert_eq!(journal("opt"), ["optional-service up"]);
+    assert_eq!(probe.current_metrics().as_deref(), Some("v1"));
+
+    // Provider reloads: `handle` is cleared BEFORE `v1`'s teardown runs, then sees `v2`.
+    metrics.update(ObservedMetricsConfig {
+        name: "v2".into(),
+        observer: handle.clone(),
+        saw_cleared: saw_cleared.clone(),
+    });
+    app.settled().await;
+    assert_eq!(journal("opt"), ["optional-service up"]);
+    assert_eq!(*saw_cleared.lock().unwrap(), [true]);
+    assert_eq!(probe.current_metrics().as_deref(), Some("v2"));
+
+    // Provider leaves: `handle` clears before `v2`'s teardown; `OptionalService` stays active.
+    metrics.dispose();
+    app.settled().await;
+    assert_eq!(app.status(service).await, Some(Status::Active));
+    assert_eq!(*saw_cleared.lock().unwrap(), [true, true]);
+    assert_eq!(probe.current_metrics(), None);
+
+    // Provider returns, then parent unloads: even a kept clone of `Optional` clears to `None`
+    // while the provider stays active.
+    let metrics3 = app.insert::<Recorder>(json!({ "tag": "opt_p3", "name": "v3" })).await;
+    app.settled().await;
+    assert_eq!(handle.get().unwrap().name(), "v3");
+
+    app.remove(service);
+    app.settled().await;
+    assert_eq!(app.status(metrics3).await, Some(Status::Active));
+    assert!(handle.get().is_none());
+}
+
+#[tokio::test]
+async fn optional_respects_realms_intercepts_once_per_activation_and_supports_dispose() {
+    let app = App::new();
+    let realm = Realm::named("opt-isolated");
+    let remaps = Arc::new(AtomicUsize::new(0));
+
+    let shared_opt = app.optional::<dyn Metrics>().await.unwrap();
+    let counted = remaps.clone();
+    let iso_opt = app
+        .isolate_in::<dyn Metrics>(&realm)
+        .intercept::<dyn Metrics>(move |m| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Arc::new(PrefixedMetrics("iso:", m))
+        })
+        .optional::<dyn Metrics>()
+        .await
+        .unwrap();
+
+    // Shared provider is visible only to `shared_opt`.
+    let shared_metrics = app.insert::<Recorder>(json!({ "tag": "opt_shared", "name": "shared" })).await;
+    app.settled().await;
+    assert_eq!(shared_opt.get().unwrap().name(), "shared");
+    assert!(iso_opt.get().is_none());
+
+    // Isolated provider is visible to `iso_opt`, with interception applied once (not per read).
+    let iso_metrics = app
+        .isolate_in::<dyn Metrics>(&realm)
+        .plugin::<Recorder>(MetricsConfig { tag: "opt_iso".into(), name: "local".into() })
+        .await
+        .unwrap();
+    app.settled().await;
+    for _ in 0..3 {
+        assert_eq!(iso_opt.get().unwrap().name(), "iso:local");
+    }
+    assert_eq!(remaps.load(Ordering::SeqCst), 1);
+
+    // `Optional::dispose` retires the backing fiber and clears the handle while providers stay up.
+    shared_opt.dispose();
+    iso_opt.dispose();
+    app.settled().await;
+    assert!(shared_opt.get().is_none());
+    assert!(iso_opt.get().is_none());
+    assert_eq!(app.status(shared_metrics).await, Some(Status::Active));
+    assert_eq!(iso_metrics.status().await, Some(Status::Active));
 }

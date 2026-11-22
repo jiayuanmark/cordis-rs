@@ -1,8 +1,9 @@
 //! Components and their declared dependencies and provisions.
 
+use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::erased::BoxFuture;
 use crate::events::{Held, On};
@@ -136,6 +137,81 @@ where
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     type Future = Fut;
+}
+
+/// A live handle to an optional provider of `K`, returned by [`Cx::optional`],
+/// [`Scope::optional`], or [`App::optional`](crate::App::optional).
+///
+/// Backed by a [`When<K>`] child fiber: the handle updates as `K`'s provider activates, reloads,
+/// or unloads, without restarting the fiber that created it. Interception on `K` is applied once
+/// per activation of `K`'s provider, and the handle clears to `None` before `K`'s provider begins
+/// its own teardown (and when the owning activation ends).
+///
+/// Because the backing [`When<K>`] fiber activates asynchronously, [`get`](Optional::get) may
+/// return `None` immediately inside `activate` even if `K` is already active; use `Optional<K>`
+/// in methods called after activation, and [`Cx::when`] for setup effects that depend on `K`.
+///
+/// ```
+/// use cordis::{Component, Cx, Optional, Result, component, key};
+///
+/// pub trait Metrics: Send + Sync {
+///     fn increment(&self, counter: &str);
+/// }
+/// key!(dyn Metrics = "metrics");
+///
+/// #[component]
+/// struct Cache {
+///     metrics: Optional<dyn Metrics>,
+/// }
+///
+/// impl Cache {
+///     fn read(&self, _key: &str) {
+///         if let Some(metrics) = self.metrics.get() {
+///             metrics.increment("cache.read");
+///         }
+///     }
+/// }
+///
+/// impl Component for Cache {
+///     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+///         let metrics = cx.optional::<dyn Metrics>().await?;
+///         Ok(Cache { metrics })
+///     }
+/// }
+/// ```
+pub struct Optional<K: Key + ?Sized> {
+    slot: Arc<RwLock<Option<Arc<K::Value>>>>,
+    fiber: Fiber<When<K>>,
+}
+
+impl<K: Key + ?Sized> Clone for Optional<K> {
+    fn clone(&self) -> Self {
+        Self { slot: self.slot.clone(), fiber: self.fiber.clone() }
+    }
+}
+
+impl<K: Key + ?Sized> fmt::Debug for Optional<K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Optional").field("key", &KeyId::of::<K>()).field("present", &self.get().is_some()).finish()
+    }
+}
+
+impl<K: Key + ?Sized> Optional<K> {
+    pub(crate) fn new(slot: Arc<RwLock<Option<Arc<K::Value>>>>, fiber: Fiber<When<K>>) -> Self {
+        Self { slot, fiber }
+    }
+
+    /// Returns the active provider of `K` in this handle's realm, with any interception of `K`
+    /// applied, or `None` when no provider of `K` is currently active there (or the handle has
+    /// been disposed or its owning activation has ended).
+    pub fn get(&self) -> Option<Arc<K::Value>> {
+        self.slot.read().expect("optional slot lock is never poisoned").clone()
+    }
+
+    /// Retires the backing [`When<K>`] fiber early, clearing this handle to `None`.
+    pub fn dispose(&self) {
+        self.fiber.dispose();
+    }
 }
 
 /// The context of one fiber run of `C`: its resolved dependencies, the event bus, and the
@@ -293,7 +369,9 @@ impl<C: Component> Cx<C> {
     /// ```
     ///
     /// To capture state from `self` across reloads of `K`, clone an `Arc` (or `cx.clone()`)
-    /// outside the closure and clone it into the async block on each call.
+    /// outside the closure and clone it into the async block on each call. To read an optional
+    /// provider on demand from ordinary methods without managing a shared slot by hand, see
+    /// [`optional`](Cx::optional).
     ///
     /// # Errors
     ///
@@ -301,6 +379,22 @@ impl<C: Component> Cx<C> {
     /// [`is_live`](Cx::is_live)), or when the app has stopped. In each case no child runs.
     pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> Result<Fiber<When<K>>> {
         self.control.scope().when::<K>(run).await
+    }
+
+    /// Returns a live [`Optional<K>`] handle backed by a [`when`](Cx::when) child fiber under
+    /// this fiber.
+    ///
+    /// The handle tracks the active provider of `K` in this fiber's realm (with any interception
+    /// on `K` applied once per activation of `K`'s provider) without restarting this fiber, and
+    /// clears to `None` before `K`'s provider tears down or when this fiber's activation ends.
+    /// See [`Optional`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this fiber is leaving or its activation has ended (see
+    /// [`is_live`](Cx::is_live)), or when the app has stopped. In each case no child runs.
+    pub fn optional<K: Key + ?Sized>(&self) -> impl Future<Output = Result<Optional<K>>> + Send + use<C, K> {
+        self.control.scope().optional::<K>()
     }
 
     /// Returns a scope where `K` resolves in a fresh realm, for children that share a private

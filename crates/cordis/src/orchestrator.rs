@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use crate::dispose::{Undo, UndoHandle, panic_message};
 use crate::erased::{Config, Factory, Instance};
 use crate::realm::{Env, Slot};
-use crate::{Component, Dispose, Erased, Events, Key, KeyId, Realm, Scope, When, WhenAction};
+use crate::{Component, Dispose, Erased, Events, Key, KeyId, Optional, Realm, Scope, When, WhenAction};
 
 new_key_type! {
     /// Identity of a fiber: one configured instance of a component.
@@ -142,6 +142,19 @@ impl App {
     /// Returns an error when the app has stopped.
     pub async fn when<K: Key + ?Sized>(&self, run: impl WhenAction<K>) -> crate::Result<Fiber<When<K>>> {
         self.scope().when::<K>(run).await
+    }
+
+    /// Returns a live [`Optional<K>`] handle backed by a root [`when`](App::when) fiber in the
+    /// shared realm.
+    ///
+    /// Call [`Optional::dispose`] to retire the backing fiber early. To watch `K` in another
+    /// realm, call [`Scope::optional`] on [`isolate_in`](App::isolate_in). See [`Optional`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the app has stopped.
+    pub fn optional<K: Key + ?Sized>(&self) -> impl Future<Output = crate::Result<Optional<K>>> + Send + use<K> {
+        self.scope().optional::<K>()
     }
 
     fn scope(&self) -> Scope {
