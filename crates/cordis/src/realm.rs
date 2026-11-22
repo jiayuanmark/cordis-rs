@@ -3,13 +3,14 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use crate::component::WhenRun;
 use crate::erased::{Config, Erased, Factory};
 use crate::orchestrator::Spawner;
-use crate::{Component, Fiber, Key, KeyId, Result, When, WhenAction};
+use crate::{Component, Fiber, Guard, Key, KeyId, Optional, Result, When, WhenAction};
 
 /// A namespace of provisions.
 ///
@@ -266,5 +267,40 @@ impl Scope {
         // prove for every lifetime when `K` is a trait object.
         let config = Config::Typed(Arc::new(WhenRun::new(run)));
         self.spawner.insert(Arc::new(Factory::typed::<When<K>>()), config, self.env.clone()).await
+    }
+
+    /// Returns a live [`Optional<K>`] handle backed by a [`when`](Scope::when) fiber under this
+    /// scope.
+    ///
+    /// The handle tracks the active provider of `K` in this scope's realm (with any interception
+    /// on `K` applied once per activation of `K`'s provider) without restarting the owning fiber.
+    /// See [`Optional`] and [`Cx::optional`](crate::Cx::optional).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fiber the scope was taken from can no longer instantiate
+    /// children, or when the app has stopped. In each case no fiber runs.
+    pub fn optional<K: Key + ?Sized>(&self) -> impl Future<Output = Result<Optional<K>>> + Send + use<K> {
+        // Plain `fn` rather than `async fn`: rustc cannot prove an `async fn` generic over
+        // `dyn Trait` keys `Send` when awaited inside `Component::activate` or `tokio::spawn`.
+        let scope = self.clone();
+        async move {
+            let slot: Arc<RwLock<Option<Arc<K::Value>>>> = Arc::new(RwLock::new(None));
+            let cell = slot.clone();
+            let fiber = scope
+                .when::<K>(move |cx, provider| {
+                    let cell = cell.clone();
+                    async move {
+                        *cell.write().expect("optional slot lock is never poisoned") = Some(provider);
+                        let clear = cell.clone();
+                        cx.on_dispose(Guard::new(move || {
+                            *clear.write().expect("optional slot lock is never poisoned") = None;
+                        }));
+                        Ok(())
+                    }
+                })
+                .await?;
+            Ok(Optional::new(slot, fiber))
+        }
     }
 }
