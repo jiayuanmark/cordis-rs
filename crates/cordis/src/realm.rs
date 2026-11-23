@@ -275,9 +275,9 @@ impl Scope {
     /// The handle tracks the active provider of `K` in this scope's realm (with any interception
     /// on `K` applied once per activation of `K`'s provider) without restarting the owning fiber.
     ///
-    /// Each call starts a new [`When<K>`] fiber under this scope; create the handle once and
-    /// store or clone it (unlike [`Cx::optional`](crate::Cx::optional), which reuses one child
-    /// fiber per key for the activation). See [`Optional`].
+    /// Create the handle once and store or clone it: each call starts a new [`When<K>`] fiber
+    /// that lives until the owning activation ends or the last clone of the handle is dropped.
+    /// See [`Optional`].
     ///
     /// # Errors
     ///
