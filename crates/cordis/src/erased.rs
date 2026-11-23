@@ -19,8 +19,8 @@ pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 pub(crate) type Resolved = Vec<(KeyId, Erased)>;
 
 /// Configuration of a fiber: either a JSON value (for fibers inserted through [`App::insert`] or
-/// [`Loader`](crate::Loader)) or a typed Rust value (for fibers instantiated through
-/// [`Cx::plugin`], [`Scope::plugin`], or [`App::plugin`](crate::App::plugin)).
+/// [`Loader`](crate::Loader)) or a typed Rust value (for fibers instantiated through `plugin`,
+/// `when`, or `optional`).
 #[derive(Clone)]
 pub(crate) enum Config {
     Json(Value),

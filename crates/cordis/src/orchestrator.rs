@@ -165,8 +165,9 @@ impl App {
     /// Replaces a fiber's JSON configuration; an active fiber reloads, and its consumers with it.
     ///
     /// Applies to fibers inserted with [`insert`](App::insert) or by a [`Loader`](crate::Loader).
-    /// A fiber instantiated with a `plugin` method is updated through its [`Fiber`] handle; a JSON
-    /// update of one is ignored with a warning, and the fiber keeps running as it was.
+    /// A fiber instantiated with `plugin`, `when`, or `optional` uses typed configuration (updated
+    /// through its [`Fiber`] handle for `plugin`); a JSON update of one is ignored with a warning,
+    /// and the fiber keeps running as it was.
     pub fn update(&self, id: FiberId, config: Value) {
         self.send(Command::Update { id, config: Config::Json(config) });
     }
@@ -202,7 +203,8 @@ impl App {
     /// first polled. The future does not keep the app alive; once the app is dropped it returns
     /// `None`.
     ///
-    /// For host code. A component reads its providers through `cx.deps()`, which tracks them.
+    /// For host code. A component reads its providers through `cx.deps()` (or `cx.when()` /
+    /// `cx.optional()` for optional keys), which tracks them.
     pub fn get<K: Key + ?Sized>(&self) -> impl Future<Output = Option<Arc<K::Value>>> + Send + use<K> {
         self.get_in::<K>(&Realm::shared())
     }
@@ -664,7 +666,7 @@ impl Orchestrator {
                     if matches!(fiber.config, Config::Json(_)) != matches!(config, Config::Json(_)) {
                         tracing::warn!(
                             fiber = ?id,
-                            "ignored a JSON update of a fiber instantiated with `plugin`; update it through its `Fiber` handle"
+                            "ignored a JSON update of a typed fiber; update `plugin` fibers through their `Fiber` handle"
                         );
                         return;
                     }

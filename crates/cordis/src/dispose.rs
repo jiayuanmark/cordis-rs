@@ -94,7 +94,8 @@ const PRUNE_AT: usize = 32;
 /// fiber's instance.
 ///
 /// Every `Cx` of the run adds to it through an [`UndoHandle`]: [`Cx::on_dispose`](crate::Cx::on_dispose)
-/// entries, listeners registered with `cx.on`, and children instantiated with `cx.plugin`. The
+/// entries, listeners registered with `cx.on`, and children instantiated with `cx.plugin`,
+/// `cx.when`, or `cx.optional`. The
 /// runtime runs it once, when the run unloads, fails, or is cancelled, and closes it first. An
 /// entry added after that is undone at once, so nothing a run registers can outlive it.
 #[derive(Clone)]
