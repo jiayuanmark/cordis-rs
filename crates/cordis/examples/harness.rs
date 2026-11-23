@@ -1,14 +1,17 @@
 //! A miniature agent harness: an agent runs turns through a tool runtime, which reads a
-//! workspace and records to a session log. Independent components extend tool execution,
-//! session recording, and turn control through typed events, and configuration changes take
-//! effect without a restart, restarting exactly the components whose dependencies changed.
+//! workspace, records to a session log, and optionally emits telemetry to a metrics sink via
+//! `cx.optional`. The session log in turn registers a `session_stats` tool on the runtime via
+//! `cx.when`, breaking what would otherwise be a dependency cycle and surviving runtime reloads
+//! without restarting. Independent components extend tool execution, session recording, and turn
+//! control through typed events, and configuration changes take effect without a restart,
+//! restarting exactly the components whose dependencies changed.
 //!
 //! Run with `cargo run --example harness`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-use cordis::{App, Catalog, Component, Cx, Events, Flow, Loader, Result, component, event, key};
+use cordis::{App, Catalog, Component, Cx, Events, Flow, Guard, Loader, Optional, Result, component, event, key};
 use futures::future::BoxFuture;
 use serde::Deserialize;
 
@@ -63,11 +66,22 @@ pub trait Session: Send + Sync {
 }
 key!(dyn Session = "session");
 
+/// Handler for a dynamically registered tool.
+pub type ToolHandler = Arc<dyn Fn(&str) -> ToolResult + Send + Sync>;
+
 /// Runs tool calls, with every listener of [`ToolsExecute`] around each one.
 pub trait Tools: Send + Sync {
+    fn register(&self, name: &str, handler: ToolHandler) -> Guard;
     fn run(&self, call: ToolCall) -> BoxFuture<'static, ToolResult>;
 }
 key!(dyn Tools = "tools");
+
+/// Optional telemetry sink for counting tool calls and denials.
+pub trait Metrics: Send + Sync {
+    fn increment(&self, counter: &str);
+    fn snapshot(&self) -> Vec<(String, u64)>;
+}
+key!(dyn Metrics = "metrics");
 
 /// Drives a turn of tool calls until a listener of [`TurnStopping`] stops it.
 pub trait Agent: Send + Sync {
@@ -101,10 +115,14 @@ impl Component for MemoryWorkspace {
 }
 
 /// Keeps session events in memory and announces each one on the event bus.
+///
+/// `ToolRuntime` requires `dyn Session`, so `SessionLog` cannot depend on `dyn Tools` directly.
+/// Instead, it registers a `session_stats` tool via `cx.when::<dyn Tools>` whenever a tool
+/// runtime is active, and keeps its recorded events across runtime reloads.
 #[component(provides(dyn Session))]
 struct SessionLog {
     events: Events,
-    log: Mutex<Vec<Arc<SessionEvent>>>,
+    log: Arc<Mutex<Vec<Arc<SessionEvent>>>>,
 }
 
 impl Session for SessionLog {
@@ -121,7 +139,43 @@ impl Session for SessionLog {
 
 impl Component for SessionLog {
     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
-        Ok(Self { events: cx.events().clone(), log: Mutex::default() })
+        let log: Arc<Mutex<Vec<Arc<SessionEvent>>>> = Arc::default();
+        let stats = log.clone();
+        cx.when::<dyn Tools>(move |cx, tools| {
+            let stats = stats.clone();
+            async move {
+                let handler: ToolHandler = Arc::new(move |_| {
+                    let count = stats.lock().unwrap().len();
+                    ToolResult::Ok(format!("{count} recorded events"))
+                });
+                cx.on_dispose(tools.register("session_stats", handler));
+                Ok(())
+            }
+        })
+        .await?;
+        Ok(Self { events: cx.events().clone(), log })
+    }
+}
+
+/// Counts named events in memory. Optional: components use it if loaded and run without it if not.
+#[component(provides(dyn Metrics))]
+struct MetricsCollector {
+    counts: Mutex<BTreeMap<String, u64>>,
+}
+
+impl Metrics for MetricsCollector {
+    fn increment(&self, counter: &str) {
+        *self.counts.lock().unwrap().entry(counter.to_owned()).or_default() += 1;
+    }
+
+    fn snapshot(&self) -> Vec<(String, u64)> {
+        self.counts.lock().unwrap().iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
+}
+
+impl Component for MetricsCollector {
+    async fn activate(_: Cx<Self>, _: ()) -> Result<Self> {
+        Ok(Self { counts: Mutex::default() })
     }
 }
 
@@ -130,18 +184,37 @@ impl Component for SessionLog {
 #[component(deps(workspace: dyn Workspace, session: dyn Session), provides(dyn Tools))]
 struct ToolRuntime {
     cx: Cx<Self>,
+    handlers: Arc<Mutex<HashMap<String, ToolHandler>>>,
+    metrics: Optional<dyn Metrics>,
 }
 
 impl Tools for ToolRuntime {
+    fn register(&self, name: &str, handler: ToolHandler) -> Guard {
+        self.handlers.lock().unwrap().insert(name.to_owned(), handler);
+        let handlers = Arc::downgrade(&self.handlers);
+        let name = name.to_owned();
+        Guard::new(move || {
+            if let Some(handlers) = handlers.upgrade() {
+                handlers.lock().unwrap().remove(&name);
+            }
+        })
+    }
+
     fn run(&self, call: ToolCall) -> BoxFuture<'static, ToolResult> {
         let cx = self.cx.clone();
+        let handlers = self.handlers.clone();
+        let metrics = self.metrics.clone();
         Box::pin(async move {
             let deps = cx.deps();
+            let tool_name = call.tool.clone();
             deps.session.append(SessionEvent::ToolCall(call.clone()));
             let workspace = deps.workspace.clone();
             let result = cx
                 .events()
-                .waterfall::<ToolsExecute>(call, |call| async move {
+                .waterfall::<ToolsExecute>(call, move |call| async move {
+                    if let Some(handler) = handlers.lock().unwrap().get(&call.tool).cloned() {
+                        return handler(&call.input);
+                    }
                     match call.tool.as_str() {
                         "read" => match workspace.read(&call.input) {
                             Some(text) => ToolResult::Ok(text),
@@ -151,6 +224,12 @@ impl Tools for ToolRuntime {
                     }
                 })
                 .await;
+            if let Some(metrics) = metrics.get() {
+                metrics.increment(&format!("tool.{tool_name}"));
+                if matches!(result, ToolResult::Denied(_)) {
+                    metrics.increment("tool.denied");
+                }
+            }
             deps.session.append(SessionEvent::ToolResult(result.clone()));
             result
         })
@@ -159,7 +238,8 @@ impl Tools for ToolRuntime {
 
 impl Component for ToolRuntime {
     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
-        Ok(Self { cx })
+        let metrics = cx.optional::<dyn Metrics>().await?;
+        Ok(Self { cx, handlers: Arc::default(), metrics })
     }
 }
 
@@ -280,17 +360,29 @@ plugins:
   - { id: tools, use: tool-runtime }
   - { id: session, use: session-log }
   - { id: workspace, use: memory-workspace, config: { files: { src/main.rs: "fn main() {}" } } }
+  - { id: metrics, use: metrics-collector }
   - { id: approval, use: approval-policy, config: { deny: ["rm "] } }
   - { id: limit, use: output-limit, config: { max_chars: 24 } }
   - { id: transcript, use: transcript }
-  - { id: budget, use: step-budget, config: { max_steps: 3 } }
+  - { id: budget, use: step-budget, config: { max_steps: 4 } }
 "#;
 
 async fn turn(app: &App) {
-    let calls = [("bash", "ls -la"), ("bash", "rm -rf build"), ("read", "src/main.rs"), ("read", "README.md")];
+    let calls = [
+        ("bash", "ls -la"),
+        ("bash", "rm -rf build"),
+        ("read", "src/main.rs"),
+        ("session_stats", ""),
+        ("read", "README.md"),
+    ];
     let calls = calls.iter().map(|(tool, input)| ToolCall { tool: tool.to_string(), input: input.to_string() });
     let agent = app.get::<dyn Agent>().await.expect("the agent and everything it needs are active");
     agent.turn(calls.collect()).await;
+    if let Some(metrics) = app.get::<dyn Metrics>().await {
+        println!("metrics: {:?}", metrics.snapshot());
+    } else {
+        println!("metrics: disabled");
+    }
 }
 
 #[tokio::main]
@@ -302,6 +394,7 @@ async fn main() {
         .register::<ToolRuntime>("tool-runtime")
         .register::<SessionLog>("session-log")
         .register::<MemoryWorkspace>("memory-workspace")
+        .register::<MetricsCollector>("metrics-collector")
         .register::<ApprovalPolicy>("approval-policy")
         .register::<OutputLimit>("output-limit")
         .register::<Transcript>("transcript")
@@ -316,15 +409,18 @@ async fn main() {
     turn(&app).await;
 
     // The workspace's configuration changes, so it restarts. The tool runtime depends on it
-    // and the agent on the runtime, so both restart too. The session log does not, and keeps
-    // its events.
-    println!("\n== transcript and approval removed, budget raised, README added; no restart");
+    // and the agent on the runtime, so both restart too. The session log does not: it keeps
+    // its events, and its `cx.when::<dyn Tools>` child re-registers `session_stats` on the new
+    // runtime. Because `metrics` is optional, `ToolRuntime` still activates cleanly without it.
+    println!("\n== transcript, approval, and metrics removed, budget raised, README added; no restart");
     let patched = CONFIG
         .lines()
-        .filter(|line| !line.contains("id: transcript") && !line.contains("id: approval"))
+        .filter(|line| {
+            !line.contains("id: transcript") && !line.contains("id: approval") && !line.contains("id: metrics")
+        })
         .collect::<Vec<_>>()
         .join("\n")
-        .replace("max_steps: 3", "max_steps: 10")
+        .replace("max_steps: 4", "max_steps: 10")
         .replace(
             r#"src/main.rs: "fn main() {}""#,
             r#"src/main.rs: "fn main() {}", README.md: "A miniature agent harness built on cordis""#,
@@ -332,6 +428,20 @@ async fn main() {
     loader.apply_yaml(&patched).await.unwrap();
     app.settled().await;
     turn(&app).await;
+
+    // Re-adding `metrics` on its own does not restart `ToolRuntime`: its existing
+    // `Optional<dyn Metrics>` handle picks up the new provider live.
+    println!("\n== metrics re-added live");
+    let tools_before = app.get::<dyn Tools>().await.unwrap();
+    let with_metrics = format!("{patched}\n  - {{ id: metrics, use: metrics-collector }}");
+    loader.apply_yaml(&with_metrics).await.unwrap();
+    app.settled().await;
+    let tools_after = app.get::<dyn Tools>().await.unwrap();
+    println!("tool runtime kept same instance: {}", Arc::ptr_eq(&tools_before, &tools_after));
+    let result = tools_after.run(ToolCall { tool: "session_stats".into(), input: String::new() }).await;
+    println!("session_stats: {result:?}");
+    let metrics = app.get::<dyn Metrics>().await.unwrap();
+    println!("metrics: {:?}", metrics.snapshot());
 
     app.shutdown().await;
 }
