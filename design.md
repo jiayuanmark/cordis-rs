@@ -204,7 +204,7 @@ let result = cx.events().waterfall::<ToolsPreExecute>(call, |call| run_tool(call
 
 ## Isolation and interception
 
-Both adjust how keys resolve for part of the fiber tree without touching the shared table, so both are **derived contexts** (Def 23): `cx.isolate` and `cx.intercept` return a `Scope`, a new context that leaves the `Cx` it came from as it was. Dropping a scope has nothing to revert. Fibers instantiated through it, with `scope.plugin::<C>(config)`, run under it, and their own `Cx`, and so their children, inherit it. `App` offers the same three methods for root fibers.
+Both adjust how keys resolve for part of the fiber tree without touching the shared table, so both are **derived contexts** (Def 23): `cx.isolate` and `cx.intercept` return a `Scope`, a new context that leaves the `Cx` it came from as it was. Dropping a scope has nothing to revert. Fibers instantiated through it, with `scope.plugin::<C>(config)`, run under it, and their own `Cx`, and so their children, inherit it. `App` offers the same methods for root fibers.
 
 ```rust
 // A reviewer runs its own tool registry; the agent inside sees it, nothing outside does.
