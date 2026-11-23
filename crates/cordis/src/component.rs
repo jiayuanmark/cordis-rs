@@ -121,13 +121,14 @@ impl<C: Component> Cx<C> {
 
     /// Instantiates a child fiber of component `D` under this fiber, with `config`.
     ///
-    /// The child is an effect of this fiber's current activation: it joins the run's undo list
+    /// `config` is passed directly in memory (`D::Config: Clone + Sync`, no serialization). The
+    /// child is an effect of this fiber's current activation: it joins the run's undo list
     /// (see [`on_dispose`](Cx::on_dispose)), so the orchestrator retires it, in its place in the
     /// list, when that activation ends, whether the fiber unloads, its activation is cancelled,
     /// or it fails. Like a root fiber, the child activates once its own dependencies have providers
     /// and reloads when they change. The returned [`Fiber`] reads its status, updates its
-    /// configuration, or disposes of it early. The parent does not wait for its children to
-    /// finish unloading.
+    /// configuration with `D::Config`, or disposes of it early. The parent does not wait for its
+    /// children to finish unloading.
     ///
     /// ```
     /// use cordis::{Component, Cx, Result, component};

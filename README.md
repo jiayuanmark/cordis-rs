@@ -55,7 +55,7 @@ Implemented:
 - Typed events with `Emit`, `Bail`, `Parallel`, `Serial`, and `Waterfall` dispatch; listeners registered through `Cx` are removed when their fiber unloads or its activation is cancelled or fails.
 - Layered configuration: `Tree::layered` merges YAML layers by row id (override set fields, replace `config` whole, toggle `disabled`, append new rows).
 - A YAML loader that validates a whole tree (unknown components and invalid configuration are errors; missing providers and cycles are warnings) before reconciling it against what the app is running.
-- Child fibers instantiated through `cx.plugin`, retired with the activation that made them.
+- Child fibers instantiated through `cx.plugin` (passing typed `C::Config` in memory without serialization and returning a typed `Fiber<C>`), retired with the activation that made them.
 - Realms: `cx.isolate::<K>()` gives a subtree its own provider of `K`, in a fresh or named realm, and rows can name realms with `isolate`.
 - Interception: `cx.intercept::<K>(|v| ...)` hands consumers under the scope a remapped view of a provider, such as a read-only wrapper, leaving the shared provider untouched.
 

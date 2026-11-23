@@ -67,6 +67,10 @@ pub use component::{Component, Cx, Manifest};
 /// Generic types are supported; the generated impls carry the type's generics and `where`
 /// clause.
 ///
+/// - `config = Type` sets [`Manifest::Config`]. It needs only `Send + 'static` on [`Manifest`],
+///   `Clone + Sync` for in-memory instantiation with [`Cx::plugin`], [`Scope::plugin`], or
+///   [`App::plugin`], and `DeserializeOwned` to load from YAML or JSON with [`Catalog::register`]
+///   or [`App::insert`].
 /// - `deps(name: Key, ...)` generates `{Type}Deps`, a struct with one `pub name: Arc<Key::Value>`
 ///   field per entry and the visibility of the component type, and sets it as
 ///   [`Manifest::Deps`]. The orchestrator resolves it once before activation, and components read
