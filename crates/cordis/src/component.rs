@@ -537,7 +537,8 @@ impl<C: Component> Cx<C> {
     /// The run undoes its entries newest first, each finishing before the next starts, after
     /// every consumer of this fiber has finished its own teardown, so dependencies are still
     /// available. Listeners registered with [`on`](Cx::on) and children instantiated with
-    /// [`plugin`](Cx::plugin) join the same list in the order they are made.
+    /// [`plugin`](Cx::plugin), [`when`](Cx::when), or [`optional`](Cx::optional) join the same
+    /// list in the order they are made.
     ///
     /// Add each inverse right after the effect it undoes; the order then comes out right:
     ///

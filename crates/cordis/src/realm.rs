@@ -136,7 +136,8 @@ impl Env {
 ///
 /// [`isolate`](Scope::isolate) moves a key into another realm and
 /// [`intercept`](Scope::intercept) changes the value consumers of a key receive; each returns a new scope and
-/// leaves this one as it was. [`plugin`](Scope::plugin) instantiates a fiber under the scope.
+/// leaves this one as it was. [`plugin`](Scope::plugin), [`when`](Scope::when), and
+/// [`optional`](Scope::optional) instantiate fibers under the scope.
 /// That fiber's own context, and so its children's, inherits every adjustment.
 ///
 /// A scope is a derived context in the paper's sense (Def 23): it changes nothing shared, so

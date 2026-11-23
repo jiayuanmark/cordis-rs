@@ -19,7 +19,7 @@ A Rust realization of the context paradigm from *A Programming Paradigm for Spat
 | `crates/cordis/tests/lifecycle.rs` | Lifecycle behavior tests |
 | `crates/cordis/tests/dispose.rs` | Undo list tests: order, timing, panics |
 | `crates/cordis/tests/tree.rs` | Child fiber tests |
-| `crates/cordis/tests/when.rs` | Inline reactive hook (`Cx::when`) tests |
+| `crates/cordis/tests/when.rs` | Inline reactive hooks (`Cx::when`) and live optional handles (`Optional`) tests |
 | `crates/cordis/tests/component.rs` | `#[component]` on generic and plain types |
 | `crates/cordis/tests/events.rs` | Event bus behavior tests |
 | `crates/cordis/tests/layers.rs` | Layer merge tests |
