@@ -142,13 +142,15 @@ where
 /// A live handle to an optional provider of `K`, returned by [`Cx::optional`],
 /// [`Scope::optional`], or [`App::optional`](crate::App::optional).
 ///
-/// Backed by a [`When<K>`] child fiber: the handle updates as `K`'s provider activates, reloads,
-/// or unloads, without restarting the fiber that created it. Interception on `K` is applied once
-/// per activation of `K`'s provider, and the handle clears to `None` before `K`'s provider begins
-/// its own teardown (and when the owning activation ends).
+/// Backed by a [`When<K>`] fiber: the handle updates as `K`'s provider activates, reloads, or
+/// unloads, without restarting the fiber that created it. Interception on `K` is applied once per
+/// activation of `K`'s provider, and the handle clears to `None` before `K`'s provider begins its
+/// own teardown, when the owning activation ends, or when the last clone of this handle is
+/// dropped.
 ///
-/// Because the backing [`When<K>`] fiber activates asynchronously, [`get`](Optional::get) may
-/// return `None` immediately inside `activate` even if `K` is already active; use `Optional<K>`
+/// Create the handle once (typically in `activate`) and store it: each call to `optional` starts
+/// a backing [`When<K>`] fiber that activates asynchronously, so [`get`](Optional::get) may
+/// return `None` immediately inside `activate` even if `K` is already active. Use `Optional<K>`
 /// in methods called after activation, and [`Cx::when`] for setup effects that depend on `K`.
 ///
 /// ```
@@ -179,14 +181,26 @@ where
 ///     }
 /// }
 /// ```
+#[must_use = "dropping the last Optional handle retires its backing fiber"]
 pub struct Optional<K: Key + ?Sized> {
+    inner: Arc<OptionalInner>,
+    _key: PhantomData<fn() -> K>,
+}
+
+struct OptionalInner {
     slot: Arc<RwLock<Option<Erased>>>,
-    fiber: Fiber<When<K>>,
+    fiber: Fiber<()>,
+}
+
+impl Drop for OptionalInner {
+    fn drop(&mut self) {
+        self.fiber.dispose();
+    }
 }
 
 impl<K: Key + ?Sized> Clone for Optional<K> {
     fn clone(&self) -> Self {
-        Self { slot: self.slot.clone(), fiber: self.fiber.clone() }
+        Self { inner: self.inner.clone(), _key: PhantomData }
     }
 }
 
@@ -198,28 +212,26 @@ impl<K: Key + ?Sized> fmt::Debug for Optional<K> {
 
 impl<K: Key + ?Sized> Optional<K> {
     pub(crate) fn new(slot: Arc<RwLock<Option<Erased>>>, fiber: Fiber<When<K>>) -> Self {
-        Self { slot, fiber }
-    }
-
-    pub(crate) fn parts(&self) -> (Arc<RwLock<Option<Erased>>>, Fiber<When<K>>) {
-        (self.slot.clone(), self.fiber.clone())
+        Self { inner: Arc::new(OptionalInner { slot, fiber: fiber.erase() }), _key: PhantomData }
     }
 
     /// Returns the id of the backing [`When<K>`] fiber.
     pub fn id(&self) -> FiberId {
-        self.fiber.id()
+        self.inner.fiber.id()
     }
 
     /// Returns the active provider of `K` in this handle's realm, with any interception of `K`
     /// applied, or `None` when no provider of `K` is currently active there (or the handle has
     /// been disposed or its owning activation has ended).
     pub fn get(&self) -> Option<Arc<K::Value>> {
-        self.slot.read().expect("optional slot lock is never poisoned").as_ref().map(Erased::get::<K>)
+        self.inner.slot.read().expect("optional slot lock is never poisoned").as_ref().map(Erased::get::<K>)
     }
 
     /// Retires the backing [`When<K>`] fiber early, clearing this handle to `None`.
+    ///
+    /// Dropping the last clone of this handle also retires the backing fiber automatically.
     pub fn dispose(&self) {
-        self.fiber.dispose();
+        self.inner.fiber.dispose();
     }
 }
 
@@ -397,17 +409,16 @@ impl<C: Component> Cx<C> {
     /// on `K` applied once per activation of `K`'s provider) without restarting this fiber, and
     /// clears to `None` before `K`'s provider tears down or when this fiber's activation ends.
     ///
-    /// Create the handle once (typically in `activate`) and store it so the backing child fiber
-    /// is already running when methods call [`Optional::get`]. Repeated calls for the same `K`
-    /// within the same activation reuse that handle rather than spawning additional child fibers
-    /// (unless the handle was disposed with [`Optional::dispose`]). See [`Optional`].
+    /// Create the handle once (typically in `activate`) and store it: each call starts a new
+    /// backing [`When<K>`] child fiber that lives until this activation ends or the last clone of
+    /// the handle is dropped. See [`Optional`].
     ///
     /// # Errors
     ///
     /// Returns an error when this fiber is leaving or its activation has ended (see
     /// [`is_live`](Cx::is_live)), or when the app has stopped. In each case no child runs.
     pub fn optional<K: Key + ?Sized>(&self) -> impl Future<Output = Result<Optional<K>>> + Send + use<C, K> {
-        self.control.optional::<K>()
+        self.control.scope().optional::<K>()
     }
 
     /// Returns a scope where `K` resolves in a fresh realm, for children that share a private

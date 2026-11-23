@@ -430,38 +430,48 @@ impl Component for CacheProbe {
 }
 
 #[tokio::test]
-async fn cx_optional_reuses_one_child_fiber_per_key_for_an_activation() {
+async fn dropping_the_last_optional_handle_retires_its_backing_fiber() {
     let app = App::new();
+    let provider = app.insert::<Recorder>(json!({ "tag": "drop_opt", "name": "live" })).await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let owner = app.plugin::<CacheProbe>(CacheProbeConfig { tx }).await.unwrap();
+    let _owner = app.plugin::<CacheProbe>(CacheProbeConfig { tx }).await.unwrap();
     let cx = rx.recv().await.unwrap();
 
-    // Concurrent calls on the first access deduplicate to a single backing child fiber.
-    let (a, b) = tokio::join!(cx.optional::<dyn Metrics>(), cx.optional::<dyn Metrics>());
-    let a = a.unwrap();
-    let b = b.unwrap();
-    assert_eq!(a.id(), b.id());
-    assert_eq!(app.parent(a.id()).await, Some(owner.id()));
+    // Keeping a clone keeps the backing fiber alive; dropping the last clone retires it.
+    let first = cx.optional::<dyn Metrics>().await.unwrap();
+    let second = first.clone();
+    let backing = first.id();
+    app.settled().await;
+    assert_eq!(app.status(backing).await, Some(Status::Active));
+    assert_eq!(second.get().unwrap().name(), "live");
 
-    // Repeated sequential calls reuse the exact same child fiber.
+    drop(first);
+    app.settled().await;
+    assert_eq!(app.status(backing).await, Some(Status::Active));
+
+    drop(second);
+    app.settled().await;
+    assert_eq!(app.status(backing).await, None);
+    assert_eq!(app.status(provider).await, Some(Status::Active));
+
+    // Repeated throwaway calls do not leak child fibers.
+    let mut ids = Vec::with_capacity(100);
     for _ in 0..100 {
-        let next = cx.optional::<dyn Metrics>().await.unwrap();
-        assert_eq!(next.id(), a.id());
+        let handle = cx.optional::<dyn Metrics>().await.unwrap();
+        ids.push(handle.id());
+    }
+    app.settled().await;
+    for id in ids {
+        assert_eq!(app.status(id).await, None);
     }
 
-    // A derived scope's `optional` does not collide with `cx`'s own cached handle.
-    let isolated = cx.isolate::<dyn Metrics>().optional::<dyn Metrics>().await.unwrap();
-    assert_ne!(isolated.id(), a.id());
-
-    // Disposing the handle retires the backing fiber; a subsequent `cx.optional` starts a fresh one.
-    a.dispose();
+    // Root `app.optional` also retires its backing fiber automatically when dropped.
+    let root = app.optional::<dyn Metrics>().await.unwrap();
+    let root_id = root.id();
     app.settled().await;
-    assert_eq!(app.status(a.id()).await, None);
-    let fresh = cx.optional::<dyn Metrics>().await.unwrap();
-    assert_ne!(fresh.id(), a.id());
-
-    // After the owner unloads, a kept `Cx` cannot return a cached handle or start a new one.
-    owner.dispose();
+    assert_eq!(app.status(root_id).await, Some(Status::Active));
+    drop(root);
     app.settled().await;
-    assert!(cx.optional::<dyn Metrics>().await.is_err());
+    assert_eq!(app.status(root_id).await, None);
+    assert_eq!(app.status(provider).await, Some(Status::Active));
 }
