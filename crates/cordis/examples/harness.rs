@@ -1,8 +1,8 @@
 //! A miniature agent harness: an agent runs turns through a tool runtime, which reads a
 //! workspace, records to a session log, and optionally emits telemetry to a metrics sink via
 //! `cx.optional`. The session log in turn registers a `session_stats` tool on the runtime via
-//! `cx.when`, breaking what would otherwise be a dependency cycle and surviving runtime reloads
-//! without restarting. Independent components extend tool execution, session recording, and turn
+//! `cx.when`, since the log can't depend on the runtime that depends on it; the log keeps
+//! running, and its events, across runtime reloads. Independent components extend tool execution, session recording, and turn
 //! control through typed events, and configuration changes take effect without a restart,
 //! restarting exactly the components whose dependencies changed.
 //!
@@ -71,6 +71,9 @@ pub type ToolHandler = Arc<dyn Fn(&str) -> ToolResult + Send + Sync>;
 
 /// Runs tool calls, with every listener of [`ToolsExecute`] around each one.
 pub trait Tools: Send + Sync {
+    /// Registers a tool under `name`, replacing any tool of that name; dropping the guard
+    /// removes it. Names must be unique: if two components register the same name, the first
+    /// one's guard removes the second one's tool.
     fn register(&self, name: &str, handler: ToolHandler) -> Guard;
     fn run(&self, call: ToolCall) -> BoxFuture<'static, ToolResult>;
 }
@@ -116,9 +119,11 @@ impl Component for MemoryWorkspace {
 
 /// Keeps session events in memory and announces each one on the event bus.
 ///
-/// `ToolRuntime` requires `dyn Session`, so `SessionLog` cannot depend on `dyn Tools` directly.
-/// Instead, it registers a `session_stats` tool via `cx.when::<dyn Tools>` whenever a tool
-/// runtime is active, and keeps its recorded events across runtime reloads.
+/// The session log adds its own `session_stats` tool to the runtime. It can't list `dyn Tools`
+/// as a dependency, because `ToolRuntime` already depends on `dyn Session`. So it uses
+/// `cx.when::<dyn Tools>` instead: the tool is registered whenever a runtime is active,
+/// re-registered when the runtime restarts, and the log itself never restarts, so its events
+/// are kept.
 #[component(provides(dyn Session))]
 struct SessionLog {
     events: Events,
