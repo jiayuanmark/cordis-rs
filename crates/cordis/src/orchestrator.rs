@@ -1,6 +1,6 @@
 //! The orchestrator: one task that owns every fiber and applies lifecycle transitions.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -210,9 +210,9 @@ impl App {
         answer.await.expect("the orchestrator replies to every command")
     }
 
-    /// Returns the slots declared as provided by non-retired fibers (whether or not they are
-    /// active yet), excluding fibers under a retired ancestor.
-    pub(crate) async fn provided_slots(&self) -> HashSet<Slot> {
+    /// Returns the non-retired fibers (active or not) that declare each provided slot, excluding
+    /// fibers under a retired ancestor.
+    pub(crate) async fn provided_slots(&self) -> HashMap<Slot, Vec<FiberId>> {
         let (reply, answer) = oneshot::channel();
         self.send(Command::ProvidedSlots { reply });
         answer.await.expect("the orchestrator replies to every command")
@@ -314,7 +314,7 @@ pub(crate) enum Command {
         reply: oneshot::Sender<Option<Erased>>,
     },
     ProvidedSlots {
-        reply: oneshot::Sender<HashSet<Slot>>,
+        reply: oneshot::Sender<HashMap<Slot, Vec<FiberId>>>,
     },
     Settled {
         reply: oneshot::Sender<()>,
@@ -735,12 +735,14 @@ impl Orchestrator {
                 let _ = reply.send(self.table.get(&slot).map(|(_, value)| value.clone()));
             }
             Command::ProvidedSlots { reply } => {
-                let slots = self
-                    .fibers
-                    .iter()
-                    .filter(|(id, _)| self.is_not_retired(*id))
-                    .flat_map(|(_, fiber)| fiber.provides.iter().cloned())
-                    .collect();
+                let mut slots: HashMap<Slot, Vec<FiberId>> = HashMap::new();
+                for (id, fiber) in &self.fibers {
+                    if self.is_not_retired(id) {
+                        for slot in &fiber.provides {
+                            slots.entry(slot.clone()).or_default().push(id);
+                        }
+                    }
+                }
                 let _ = reply.send(slots);
             }
             Command::Settled { reply } => self.waiters.push(reply),
