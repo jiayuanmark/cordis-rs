@@ -232,6 +232,18 @@ pub enum LoadWarning {
         /// The realm the row's `isolate` names for the key, or `None` for the shared realm.
         realm: Option<String>,
     },
+    /// Multiple non-retired fibers declare the same key in the same realm, so only one can hold
+    /// the key at a time and the others wait inactive until it stops.
+    DuplicateProvider {
+        key: &'static str,
+        /// The realm the rows' `isolate` names for the key, or `None` for the shared realm.
+        realm: Option<String>,
+        /// Enabled rows in this tree that declare the key in that realm, in tree order.
+        rows: Vec<String>,
+        /// Whether at least one non-retired fiber outside this tree's rows also declares the key
+        /// in that realm (such as a host fiber or a child fiber).
+        external: bool,
+    },
     /// Enabled rows depend on each other in a cycle, so none of them activates unless
     /// something outside the cycle provides one of its keys.
     Cycle(Vec<String>),
@@ -246,6 +258,20 @@ impl fmt::Display for LoadWarning {
                     write!(f, " in realm `{realm}`")?;
                 }
                 write!(f, ", which no enabled row or external provider supplies there; it waits until one appears")
+            }
+            LoadWarning::DuplicateProvider { key, realm, rows, external } => {
+                write!(f, "key `{key}`")?;
+                if let Some(realm) = realm {
+                    write!(f, " in realm `{realm}`")?;
+                }
+                match (rows.as_slice(), *external) {
+                    ([row], true) => write!(f, " is provided by row `{row}` and an external provider"),
+                    (rows, true) => {
+                        write!(f, " is provided by multiple rows ({}) and an external provider", rows.join(", "))
+                    }
+                    (rows, false) => write!(f, " is provided by multiple rows ({})", rows.join(", ")),
+                }?;
+                write!(f, "; only one activates at a time")
             }
             LoadWarning::Cycle(rows) => write!(f, "dependency cycle: {}", rows.join(" -> ")),
         }
@@ -303,7 +329,8 @@ impl Loader {
     /// # Returns
     ///
     /// What the reconciled app leaves the tree's rows waiting on: keys not declared as provided
-    /// by any non-retired fiber in their resolved realm (active or not), and dependency cycles
+    /// by any non-retired fiber in their resolved realm (active or not), slots declared by
+    /// multiple non-retired providers (only one holds a slot at a time), and dependency cycles
     /// among the enabled rows (every cycle shares a row with a reported one). Each is also logged
     /// as a warning. The rows are mounted anyway, and a provider added later (or spawned as a
     /// child fiber during activation, which may not exist yet when this check runs) still
@@ -341,7 +368,7 @@ impl Loader {
             }
         }
         let provided = self.app.provided_slots().await;
-        let warnings = warnings(&rows, &provided);
+        let warnings = warnings(&rows, &self.mounted, &provided);
         for warning in &warnings {
             tracing::warn!("{warning}");
         }
@@ -386,12 +413,23 @@ impl Loader {
     }
 }
 
-/// Reports dependencies not in `provided`, and dependency cycles among `rows`.
-fn warnings(rows: &[Checked<'_>], provided: &HashSet<Slot>) -> Vec<LoadWarning> {
+/// Reports missing providers, duplicate providers, and dependency cycles among `rows` against
+/// `provided`.
+fn warnings(
+    rows: &[Checked<'_>],
+    mounted: &HashMap<String, Mounted>,
+    provided: &HashMap<Slot, Vec<FiberId>>,
+) -> Vec<LoadWarning> {
     let mut providers: HashMap<Slot, Vec<usize>> = HashMap::new();
-    for (index, (_, factory, env)) in rows.iter().enumerate() {
+    let mut provided_order: Vec<(Slot, &'static str, Option<String>)> = Vec::new();
+    for (index, (row, factory, env)) in rows.iter().enumerate() {
         for key in &factory.provides {
-            providers.entry(env.slot(*key)).or_default().push(index);
+            let slot = env.slot(*key);
+            let entry = providers.entry(slot.clone()).or_default();
+            if entry.is_empty() {
+                provided_order.push((slot, key.name(), row.isolate.get(key.name()).cloned()));
+            }
+            entry.push(index);
         }
     }
     let mut warnings = Vec::new();
@@ -403,7 +441,7 @@ fn warnings(rows: &[Checked<'_>], provided: &HashSet<Slot>) -> Vec<LoadWarning> 
             if let Some(provided_by) = providers.get(&slot) {
                 targets.extend(provided_by);
             }
-            if !provided.contains(&slot) {
+            if !provided.contains_key(&slot) {
                 warnings.push(LoadWarning::MissingProvider {
                     row: row.id.clone(),
                     key: key.name(),
@@ -412,6 +450,20 @@ fn warnings(rows: &[Checked<'_>], provided: &HashSet<Slot>) -> Vec<LoadWarning> 
             }
         }
         edges.push(targets);
+    }
+    for (slot, key, realm) in provided_order {
+        let row_indices = &providers[&slot];
+        let row_fibers: HashSet<FiberId> =
+            row_indices.iter().filter_map(|&index| mounted.get(&rows[index].0.id).map(|m| m.fiber)).collect();
+        let external = provided.get(&slot).is_some_and(|fibers| fibers.iter().any(|id| !row_fibers.contains(id)));
+        if row_indices.len() > 1 || external {
+            warnings.push(LoadWarning::DuplicateProvider {
+                key,
+                realm,
+                rows: row_indices.iter().map(|&index| rows[index].0.id.clone()).collect(),
+                external,
+            });
+        }
     }
     for cycle in find_cycles(&edges) {
         warnings.push(LoadWarning::Cycle(cycle.into_iter().map(|index| rows[index].0.id.clone()).collect()));

@@ -469,3 +469,138 @@ plugins:
 
     app.shutdown().await;
 }
+
+#[component(provides(dyn Tools))]
+struct YamlToolsProvider;
+
+impl Tools for YamlToolsProvider {
+    fn label(&self) -> String {
+        "yaml".into()
+    }
+}
+
+impl Component for YamlToolsProvider {
+    async fn activate(_: Cx<Self>, _: ()) -> Result<Self> {
+        Ok(Self)
+    }
+}
+
+#[tokio::test]
+async fn loader_warns_on_duplicate_providers_against_rows_and_external_fibers() {
+    let app = App::new();
+    let mut catalog = Catalog::new();
+    catalog.register::<YamlToolsProvider>("tools");
+    let mut loader = Loader::new(app.clone(), catalog);
+
+    let host_shared = app.provide::<dyn Tools>(Arc::new(SimpleTools::new("host"))).await.unwrap();
+    app.settled().await;
+
+    // Different realm: no conflict with the shared-realm host provider.
+    let warnings = loader
+        .apply_yaml(
+            r#"
+plugins:
+  - { id: t-sandbox, use: tools, isolate: { tools: sandbox } }
+"#,
+        )
+        .await
+        .unwrap();
+    assert!(warnings.is_empty());
+
+    // Host + one YAML row in the shared realm, and host + one YAML row in `sandbox`.
+    let host_sandbox = app
+        .isolate_in::<dyn Tools>(&Realm::named("sandbox"))
+        .provide::<dyn Tools>(Arc::new(SimpleTools::new("host-sandbox")))
+        .await
+        .unwrap();
+    let warnings = loader
+        .apply_yaml(
+            r#"
+plugins:
+  - { id: t1, use: tools }
+  - { id: t-sandbox, use: tools, isolate: { tools: sandbox } }
+"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        warnings,
+        [
+            LoadWarning::DuplicateProvider { key: "tools", realm: None, rows: vec!["t1".into()], external: true },
+            LoadWarning::DuplicateProvider {
+                key: "tools",
+                realm: Some("sandbox".into()),
+                rows: vec!["t-sandbox".into()],
+                external: true,
+            },
+        ]
+    );
+    assert!(warnings[0].to_string().contains("row `t1` and an external provider"));
+    assert!(warnings[1].to_string().contains("in realm `sandbox`"));
+    app.settled().await;
+    assert_eq!(app.status(loader.fiber("t1").unwrap()).await, Some(Status::Inactive));
+
+    // Host + two YAML rows in the shared realm.
+    host_sandbox.dispose();
+    let warnings = loader
+        .apply_yaml(
+            r#"
+plugins:
+  - { id: t1, use: tools }
+  - { id: t2, use: tools }
+"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        warnings,
+        [LoadWarning::DuplicateProvider {
+            key: "tools",
+            realm: None,
+            rows: vec!["t1".into(), "t2".into()],
+            external: true,
+        }]
+    );
+    assert!(warnings[0].to_string().contains("multiple rows (t1, t2) and an external provider"));
+
+    // Disposing the host provider leaves only the YAML-vs-YAML conflict, and `t1` takes over.
+    host_shared.dispose();
+    let warnings = loader
+        .apply_yaml(
+            r#"
+plugins:
+  - { id: t1, use: tools }
+  - { id: t2, use: tools }
+"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        warnings,
+        [LoadWarning::DuplicateProvider {
+            key: "tools",
+            realm: None,
+            rows: vec!["t1".into(), "t2".into()],
+            external: false,
+        }]
+    );
+    assert!(warnings[0].to_string().contains("multiple rows (t1, t2);"));
+    app.settled().await;
+    assert_eq!(app.status(loader.fiber("t1").unwrap()).await, Some(Status::Active));
+    assert_eq!(app.status(loader.fiber("t2").unwrap()).await, Some(Status::Inactive));
+
+    // Disabling the second row clears the warning completely.
+    let warnings = loader
+        .apply_yaml(
+            r#"
+plugins:
+  - { id: t1, use: tools }
+  - { id: t2, use: tools, disabled: true }
+"#,
+        )
+        .await
+        .unwrap();
+    assert!(warnings.is_empty());
+
+    app.shutdown().await;
+}
