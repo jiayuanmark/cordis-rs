@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use crate::dispose::{Undo, UndoHandle, panic_message};
 use crate::erased::{Config, Factory, Instance};
 use crate::realm::{Env, Slot};
-use crate::{Component, Dispose, Erased, Events, Key, KeyId, Optional, Realm, Scope, When, WhenAction};
+use crate::{Component, Dispose, Erased, Events, Key, KeyId, Optional, Provide, Realm, Scope, When, WhenAction};
 
 new_key_type! {
     /// Identity of a fiber: one configured instance of a component.
@@ -105,6 +105,25 @@ impl App {
         self.scope().plugin::<C>(config).await
     }
 
+    /// Instantiates a root [`Provide<K>`] fiber that publishes an existing `value` under key `K`
+    /// in the shared realm.
+    ///
+    /// Use this to supply host-created resources, trait objects, foreign types, or test doubles
+    /// without defining a wrapper [`Component`]. The returned [`Fiber`] can swap the value with
+    /// [`Fiber::update`] (reloading consumers against the new value) or withdraw it with
+    /// [`Fiber::dispose`]. To provide `K` in another realm, call [`Scope::provide`] on
+    /// [`isolate_in`](App::isolate_in). See [`Cx::provide`](crate::Cx::provide).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the app has stopped.
+    pub fn provide<K: Key + ?Sized>(
+        &self,
+        value: Arc<K::Value>,
+    ) -> impl Future<Output = crate::Result<Fiber<Provide<K>>>> + Send + use<K> {
+        self.scope().provide::<K>(value)
+    }
+
     pub(crate) async fn insert_factory(&self, factory: Arc<Factory>, config: Value, env: Env) -> FiberId {
         let (reply, answer) = oneshot::channel();
         self.send(Command::Insert { factory, config: Config::Json(config), env, parent: None, reply });
@@ -165,9 +184,9 @@ impl App {
     /// Replaces a fiber's JSON configuration; an active fiber reloads, and its consumers with it.
     ///
     /// Applies to fibers inserted with [`insert`](App::insert) or by a [`Loader`](crate::Loader).
-    /// A fiber instantiated with `plugin`, `when`, or `optional` uses typed configuration (updated
-    /// through its [`Fiber`] handle for `plugin`); a JSON update of one is ignored with a warning,
-    /// and the fiber keeps running as it was.
+    /// A fiber instantiated with `plugin`, `provide`, `when`, or `optional` uses typed
+    /// configuration (updated through its [`Fiber`] handle for `plugin` and `provide`); a JSON
+    /// update of one is ignored with a warning, and the fiber keeps running as it was.
     pub fn update(&self, id: FiberId, config: Value) {
         self.send(Command::Update { id, config: Config::Json(config) });
     }

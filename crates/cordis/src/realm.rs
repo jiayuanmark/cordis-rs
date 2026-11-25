@@ -10,7 +10,7 @@ use std::sync::{Arc, RwLock};
 use crate::component::WhenRun;
 use crate::erased::{Config, Erased, Factory};
 use crate::orchestrator::Spawner;
-use crate::{Component, Fiber, Guard, Key, KeyId, Optional, Result, When, WhenAction};
+use crate::{Component, Fiber, Guard, Key, KeyId, Optional, Provide, Result, When, WhenAction};
 
 /// A namespace of provisions.
 ///
@@ -136,8 +136,8 @@ impl Env {
 ///
 /// [`isolate`](Scope::isolate) moves a key into another realm and
 /// [`intercept`](Scope::intercept) changes the value consumers of a key receive; each returns a new scope and
-/// leaves this one as it was. [`plugin`](Scope::plugin), [`when`](Scope::when), and
-/// [`optional`](Scope::optional) instantiate fibers under the scope.
+/// leaves this one as it was. [`plugin`](Scope::plugin), [`provide`](Scope::provide),
+/// [`when`](Scope::when), and [`optional`](Scope::optional) instantiate fibers under the scope.
 /// That fiber's own context, and so its children's, inherits every adjustment.
 ///
 /// A scope is a derived context in the paper's sense (Def 23): it changes nothing shared, so
@@ -249,6 +249,31 @@ impl Scope {
     {
         let config = Config::Typed(Arc::new(config));
         self.spawner.insert(Arc::new(Factory::typed::<D>()), config, self.env.clone()).await
+    }
+
+    /// Instantiates a [`Provide<K>`] fiber under this scope that publishes an existing `value`
+    /// under key `K` in this scope's realm for `K`.
+    ///
+    /// Like [`plugin`](Scope::plugin), from a scope taken from a `Cx` the fiber is a child of that
+    /// fiber's current activation; from a scope taken from an `App` it is a root fiber. The
+    /// returned [`Fiber`] can replace the value with [`Fiber::update`] (reloading consumers) or
+    /// withdraw it with [`Fiber::dispose`]. See [`Cx::provide`](crate::Cx::provide).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fiber the scope was taken from can no longer instantiate
+    /// children, or when the app has stopped. In each case no fiber runs.
+    pub fn provide<K: Key + ?Sized>(
+        &self,
+        value: Arc<K::Value>,
+    ) -> impl Future<Output = Result<Fiber<Provide<K>>>> + Send + use<K> {
+        // Plain `fn` with `config` and `factory` built before `async move` so the returned future
+        // never holds `<dyn Trait as Key>::Value` across `.await` and stays unconditionally `Send`.
+        let spawner = self.spawner.clone();
+        let env = self.env.clone();
+        let config = Config::Typed(Arc::new(value));
+        let factory = Arc::new(Factory::typed::<Provide<K>>());
+        async move { spawner.insert(factory, config, env).await }
     }
 
     /// Instantiates a fiber under this scope that runs `run` whenever `K` has an active provider

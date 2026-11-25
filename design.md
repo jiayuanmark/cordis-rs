@@ -28,7 +28,7 @@ This document also describes parts that do not exist yet; each is marked *(plann
 | Accumulator φ | The undo list of the fiber run, held by the orchestrator |
 | Effect iterator and iteration boundaries, Def 17 | `async fn activate`, which always runs to its end: an `.await` can sit between an effect and its inverse, so the runtime never stops it there (an inertial host, §4.4). `cx.cancelled()` tells it to finish early |
 | Fiber and fiber tree, Defs 49 and 50 | One configured instance of a component, owned by the orchestrator; a child records the activation it was instantiated under |
-| Instantiation and retirement, Def 52 | `cx.plugin::<C>(config)` (and `cx.when::<K>`, `cx.optional::<K>()`); the orchestrator retires a child when its parent's activation ends (O-Retire) |
+| Instantiation and retirement, Def 52 | `cx.plugin::<C>(config)` (and `cx.provide::<K>`, `cx.when::<K>`, `cx.optional::<K>()`); the orchestrator retires a child when its parent's activation ends (O-Retire) |
 | Target view and committed view, Def 53 | `View`: the provider of each dependency key, as a fiber and one activation of it |
 | Satisfaction and `notify`, Def 22 | The orchestrator's settle step |
 | The "relied upon" guard, Def 54 | Per-fiber count of committed views that name the fiber |
@@ -125,7 +125,7 @@ async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
 ```
 
 - **One method, three kinds of inverse.** `cx.on_dispose(x)` takes anything implementing `Dispose`: a `Guard` (dropped), a Tokio `JoinHandle` (aborted, then awaited until the task has stopped, so everything it owned is dropped), or an async closure (called and awaited). A type with an async close can implement `Dispose` itself.
-- **Listeners and children join the same list.** `cx.on` adds its listener's guard and `cx.plugin`, `cx.when`, and `cx.optional` add the child's retirement, in the order they are made.
+- **Listeners and children join the same list.** `cx.on` adds its listener's guard and `cx.plugin`, `cx.provide`, `cx.when`, and `cx.optional` add the child's retirement, in the order they are made.
 - **Entries that end on their own are dropped early.** A finished task, or a child disposed through its handle, leaves the list (`Dispose::is_finished`), so a long-lived run that starts a task or a child per request doesn't accumulate them.
 - **Newest first, one at a time.** The list runs in reverse order of registration, the rule Rust uses for locals, and each undo finishes before the next starts. Adding each inverse right after its effect gives the right order (Theorem 16). A retired child is not waited for (O-Retire).
 - **On time, whoever holds the value.** The orchestrator runs the list when the fiber unloads, after its consumers have finished their own teardown and before its own providers are released, so dependencies are still readable inside an undo. A consumer or the host that kept the component value keeps only memory; see [Leaks](#leaks).
@@ -147,6 +147,7 @@ struct ToolRegistry { tools: Arc<Mutex<Vec<String>>> }
 impl Tools for ToolRegistry { fn register(&self, name: &str) -> Guard { /* ... */ } }
 ```
 
+- **Pre-existing in-memory values.** `app.provide::<K>(value)`, `scope.provide::<K>(value)`, and `cx.provide::<K>(value)` publish an existing `Arc<K::Value>` directly through a built-in `Provide<K>` fiber (`d = ∅`, `p = {K}`, `Config = Arc<K::Value>`). This handles host-supplied trait objects, scoped handles in isolated realms, test doubles, and concrete foreign types (such as a database pool) that cannot implement `Component`, while keeping every binding owned by an `Active` fiber (Eq. 46): `Fiber::update` swaps the value and reloads consumers, `Fiber::dispose` drains consumers first, and `cx.provide` retires with its parent activation.
 - **Versions.** Trait upcasting lets one provider serve several interface versions: with `trait ToolsV2: Tools`, the provider lists both `dyn ToolsV2` and `dyn Tools`.
 - **Cardinality.** A key has one provider at a time, counted from the start of its activation until its teardown has finished; a second provider waits and takes over once the first has fully stopped. A provider that reloads, for a configuration change or a replaced dependency, keeps the key. *(Planned)* A `many` key, where adding or removing a provider does not reload consumers, which observe a live set instead. This gives load balancing and rolling updates (paper §6.2).
 
@@ -205,7 +206,7 @@ let result = cx.events().waterfall::<ToolsPreExecute>(call, |call| run_tool(call
 
 ## Isolation and interception
 
-Both adjust how keys resolve for part of the fiber tree without touching the shared table, so both are **derived contexts** (Def 23): `cx.isolate` and `cx.intercept` return a `Scope`, a new context that leaves the `Cx` it came from as it was. Dropping a scope has nothing to revert. Fibers instantiated through it, with `scope.plugin::<C>(config)`, `scope.when::<K>(...)`, or `scope.optional::<K>()`, run under it, and their own `Cx`, and so their children, inherit it. `App` offers the same methods for root fibers.
+Both adjust how keys resolve for part of the fiber tree without touching the shared table, so both are **derived contexts** (Def 23): `cx.isolate` and `cx.intercept` return a `Scope`, a new context that leaves the `Cx` it came from as it was. Dropping a scope has nothing to revert. Fibers instantiated through it, with `scope.plugin::<C>(config)`, `scope.provide::<K>(value)`, `scope.when::<K>(...)`, or `scope.optional::<K>()`, run under it, and their own `Cx`, and so their children, inherit it. `App` offers the same methods for root fibers.
 
 ```rust
 // A reviewer runs its own tool registry; the agent inside sees it, nothing outside does.
@@ -323,13 +324,13 @@ Activation runs in dependency order, and independent branches activate concurren
 
 ### Fiber tree
 
-A component instantiates a child fiber with `cx.plugin::<C>(config)` (or an inline `When<K>` child fiber with `cx.when::<K>` / `cx.optional::<K>()`), from `activate` or from any method of a value that keeps its `Cx`. The child is an effect of the parent's current activation:
+A component instantiates a child fiber with `cx.plugin::<C>(config)` (or a `Provide<K>` / `When<K>` child fiber with `cx.provide::<K>` / `cx.when::<K>` / `cx.optional::<K>()`), from `activate` or from any method of a value that keeps its `Cx`. The child is an effect of the parent's current activation:
 
 - **The orchestrator owns the link.** Each fiber records the activation it was instantiated under (`parent: Option<Owner>`, an id plus the activation token). The parent's `Cx` carries a weak sender to the orchestrator, so a kept `Cx` never keeps the orchestrator alive.
 - **Retirement follows the parent's activation.** The child is an entry in the parent's undo list, so it is retired in its place when that list runs: when the activation is cancelled, fails, or unloads. Once the list has run, the orchestrator retires any child still left. A reload is an unload and a fresh activation, so a reloaded parent gets fresh children.
 - **The parent does not wait.** As in the paper's O-Retire, retirement is unconditional, and a parent may finish unloading while a child is still unloading (§4.2.1). Children do not count toward the parent's "relied upon" guard.
 - **A child is an ordinary fiber otherwise.** It activates when its own dependencies have providers and reloads when they change. Its configuration is the component's own `C::Config` value, passed in memory and cloned for each activation, so it can hold channels or `Arc<dyn Trait>` and needs no serde; only rows loaded from YAML or JSON (`Catalog::register`, `App::insert`) require `DeserializeOwned`. `plugin` returns a typed `Fiber<C>` handle with `status`, `update` (which takes `C::Config`, so a wrong type does not compile), and `dispose`, so a parent can retire a child early, such as an agent that finished its task. Like a TS fiber, `Fiber<C>` is a view: dropping it changes nothing. (`Optional<K>`, by contrast, owns its `When<K>` watcher handle and retires it automatically when the last clone drops.) `App::parent` reports the link.
-- **Late requests are refused.** A fiber that is leaving or whose activation has ended gets an error from `plugin`, `when`, or `optional`; in the paper's `Unloading` state a fiber performs no more effects. The orchestrator makes the check, so a race cannot leave an orphan.
+- **Late requests are refused.** A fiber that is leaving or whose activation has ended gets an error from `plugin`, `provide`, `when`, or `optional`; in the paper's `Unloading` state a fiber performs no more effects. The orchestrator makes the check, so a race cannot leave an orphan.
 
 ### Leaks
 
