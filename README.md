@@ -9,7 +9,7 @@ A Rust realization of the context paradigm from *A Programming Paradigm for Spat
 | `crates/cordis/src/key.rs` | `Key`, `KeyId`, `key!` |
 | `crates/cordis/src/guard.rs` | `Guard` |
 | `crates/cordis/src/dispose.rs` | `Dispose` and the undo list of a fiber run |
-| `crates/cordis/src/component.rs` | `Manifest`, `Component`, `Cx`, `Optional`, `When` |
+| `crates/cordis/src/component.rs` | `Manifest`, `Component`, `Cx`, `Optional`, `Provide`, `When` |
 | `crates/cordis-macros/src/lib.rs` | The `#[component]` attribute, re-exported as `cordis::component` |
 | `crates/cordis/src/events.rs` | `Event`, `Events`, the five dispatch modes, `event!` |
 | `crates/cordis/src/erased.rs` | Type-erased values and component operations |
@@ -19,6 +19,7 @@ A Rust realization of the context paradigm from *A Programming Paradigm for Spat
 | `crates/cordis/tests/lifecycle.rs` | Lifecycle behavior tests |
 | `crates/cordis/tests/dispose.rs` | Undo list tests: order, timing, panics |
 | `crates/cordis/tests/tree.rs` | Child fiber tests |
+| `crates/cordis/tests/provide.rs` | Direct in-memory value provision (`Provide`, `provide`) tests |
 | `crates/cordis/tests/when.rs` | Inline reactive hooks (`Cx::when`) and live optional handles (`Optional`) tests |
 | `crates/cordis/tests/component.rs` | `#[component]` on generic and plain types |
 | `crates/cordis/tests/events.rs` | Event bus behavior tests |
@@ -56,7 +57,7 @@ Implemented:
 - Typed events with `Emit`, `Bail`, `Parallel`, `Serial`, and `Waterfall` dispatch; listeners registered through `Cx` are removed when their fiber unloads or its activation is cancelled or fails.
 - Layered configuration: `Tree::layered` merges YAML layers by row id (override set fields, replace `config` whole, toggle `disabled`, append new rows).
 - A YAML loader that validates a whole tree (unknown components and invalid configuration are errors; missing providers and cycles are warnings) before reconciling it against what the app is running.
-- Child fibers instantiated through `cx.plugin` (passing typed `C::Config` in memory without serialization and returning a typed `Fiber<C>`), inline reactive hooks through `cx.when::<K>(|cx, provider| ...)`, and live optional handles through `cx.optional::<K>()`, retired with the activation that made them (or when the last `Optional<K>` clone drops).
+- Child fibers instantiated through `cx.plugin` (passing typed `C::Config` in memory without serialization and returning a typed `Fiber<C>`), direct in-memory service provision through `provide::<K>(value)` (`Provide<K>`, on `App`, `Scope`, and `Cx`), inline reactive hooks through `cx.when::<K>(|cx, provider| ...)`, and live optional handles through `cx.optional::<K>()`, retired with the activation that made them (or when the last `Optional<K>` clone drops).
 - Realms: `cx.isolate::<K>()` gives a subtree its own provider of `K`, in a fresh or named realm, and rows can name realms with `isolate`.
 - Interception: `cx.intercept::<K>(|v| ...)` hands consumers under the scope a remapped view of a provider, such as a read-only wrapper, leaving the shared provider untouched.
 

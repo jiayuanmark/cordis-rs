@@ -62,6 +62,47 @@ pub trait Component: Manifest + Send + Sync {
     fn activate(cx: Cx<Self>, config: Self::Config) -> impl Future<Output = Result<Self>> + Send;
 }
 
+/// The component type of a fiber instantiated by [`Cx::provide`], [`Scope::provide`], or
+/// [`App::provide`](crate::App::provide).
+///
+/// Publishes an existing `Arc<K::Value>` under key `K` without needing a wrapper [`Component`]
+/// type. It works for both trait-object keys (`dyn Trait`) and concrete or foreign types where
+/// implementing [`Component`] directly is impossible or boilerplate.
+///
+/// It is an ordinary component with no dependencies (`d = ∅`), providing `K` (`p = {K}`), whose
+/// configuration is the `Arc<K::Value>`. Calling [`Fiber::update`] replaces the value and reloads
+/// consumers against the new one; calling [`Fiber::dispose`] (or unloading the parent activation)
+/// tears down consumers first before withdrawing the binding.
+pub struct Provide<K: Key + ?Sized> {
+    value: Erased,
+    _key: PhantomData<fn() -> K>,
+}
+
+impl<K: Key + ?Sized> Manifest for Provide<K> {
+    type Config = Arc<K::Value>;
+    type Deps = ();
+
+    fn deps() -> Vec<KeyId> {
+        Vec::new()
+    }
+
+    fn provides() -> Vec<KeyId> {
+        vec![KeyId::of::<K>()]
+    }
+
+    fn resolve(_: &Resolve<'_>) -> Self::Deps {}
+
+    fn publish(component: &Arc<Self>) -> Vec<(KeyId, Erased)> {
+        vec![(KeyId::of::<K>(), component.value.clone())]
+    }
+}
+
+impl<K: Key + ?Sized> Component for Provide<K> {
+    async fn activate(_: Cx<Self>, value: Arc<K::Value>) -> Result<Self> {
+        Ok(Self { value: Erased::new::<K>(value), _key: PhantomData })
+    }
+}
+
 /// The component type of a fiber instantiated by [`Cx::when`], [`Scope::when`], or
 /// [`App::when`](crate::App::when).
 ///
@@ -348,6 +389,59 @@ impl<C: Component> Cx<C> {
         D::Config: Clone + Sync,
     {
         self.control.scope().plugin::<D>(config).await
+    }
+
+    /// Instantiates a child fiber under this fiber that publishes an existing `value` under key
+    /// `K`.
+    ///
+    /// Use this when you already have an `Arc<K::Value>` in memory (such as a trait object built
+    /// dynamically, a scoped handle for an isolated realm, or a foreign type that cannot implement
+    /// [`Component`]) and want other components to consume it through `deps`, [`Cx::when`], or
+    /// [`Cx::optional`]. For a service that depends on other keys or needs its own
+    /// [`on_dispose`](Cx::on_dispose) teardown, write a [`Component`] instead.
+    ///
+    /// The returned [`Fiber`] can replace the value with [`Fiber::update`] (reloading consumers
+    /// against the new value) or withdraw it early with [`Fiber::dispose`]; otherwise it is
+    /// retired automatically when this fiber's activation ends.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use cordis::{Component, Cx, Result, component, key};
+    ///
+    /// pub trait Tools: Send + Sync {
+    ///     fn label(&self) -> &str;
+    /// }
+    /// key!(dyn Tools = "tools");
+    ///
+    /// struct ScopedTools(&'static str);
+    /// impl Tools for ScopedTools {
+    ///     fn label(&self) -> &str {
+    ///         self.0
+    ///     }
+    /// }
+    ///
+    /// #[component]
+    /// struct Coordinator;
+    ///
+    /// impl Component for Coordinator {
+    ///     async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+    ///         let sub = cx.isolate::<dyn Tools>();
+    ///         sub.provide::<dyn Tools>(Arc::new(ScopedTools("subagent"))).await?;
+    ///         Ok(Coordinator)
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this fiber is leaving or its activation has ended (see
+    /// [`is_live`](Cx::is_live)), or when the app has stopped. In each case no child runs.
+    pub fn provide<K: Key + ?Sized>(
+        &self,
+        value: Arc<K::Value>,
+    ) -> impl Future<Output = Result<Fiber<Provide<K>>>> + Send + use<C, K> {
+        self.control.scope().provide::<K>(value)
     }
 
     /// Instantiates a child fiber under this fiber that runs `run` whenever `K` has an active
