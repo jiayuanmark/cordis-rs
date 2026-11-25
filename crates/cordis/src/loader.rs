@@ -219,10 +219,13 @@ pub enum LoadError {
 /// waits for a provider that isn't there yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoadWarning {
-    /// A row depends on a key that no live provider on the [`App`] supplies in the realm the row
-    /// resolves it in (neither an enabled row in the tree nor an external provider such as a host
-    /// fiber). The row still activates if something provides the key there later (such as a fiber
-    /// inserted afterwards or a child fiber of another row).
+    /// A row depends on a key that no non-retired fiber on the [`App`] declares as provided in
+    /// the realm the row resolves it in—whether or not such a provider is active yet (covering
+    /// both enabled rows in the tree and external fibers such as host-provided services). The row
+    /// still activates if something provides the key there later (such as a fiber inserted
+    /// afterwards or a child fiber spawned during another row's activation; a child provider is
+    /// only seen if it already exists when [`Loader::apply`] checks, so warnings for child-provided
+    /// keys may or may not appear on the first apply).
     MissingProvider {
         row: String,
         key: &'static str,
@@ -299,10 +302,12 @@ impl Loader {
     ///
     /// # Returns
     ///
-    /// What the reconciled app leaves the tree's rows waiting on: keys with no live provider in
-    /// their resolved realm, and dependency cycles among the enabled rows (every cycle shares a
-    /// row with a reported one). Each is also logged as a warning. The rows are mounted anyway,
-    /// and a provider added later (or by a child fiber) still satisfies them.
+    /// What the reconciled app leaves the tree's rows waiting on: keys not declared as provided
+    /// by any non-retired fiber in their resolved realm (active or not), and dependency cycles
+    /// among the enabled rows (every cycle shares a row with a reported one). Each is also logged
+    /// as a warning. The rows are mounted anyway, and a provider added later (or spawned as a
+    /// child fiber during activation, which may not exist yet when this check runs) still
+    /// satisfies them.
     ///
     /// # Errors
     ///
@@ -381,7 +386,7 @@ impl Loader {
     }
 }
 
-/// Reports dependencies with no live provider in `provided`, and dependency cycles among `rows`.
+/// Reports dependencies not in `provided`, and dependency cycles among `rows`.
 fn warnings(rows: &[Checked<'_>], provided: &HashSet<Slot>) -> Vec<LoadWarning> {
     let mut providers: HashMap<Slot, Vec<usize>> = HashMap::new();
     for (index, (_, factory, env)) in rows.iter().enumerate() {

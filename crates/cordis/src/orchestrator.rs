@@ -210,7 +210,8 @@ impl App {
         answer.await.expect("the orchestrator replies to every command")
     }
 
-    /// Returns the slots declared as provided by live (non-retired) fibers.
+    /// Returns the slots declared as provided by non-retired fibers (whether or not they are
+    /// active yet), excluding fibers under a retired ancestor.
     pub(crate) async fn provided_slots(&self) -> HashSet<Slot> {
         let (reply, answer) = oneshot::channel();
         self.send(Command::ProvidedSlots { reply });
@@ -737,7 +738,7 @@ impl Orchestrator {
                 let slots = self
                     .fibers
                     .iter()
-                    .filter(|(id, _)| self.is_live_fiber(*id))
+                    .filter(|(id, _)| self.is_not_retired(*id))
                     .flat_map(|(_, fiber)| fiber.provides.iter().cloned())
                     .collect();
                 let _ = reply.send(slots);
@@ -746,8 +747,8 @@ impl Orchestrator {
         }
     }
 
-    /// Whether `id` and every ancestor up to its root are live (not retired).
-    fn is_live_fiber(&self, mut id: FiberId) -> bool {
+    /// Whether `id` and every ancestor up to its root are not retired (active or not).
+    fn is_not_retired(&self, mut id: FiberId) -> bool {
         while let Some(fiber) = self.fibers.get(id) {
             if fiber.retired {
                 return false;
