@@ -535,7 +535,7 @@ plugins:
             },
         ]
     );
-    assert!(warnings[0].to_string().contains("row `t1` and an external provider"));
+    assert!(warnings[0].to_string().contains("row `t1` and another fiber (host or a row's child)"));
     assert!(warnings[1].to_string().contains("in realm `sandbox`"));
     app.settled().await;
     assert_eq!(app.status(loader.fiber("t1").unwrap()).await, Some(Status::Inactive));
@@ -561,7 +561,7 @@ plugins:
             external: true,
         }]
     );
-    assert!(warnings[0].to_string().contains("multiple rows (t1, t2) and an external provider"));
+    assert!(warnings[0].to_string().contains("multiple rows (t1, t2) and another fiber (host or a row's child)"));
 
     // Disposing the host provider leaves only the YAML-vs-YAML conflict, and `t1` takes over.
     host_shared.dispose();
