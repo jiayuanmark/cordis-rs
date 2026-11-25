@@ -2,7 +2,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use cordis::{App, Catalog, Component, Cx, Guard, Key, Loader, Provide, Result, Status, component, key};
+use cordis::{
+    App, Catalog, Component, Cx, Guard, Key, LoadWarning, Loader, Provide, Realm, Result, Status, component, key,
+};
 use serde::Deserialize;
 
 type Log = Arc<Mutex<Vec<String>>>;
@@ -132,11 +134,11 @@ async fn app_provide_publishes_trait_objects_foreign_types_and_feeds_yaml_rows()
     assert_eq!(app.get::<dyn Tools>().await.unwrap().label(), "host");
     assert_eq!(app.get::<DbPool>().await.unwrap().max_conns, 8);
 
-    // YAML-loaded rows consume host-provided values seamlessly.
+    // YAML-loaded rows consume host-provided values seamlessly, without false MissingProvider warnings.
     let mut catalog = Catalog::new();
     catalog.register::<YamlConsumer>("yaml-consumer");
     let mut loader = Loader::new(app.clone(), catalog);
-    loader
+    let warnings = loader
         .apply_yaml(
             r#"
 plugins:
@@ -145,6 +147,7 @@ plugins:
         )
         .await
         .unwrap();
+    assert!(warnings.is_empty());
     app.settled().await;
     assert_eq!(app.status(loader.fiber("c").unwrap()).await, Some(Status::Active));
 
@@ -341,6 +344,128 @@ async fn provide_works_with_when_and_optional() {
     app.settled().await;
     assert!(opt.get().is_none());
     assert_eq!(entries(&log), vec!["+when(a)", "-when(a)", "+when(b)", "-when(b)"]);
+
+    app.shutdown().await;
+}
+
+#[component(deps(tools: dyn Tools))]
+struct SimpleYamlToolsConsumer;
+
+impl Component for SimpleYamlToolsConsumer {
+    async fn activate(_: Cx<Self>, _: ()) -> Result<Self> {
+        Ok(Self)
+    }
+}
+
+#[component]
+struct YamlParentProvidingTools;
+
+impl Component for YamlParentProvidingTools {
+    async fn activate(cx: Cx<Self>, _: ()) -> Result<Self> {
+        cx.provide::<dyn Tools>(Arc::new(SimpleTools::new("from-yaml-child"))).await?;
+        Ok(Self)
+    }
+}
+
+#[tokio::test]
+async fn loader_treats_live_external_providers_as_satisfied_per_realm() {
+    let app = App::new();
+    let mut catalog = Catalog::new();
+    catalog.register::<SimpleYamlToolsConsumer>("consumer").register::<YamlParentProvidingTools>("yaml-parent");
+    let mut loader = Loader::new(app.clone(), catalog);
+
+    // Host provides `dyn Tools` only in realm `sandbox` (and we do not even await `settled` first).
+    let sandbox_provider = app
+        .isolate_in::<dyn Tools>(&Realm::named("sandbox"))
+        .provide::<dyn Tools>(Arc::new(SimpleTools::new("sandbox")))
+        .await
+        .unwrap();
+
+    let warnings = loader
+        .apply_yaml(
+            r#"
+plugins:
+  - { id: in-sandbox, use: consumer, isolate: { tools: sandbox } }
+  - { id: in-shared, use: consumer }
+  - { id: in-other, use: consumer, isolate: { tools: other } }
+"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        warnings,
+        [
+            LoadWarning::MissingProvider { row: "in-shared".into(), key: "tools", realm: None },
+            LoadWarning::MissingProvider { row: "in-other".into(), key: "tools", realm: Some("other".into()) },
+        ]
+    );
+    app.settled().await;
+    assert_eq!(app.status(loader.fiber("in-sandbox").unwrap()).await, Some(Status::Active));
+    assert_eq!(app.status(loader.fiber("in-shared").unwrap()).await, Some(Status::Inactive));
+
+    // A child fiber under a host-inserted parent also counts as an external provider.
+    let log: Log = Arc::default();
+    let host_parent = app.plugin::<ParentProvider>(log).await.unwrap();
+    app.settled().await;
+    let warnings = loader
+        .apply_yaml(
+            r#"
+plugins:
+  - { id: in-sandbox, use: consumer, isolate: { tools: sandbox } }
+  - { id: in-shared, use: consumer }
+"#,
+        )
+        .await
+        .unwrap();
+    assert!(warnings.is_empty());
+
+    // Disposing external providers immediately makes them stop counting (even before `settled`).
+    sandbox_provider.dispose();
+    host_parent.dispose();
+    let warnings = loader
+        .apply_yaml(
+            r#"
+plugins:
+  - { id: in-sandbox, use: consumer, isolate: { tools: sandbox } }
+  - { id: in-shared, use: consumer }
+"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        warnings,
+        [
+            LoadWarning::MissingProvider { row: "in-sandbox".into(), key: "tools", realm: Some("sandbox".into()) },
+            LoadWarning::MissingProvider { row: "in-shared".into(), key: "tools", realm: None },
+        ]
+    );
+    app.settled().await;
+
+    // Removing a loader-mounted row retires it, so its child fiber no longer counts as a live
+    // provider and `MissingProvider` is reported.
+    loader
+        .apply_yaml(
+            r#"
+plugins:
+  - { id: p, use: yaml-parent }
+  - { id: c, use: consumer }
+"#,
+        )
+        .await
+        .unwrap();
+    app.settled().await;
+    assert_eq!(app.status(loader.fiber("c").unwrap()).await, Some(Status::Active));
+
+    let warnings = loader
+        .apply_yaml(
+            r#"
+plugins:
+  - { id: c, use: consumer }
+"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(warnings, [LoadWarning::MissingProvider { row: "c".into(), key: "tools", realm: None }]);
 
     app.shutdown().await;
 }
