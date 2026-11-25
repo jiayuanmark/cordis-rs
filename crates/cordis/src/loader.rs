@@ -241,7 +241,9 @@ pub enum LoadWarning {
         /// Enabled rows in this tree that declare the key in that realm, in tree order.
         rows: Vec<String>,
         /// Whether at least one non-retired fiber outside this tree's rows also declares the key
-        /// in that realm (such as a host fiber or a child fiber).
+        /// in that realm (such as a host fiber or a child fiber spawned during activation; a
+        /// child provider is only seen if it already exists when [`Loader::apply`] checks, so
+        /// warnings for child-provided conflicts may or may not appear on the first apply).
         external: bool,
     },
     /// Enabled rows depend on each other in a cycle, so none of them activates unless
@@ -265,10 +267,12 @@ impl fmt::Display for LoadWarning {
                     write!(f, " in realm `{realm}`")?;
                 }
                 match (rows.as_slice(), *external) {
-                    ([row], true) => write!(f, " is provided by row `{row}` and an external provider"),
-                    (rows, true) => {
-                        write!(f, " is provided by multiple rows ({}) and an external provider", rows.join(", "))
-                    }
+                    ([row], true) => write!(f, " is provided by row `{row}` and another fiber (host or a row's child)"),
+                    (rows, true) => write!(
+                        f,
+                        " is provided by multiple rows ({}) and another fiber (host or a row's child)",
+                        rows.join(", ")
+                    ),
                     (rows, false) => write!(f, " is provided by multiple rows ({})", rows.join(", ")),
                 }?;
                 write!(f, "; only one activates at a time")
