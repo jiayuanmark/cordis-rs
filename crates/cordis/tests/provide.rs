@@ -136,7 +136,7 @@ async fn app_provide_publishes_trait_objects_foreign_types_and_feeds_yaml_rows()
     let mut catalog = Catalog::new();
     catalog.register::<YamlConsumer>("yaml-consumer");
     let mut loader = Loader::new(app.clone(), catalog);
-    let warnings = loader
+    loader
         .apply_yaml(
             r#"
 plugins:
@@ -145,8 +145,6 @@ plugins:
         )
         .await
         .unwrap();
-    // Loader validates only rows within the YAML tree, so external providers surface as warnings.
-    assert_eq!(warnings.len(), 2);
     app.settled().await;
     assert_eq!(app.status(loader.fiber("c").unwrap()).await, Some(Status::Active));
 

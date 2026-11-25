@@ -73,6 +73,10 @@ pub trait Component: Manifest + Send + Sync {
 /// configuration is the `Arc<K::Value>`. Calling [`Fiber::update`] replaces the value and reloads
 /// consumers against the new one; calling [`Fiber::dispose`] (or unloading the parent activation)
 /// tears down consumers first before withdrawing the binding.
+///
+/// Instantiate it with [`App::provide`](crate::App::provide), [`Scope::provide`], or
+/// [`Cx::provide`], not `plugin`: `plugin::<Provide<dyn Trait>>` is not `Send` inside
+/// [`Component::activate`].
 pub struct Provide<K: Key + ?Sized> {
     value: Erased,
     _key: PhantomData<fn() -> K>,
