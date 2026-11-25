@@ -212,7 +212,9 @@ impl Tools for ToolRuntime {
             let result = cx
                 .events()
                 .waterfall::<ToolsExecute>(call, move |call| async move {
-                    if let Some(handler) = handlers.lock().unwrap().get(&call.tool).cloned() {
+                    // Release the lock before calling the handler, so a handler may register tools.
+                    let handler = handlers.lock().unwrap().get(&call.tool).cloned();
+                    if let Some(handler) = handler {
                         return handler(&call.input);
                     }
                     match call.tool.as_str() {
