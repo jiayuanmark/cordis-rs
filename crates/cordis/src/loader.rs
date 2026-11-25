@@ -214,14 +214,15 @@ pub enum LoadError {
     UnknownKey { row: String, key: String },
 }
 
-/// Something an applied tree leaves its rows waiting on, unless a provider outside the tree fills
-/// the gap. The tree is applied anyway: the rows' fibers wait, as any fiber waits for a provider
-/// that isn't there yet.
+/// Something an applied tree leaves its rows waiting on, unless a provider inserted later or a
+/// child fiber fills the gap. The tree is applied anyway: the rows' fibers wait, as any fiber
+/// waits for a provider that isn't there yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoadWarning {
-    /// A row depends on a key that no enabled row provides in the realm the row resolves it in.
-    /// The check reads the tree only: the row still activates if something else provides the
-    /// key there, such as a fiber the host inserts or a child fiber of another row.
+    /// A row depends on a key that no live provider on the [`App`] supplies in the realm the row
+    /// resolves it in (neither an enabled row in the tree nor an external provider such as a host
+    /// fiber). The row still activates if something provides the key there later (such as a fiber
+    /// inserted afterwards or a child fiber of another row).
     MissingProvider {
         row: String,
         key: &'static str,
@@ -241,7 +242,7 @@ impl fmt::Display for LoadWarning {
                 if let Some(realm) = realm {
                     write!(f, " in realm `{realm}`")?;
                 }
-                write!(f, ", which no enabled row provides there; it waits unless something outside the tree does")
+                write!(f, ", which no enabled row or external provider supplies there; it waits until one appears")
             }
             LoadWarning::Cycle(rows) => write!(f, "dependency cycle: {}", rows.join(" -> ")),
         }
@@ -294,23 +295,20 @@ impl Loader {
         self.apply(&tree).await
     }
 
-    /// Validates `tree`, then reconciles the app against it.
+    /// Validates `tree`, reconciles the app against it, and reports any warnings.
     ///
     /// # Returns
     ///
-    /// What the tree alone leaves its rows waiting on: keys no enabled row provides, and
-    /// dependency cycles among the rows (every cycle shares a row with a reported one). Each is
-    /// also logged as a warning. The rows are mounted anyway, and a provider from outside the
-    /// tree, such as a fiber the host inserts, still satisfies them.
+    /// What the reconciled app leaves the tree's rows waiting on: keys with no live provider in
+    /// their resolved realm, and dependency cycles among the enabled rows (every cycle shares a
+    /// row with a reported one). Each is also logged as a warning. The rows are mounted anyway,
+    /// and a provider added later (or by a child fiber) still satisfies them.
     ///
     /// # Errors
     ///
     /// Returns a [`LoadError`] when the tree is invalid; nothing is applied then.
     pub async fn apply(&mut self, tree: &Tree) -> Result<Vec<LoadWarning>, LoadError> {
-        let (rows, warnings) = self.check(tree)?;
-        for warning in &warnings {
-            tracing::warn!("{warning}");
-        }
+        let rows = self.validate(tree)?;
         let app = &self.app;
         self.mounted.retain(|id, mounted| {
             let kept = rows
@@ -321,7 +319,7 @@ impl Loader {
             }
             kept
         });
-        for (row, factory, env) in rows {
+        for (row, factory, env) in &rows {
             let mounted = self.mounted.get(&row.id).map(|mounted| mounted.fiber);
             let running = match mounted {
                 Some(fiber) => self.app.config(fiber).await.map(|config| (fiber, config)),
@@ -331,11 +329,16 @@ impl Loader {
                 Some((_, config)) if config == row.config => {}
                 Some((fiber, _)) => self.app.update(fiber, row.config.clone()),
                 None => {
-                    let fiber = self.app.insert_factory(factory, row.config.clone(), env).await;
+                    let fiber = self.app.insert_factory(factory.clone(), row.config.clone(), env.clone()).await;
                     let mounted = Mounted { component: row.component.clone(), isolate: row.isolate.clone(), fiber };
                     self.mounted.insert(row.id.clone(), mounted);
                 }
             }
+        }
+        let provided = self.app.provided_slots().await;
+        let warnings = warnings(&rows, &provided);
+        for warning in &warnings {
+            tracing::warn!("{warning}");
         }
         Ok(warnings)
     }
@@ -346,8 +349,8 @@ impl Loader {
         self.mounted.get(row).map(|mounted| mounted.fiber)
     }
 
-    /// Validates `tree`, returning its enabled rows and what keeps some of them from activating.
-    fn check<'t>(&self, tree: &'t Tree) -> Result<(Vec<Checked<'t>>, Vec<LoadWarning>), LoadError> {
+    /// Validates `tree`, returning its enabled rows with their resolved factories and realms.
+    fn validate<'t>(&self, tree: &'t Tree) -> Result<Vec<Checked<'t>>, LoadError> {
         let mut ids = HashSet::new();
         let mut rows = Vec::new();
         for row in &tree.plugins {
@@ -374,34 +377,41 @@ impl Loader {
             }
             rows.push((row, factory.clone(), env));
         }
-
-        let mut providers: HashMap<Slot, Vec<usize>> = HashMap::new();
-        for (index, (_, factory, env)) in rows.iter().enumerate() {
-            for key in &factory.provides {
-                providers.entry(env.slot(*key)).or_default().push(index);
-            }
-        }
-        let mut warnings = Vec::new();
-        let mut edges = Vec::with_capacity(rows.len());
-        for (row, factory, env) in &rows {
-            let mut targets = Vec::new();
-            for key in &factory.deps {
-                match providers.get(&env.slot(*key)) {
-                    Some(provided_by) => targets.extend(provided_by),
-                    None => warnings.push(LoadWarning::MissingProvider {
-                        row: row.id.clone(),
-                        key: key.name(),
-                        realm: row.isolate.get(key.name()).cloned(),
-                    }),
-                }
-            }
-            edges.push(targets);
-        }
-        for cycle in find_cycles(&edges) {
-            warnings.push(LoadWarning::Cycle(cycle.into_iter().map(|index| rows[index].0.id.clone()).collect()));
-        }
-        Ok((rows, warnings))
+        Ok(rows)
     }
+}
+
+/// Reports dependencies with no live provider in `provided`, and dependency cycles among `rows`.
+fn warnings(rows: &[Checked<'_>], provided: &HashSet<Slot>) -> Vec<LoadWarning> {
+    let mut providers: HashMap<Slot, Vec<usize>> = HashMap::new();
+    for (index, (_, factory, env)) in rows.iter().enumerate() {
+        for key in &factory.provides {
+            providers.entry(env.slot(*key)).or_default().push(index);
+        }
+    }
+    let mut warnings = Vec::new();
+    let mut edges = Vec::with_capacity(rows.len());
+    for (row, factory, env) in rows {
+        let mut targets = Vec::new();
+        for key in &factory.deps {
+            let slot = env.slot(*key);
+            if let Some(provided_by) = providers.get(&slot) {
+                targets.extend(provided_by);
+            }
+            if !provided.contains(&slot) {
+                warnings.push(LoadWarning::MissingProvider {
+                    row: row.id.clone(),
+                    key: key.name(),
+                    realm: row.isolate.get(key.name()).cloned(),
+                });
+            }
+        }
+        edges.push(targets);
+    }
+    for cycle in find_cycles(&edges) {
+        warnings.push(LoadWarning::Cycle(cycle.into_iter().map(|index| rows[index].0.id.clone()).collect()));
+    }
+    warnings
 }
 
 /// Returns dependency cycles, each with its first row repeated at the end. Every cycle shares a

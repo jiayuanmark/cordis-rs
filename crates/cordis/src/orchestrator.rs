@@ -1,6 +1,6 @@
 //! The orchestrator: one task that owns every fiber and applies lifecycle transitions.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -210,6 +210,13 @@ impl App {
         answer.await.expect("the orchestrator replies to every command")
     }
 
+    /// Returns the slots declared as provided by live (non-retired) fibers.
+    pub(crate) async fn provided_slots(&self) -> HashSet<Slot> {
+        let (reply, answer) = oneshot::channel();
+        self.send(Command::ProvidedSlots { reply });
+        answer.await.expect("the orchestrator replies to every command")
+    }
+
     /// Returns the fiber a fiber was instantiated under, or `None` for a root fiber and once
     /// the fiber has been discarded.
     pub async fn parent(&self, id: FiberId) -> Option<FiberId> {
@@ -304,6 +311,9 @@ pub(crate) enum Command {
     Get {
         slot: Slot,
         reply: oneshot::Sender<Option<Erased>>,
+    },
+    ProvidedSlots {
+        reply: oneshot::Sender<HashSet<Slot>>,
     },
     Settled {
         reply: oneshot::Sender<()>,
@@ -723,8 +733,31 @@ impl Orchestrator {
             Command::Get { slot, reply } => {
                 let _ = reply.send(self.table.get(&slot).map(|(_, value)| value.clone()));
             }
+            Command::ProvidedSlots { reply } => {
+                let slots = self
+                    .fibers
+                    .iter()
+                    .filter(|(id, _)| self.is_live_fiber(*id))
+                    .flat_map(|(_, fiber)| fiber.provides.iter().cloned())
+                    .collect();
+                let _ = reply.send(slots);
+            }
             Command::Settled { reply } => self.waiters.push(reply),
         }
+    }
+
+    /// Whether `id` and every ancestor up to its root are live (not retired).
+    fn is_live_fiber(&self, mut id: FiberId) -> bool {
+        while let Some(fiber) = self.fibers.get(id) {
+            if fiber.retired {
+                return false;
+            }
+            match fiber.parent {
+                Some(parent) => id = parent.id,
+                None => return true,
+            }
+        }
+        false
     }
 
     /// Whether `owner` may instantiate children: its activation is current and the fiber is
