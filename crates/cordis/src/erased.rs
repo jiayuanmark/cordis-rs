@@ -78,6 +78,7 @@ impl Resolve<'_> {
 
 /// The operations of one component type, with the type erased.
 pub(crate) struct Factory {
+    pub(crate) name: &'static str,
     pub(crate) deps: Vec<KeyId>,
     pub(crate) provides: Vec<KeyId>,
     pub(crate) validate: fn(&Value) -> Result<(), String>,
@@ -91,6 +92,7 @@ impl Factory {
         C::Config: DeserializeOwned,
     {
         Self {
+            name: std::any::type_name::<C>(),
             deps: <C as Manifest>::deps(),
             provides: <C as Manifest>::provides(),
             validate: validate::<C>,
@@ -104,6 +106,7 @@ impl Factory {
         C::Config: Clone + Sync,
     {
         Self {
+            name: std::any::type_name::<C>(),
             deps: <C as Manifest>::deps(),
             provides: <C as Manifest>::provides(),
             validate: |_| Ok(()),

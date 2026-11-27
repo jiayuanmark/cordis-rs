@@ -25,6 +25,7 @@ A Rust realization of the context paradigm from *A Programming Paradigm for Spat
 | `crates/cordis/tests/events.rs` | Event bus behavior tests |
 | `crates/cordis/tests/layers.rs` | Layer merge tests |
 | `crates/cordis/tests/realms.rs` | Isolation and interception tests |
+| `crates/cordis/tests/tracing.rs` | Lifecycle, `Scope::in_span`, and event middleware tracing tests |
 | `crates/cordis/tests/invariants.rs` | The lifecycle guarantees, checked under random changes |
 | `crates/cordis/examples/harness.rs` | A miniature agent harness: services, dependencies, optional deps (`cx.optional`, `cx.when`), and events (`cargo run --example harness`) |
 | `crates/cordis/examples/profiles.rs` | Profiles composed from YAML layers in `examples/config/` (`cargo run --example profiles`) |
@@ -60,6 +61,7 @@ Implemented:
 - Child fibers instantiated through `cx.plugin` (passing typed `C::Config` in memory without serialization and returning a typed `Fiber<C>`), direct in-memory service provision through `provide::<K>(value)` (`Provide<K>`, on `App`, `Scope`, and `Cx`), inline reactive hooks through `cx.when::<K>(|cx, provider| ...)`, and live optional handles through `cx.optional::<K>()`, retired with the activation that made them (or when the last `Optional<K>` clone drops).
 - Realms: `cx.isolate::<K>()` gives a subtree its own provider of `K`, in a fresh or named realm, and rows can name realms with `isolate`.
 - Interception: `cx.intercept::<K>(|v| ...)` hands consumers under the scope a remapped view of a provider, such as a read-only wrapper, leaving the shared provider untouched.
+- Tracing: bounded `cordis.activate` / `cordis.deactivate` spans (`cordis::lifecycle`, `info`) with `follows_from` links back to the triggering command without holding trigger spans open, `in_span` on `App`/`Scope`/`Cx` for parenting bounded subtrees (such as per-turn subagents), and `cordis.event` / `cordis.listener` middleware spans (`cordis::events`, `debug`) that preserve the emitter's active span.
 
 Not yet implemented: `many` keys, loader-managed local realms and interception in configuration, listener ordering beyond registration order, the named event edge, `compose!`, and WASM components.
 

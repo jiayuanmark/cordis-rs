@@ -365,7 +365,9 @@ impl Loader {
                 Some((_, config)) if config == row.config => {}
                 Some((fiber, _)) => self.app.update(fiber, row.config.clone()),
                 None => {
-                    let fiber = self.app.insert_factory(factory.clone(), row.config.clone(), env.clone()).await;
+                    let row_id: Arc<str> = Arc::from(row.id.as_str());
+                    let fiber =
+                        self.app.insert_factory(factory.clone(), row.config.clone(), env.clone(), Some(row_id)).await;
                     let mounted = Mounted { component: row.component.clone(), isolate: row.isolate.clone(), fiber };
                     self.mounted.insert(row.id.clone(), mounted);
                 }

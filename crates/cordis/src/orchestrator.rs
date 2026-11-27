@@ -15,6 +15,7 @@ use slotmap::{SecondaryMap, SlotMap, new_key_type};
 use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+use tracing::{Instrument, Span};
 
 use crate::dispose::{Undo, UndoHandle, panic_message};
 use crate::erased::{Config, Factory, Instance};
@@ -88,7 +89,7 @@ impl App {
         C: Component,
         C::Config: DeserializeOwned,
     {
-        self.insert_factory(Arc::new(Factory::of::<C>()), config, Env::default()).await
+        self.insert_factory(Arc::new(Factory::of::<C>()), config, Env::default(), None).await
     }
 
     /// Instantiates a root fiber of component `C` with a typed `config`, passed in memory without
@@ -124,9 +125,16 @@ impl App {
         self.scope().provide::<K>(value)
     }
 
-    pub(crate) async fn insert_factory(&self, factory: Arc<Factory>, config: Value, env: Env) -> FiberId {
+    pub(crate) async fn insert_factory(
+        &self,
+        factory: Arc<Factory>,
+        config: Value,
+        env: Env,
+        row: Option<Arc<str>>,
+    ) -> FiberId {
         let (reply, answer) = oneshot::channel();
-        self.send(Command::Insert { factory, config: Config::Json(config), env, parent: None, reply });
+        let cause = Span::current();
+        self.send(Command::Insert { factory, config: Config::Json(config), env, row, parent: None, cause, reply });
         answer.await.expect("the orchestrator replies to every command").expect("a root fiber is always inserted")
     }
 
@@ -148,6 +156,12 @@ impl App {
         remap: impl Fn(Arc<K::Value>) -> Arc<K::Value> + Send + Sync + 'static,
     ) -> Scope {
         self.scope().intercept::<K>(remap)
+    }
+
+    /// Returns a scope whose root fibers (and their descendants) parent their `cordis.activate`
+    /// and `cordis.deactivate` tracing spans to `span`. See [`Scope::in_span`].
+    pub fn in_span(&self, span: Span) -> Scope {
+        self.scope().in_span(span)
     }
 
     /// Inserts a root fiber that runs `run` whenever `K` has an active provider in the shared
@@ -188,12 +202,12 @@ impl App {
     /// configuration (updated through its [`Fiber`] handle for `plugin` and `provide`); a JSON
     /// update of one is ignored with a warning, and the fiber keeps running as it was.
     pub fn update(&self, id: FiberId, config: Value) {
-        self.send(Command::Update { id, config: Config::Json(config) });
+        self.send(Command::Update { id, config: Config::Json(config), cause: Span::current() });
     }
 
     /// Retires a fiber. It deactivates after its consumers, then is discarded.
     pub fn remove(&self, id: FiberId) {
-        self.send(Command::Remove { id });
+        self.send(Command::Remove { id, cause: Span::current() });
     }
 
     /// Returns a fiber's state, or `None` once the fiber has been discarded.
@@ -266,7 +280,7 @@ impl App {
 
     /// Retires every fiber and waits until all of them have been torn down.
     pub async fn shutdown(&self) {
-        self.send(Command::RemoveAll);
+        self.send(Command::RemoveAll { cause: Span::current() });
         self.settled().await;
     }
 
@@ -286,17 +300,23 @@ pub(crate) enum Command {
         factory: Arc<Factory>,
         config: Config,
         env: Env,
+        row: Option<Arc<str>>,
         parent: Option<Owner>,
+        cause: Span,
         reply: oneshot::Sender<Option<FiberId>>,
     },
     Update {
         id: FiberId,
         config: Config,
+        cause: Span,
     },
     Remove {
         id: FiberId,
+        cause: Span,
     },
-    RemoveAll,
+    RemoveAll {
+        cause: Span,
+    },
     Status {
         id: FiberId,
         reply: oneshot::Sender<Option<Status>>,
@@ -404,7 +424,10 @@ impl Spawner {
             Spawner::Fiber(control) => Some(control.owner),
         };
         let (reply, answer) = oneshot::channel();
-        commands.send(Command::Insert { factory, config, env, parent, reply }).map_err(|_| Refused::Stopped)?;
+        let cause = Span::current();
+        commands
+            .send(Command::Insert { factory, config, env, row: None, parent, cause, reply })
+            .map_err(|_| Refused::Stopped)?;
         let id = answer.await.map_err(|_| Refused::Stopped)?.ok_or(Refused::Ended)?;
         let fiber = Fiber { id, commands: commands.downgrade(), disposed: Arc::default(), component: PhantomData };
         if let Spawner::Fiber(control) = self {
@@ -473,7 +496,7 @@ where
     /// # }
     /// ```
     pub fn update(&self, config: C::Config) {
-        self.send(Command::Update { id: self.id, config: Config::Typed(Arc::new(config)) });
+        self.send(Command::Update { id: self.id, config: Config::Typed(Arc::new(config)), cause: Span::current() });
     }
 }
 
@@ -493,7 +516,7 @@ impl<C> Fiber<C> {
     /// Retires the fiber now. It deactivates after its consumers, then is discarded.
     pub fn dispose(&self) {
         self.disposed.store(true, Ordering::Relaxed);
-        self.send(Command::Remove { id: self.id });
+        self.send(Command::Remove { id: self.id, cause: Span::current() });
     }
 
     pub(crate) fn erase(self) -> Fiber<()> {
@@ -584,6 +607,8 @@ struct Entry {
     config: Config,
     /// The context the fiber was inserted under.
     env: Env,
+    /// The loader row id, when mounted by [`Loader`](crate::Loader).
+    row: Option<Arc<str>>,
     /// Where each dependency key resolves under `env`, in declaration order.
     deps: Vec<Slot>,
     /// Where each provided key is published under `env`.
@@ -640,16 +665,20 @@ impl Orchestrator {
 
     async fn run(mut self, mut commands: mpsc::UnboundedReceiver<Command>, mut events: mpsc::UnboundedReceiver<Event>) {
         loop {
-            tokio::select! {
+            let cause = tokio::select! {
                 command = commands.recv() => match command {
                     Some(command) => self.command(command),
                     None => return self.drop_consumers_first(),
                 },
-                Some(event) = events.recv() => self.event(event),
-            }
+                Some(event) = events.recv() => {
+                    self.event(event);
+                    None
+                }
+            };
             while let Some(id) = self.dirty.pop_front() {
-                self.settle(id);
+                self.settle(id, cause.as_ref());
             }
+            drop(cause);
             if self.in_flight == 0 {
                 for waiter in self.waiters.drain(..) {
                     let _ = waiter.send(());
@@ -658,13 +687,13 @@ impl Orchestrator {
         }
     }
 
-    fn command(&mut self, command: Command) {
+    fn command(&mut self, command: Command) -> Option<Span> {
         match command {
-            Command::Insert { factory, config, env, parent, reply } => {
+            Command::Insert { factory, config, env, row, parent, cause, reply } => {
                 // A child requested by an activation that has already ended is not inserted.
                 if parent.is_some_and(|parent| !self.owns_children(parent)) {
                     let _ = reply.send(None);
-                    return;
+                    return None;
                 }
                 let deps: Vec<Slot> = factory.deps.iter().map(|key| env.slot(*key)).collect();
                 let provides: Vec<Slot> = factory.provides.iter().map(|key| env.slot(*key)).collect();
@@ -673,6 +702,7 @@ impl Orchestrator {
                     factory,
                     config,
                     env,
+                    row,
                     deps,
                     provides,
                     parent,
@@ -688,8 +718,9 @@ impl Orchestrator {
                 self.relied.insert(id, 0);
                 self.dirty.push_back(id);
                 let _ = reply.send(Some(id));
+                Some(cause)
             }
-            Command::Update { id, config } => {
+            Command::Update { id, config, cause } => {
                 if let Some(fiber) = self.fibers.get_mut(id) {
                     // A fiber keeps the kind of configuration it was inserted with: its factory
                     // reads either JSON or a typed value, never both.
@@ -698,27 +729,33 @@ impl Orchestrator {
                             fiber = ?id,
                             "ignored a JSON update of a typed fiber; update `plugin` fibers through their `Fiber` handle"
                         );
-                        return;
+                        return None;
                     }
                     fiber.config = config;
                     fiber.epoch += 1;
                     self.dirty.push_back(id);
+                    return Some(cause);
                 }
+                None
             }
-            Command::Remove { id } => {
+            Command::Remove { id, cause } => {
                 if let Some(fiber) = self.fibers.get_mut(id) {
                     fiber.retired = true;
                     self.dirty.push_back(id);
+                    return Some(cause);
                 }
+                None
             }
-            Command::RemoveAll => {
+            Command::RemoveAll { cause } => {
                 for (id, fiber) in &mut self.fibers {
                     fiber.retired = true;
                     self.dirty.push_back(id);
                 }
+                Some(cause)
             }
             Command::Status { id, reply } => {
                 let _ = reply.send(self.fibers.get(id).map(|fiber| fiber.state.status()));
+                None
             }
             Command::Config { id, reply } => {
                 // Only the loader asks, and its fibers are always configured with JSON.
@@ -727,12 +764,15 @@ impl Orchestrator {
                     Config::Typed(_) => None,
                 });
                 let _ = reply.send(config);
+                None
             }
             Command::Parent { id, reply } => {
                 let _ = reply.send(self.fibers.get(id).and_then(|fiber| fiber.parent).map(|parent| parent.id));
+                None
             }
             Command::Get { slot, reply } => {
                 let _ = reply.send(self.table.get(&slot).map(|(_, value)| value.clone()));
+                None
             }
             Command::ProvidedSlots { reply } => {
                 let mut slots: HashMap<Slot, Vec<FiberId>> = HashMap::new();
@@ -744,8 +784,12 @@ impl Orchestrator {
                     }
                 }
                 let _ = reply.send(slots);
+                None
             }
-            Command::Settled { reply } => self.waiters.push(reply),
+            Command::Settled { reply } => {
+                self.waiters.push(reply);
+                None
+            }
         }
     }
 
@@ -827,7 +871,7 @@ impl Orchestrator {
         }
     }
 
-    fn settle(&mut self, id: FiberId) {
+    fn settle(&mut self, id: FiberId, cause: Option<&Span>) {
         if !self.fibers.contains_key(id) {
             return;
         }
@@ -839,11 +883,11 @@ impl Orchestrator {
             // A stopped fiber keeps the keys it holds only if it starts again right away, so a
             // reload does not hand them to a waiting competitor.
             State::Inactive => match target {
-                Some(view) => self.begin(id, view),
+                Some(view) => self.begin(id, view, cause),
                 None => self.stop(id, retired),
             },
             State::Failed { view, epoch: failed_epoch, .. } => match target {
-                Some(target) if target != *view || *failed_epoch != epoch => self.begin(id, target),
+                Some(target) if target != *view || *failed_epoch != epoch => self.begin(id, target, cause),
                 _ => self.stop(id, retired),
             },
             State::Loading { cancel, .. } => {
@@ -853,14 +897,74 @@ impl Orchestrator {
             }
             State::Active { .. } => {
                 if !current {
-                    self.leave(id);
+                    self.leave(id, cause);
                 }
             }
             State::Leaving { .. } | State::Deactivating => {}
         }
     }
 
-    fn begin(&mut self, id: FiberId, view: View) {
+    fn activate_span(&self, id: FiberId, cause: Option<&Span>) -> Span {
+        let fiber = &self.fibers[id];
+        let parent = fiber.env.span();
+        let span = match parent {
+            Some(parent) => tracing::info_span!(
+                target: "cordis::lifecycle",
+                parent: parent,
+                "cordis.activate",
+                fiber = ?id,
+                component = fiber.factory.name,
+                row = fiber.row.as_deref(),
+            ),
+            None => tracing::info_span!(
+                target: "cordis::lifecycle",
+                parent: None,
+                "cordis.activate",
+                fiber = ?id,
+                component = fiber.factory.name,
+                row = fiber.row.as_deref(),
+            ),
+        };
+        if let Some(cause) = cause
+            && !cause.is_none()
+            && parent.and_then(Span::id) != cause.id()
+        {
+            span.follows_from(cause);
+        }
+        span
+    }
+
+    fn deactivate_span(&self, id: FiberId, cause: Option<&Span>) -> Span {
+        let fiber = &self.fibers[id];
+        let parent = fiber.env.span();
+        let span = match parent {
+            Some(parent) => tracing::info_span!(
+                target: "cordis::lifecycle",
+                parent: parent,
+                "cordis.deactivate",
+                fiber = ?id,
+                component = fiber.factory.name,
+                row = fiber.row.as_deref(),
+            ),
+            None => tracing::info_span!(
+                target: "cordis::lifecycle",
+                parent: None,
+                "cordis.deactivate",
+                fiber = ?id,
+                component = fiber.factory.name,
+                row = fiber.row.as_deref(),
+            ),
+        };
+        if let Some(cause) = cause
+            && !cause.is_none()
+            && parent.and_then(Span::id) != cause.id()
+        {
+            span.follows_from(cause);
+        }
+        span
+    }
+
+    fn begin(&mut self, id: FiberId, view: View, cause: Option<&Span>) {
         for provider in view.providers() {
             self.relied[provider] += 1;
         }
@@ -872,6 +976,7 @@ impl Orchestrator {
         for slot in self.fibers[id].provides.clone() {
             self.holders.insert(slot, id);
         }
+        let span = self.activate_span(id, cause);
         let fiber = &mut self.fibers[id];
         let undo = Undo::new();
         let control = Control {
@@ -888,30 +993,33 @@ impl Orchestrator {
 
         self.in_flight += 1;
         let events = self.events.clone();
-        tokio::spawn(async move {
-            // `activate` always runs to its end. Dropping it at an `.await` could stop it between
-            // an effect and the `on_dispose` that undoes it (an async host is inertial, paper
-            // §4.4); a cancelled run sees `cx.cancelled()` and returns early instead.
-            let outcome = match AssertUnwindSafe(task).catch_unwind().await {
-                Ok(Ok(instance)) => Some(Ok(instance)),
-                Err(panic) if cancel.is_cancelled() => {
-                    tracing::error!(fiber = ?id, panic = panic_message(&*panic), "cancelled activation panicked");
-                    None
+        tokio::spawn(
+            async move {
+                // `activate` always runs to its end. Dropping it at an `.await` could stop it between
+                // an effect and the `on_dispose` that undoes it (an async host is inertial, paper
+                // §4.4); a cancelled run sees `cx.cancelled()` and returns early instead.
+                let outcome = match AssertUnwindSafe(task).catch_unwind().await {
+                    Ok(Ok(instance)) => Some(Ok(instance)),
+                    Err(panic) if cancel.is_cancelled() => {
+                        tracing::error!(fiber = ?id, panic = panic_message(&*panic), "cancelled activation panicked");
+                        None
+                    }
+                    // A cancelled activation that returns no instance was stopped, not failed.
+                    _ if cancel.is_cancelled() => None,
+                    Ok(Err(error)) => Some(Err(error.to_string())),
+                    Err(panic) => Some(Err(panic_message(&*panic))),
+                };
+                // An activation that did not produce an instance is disposed of here; an instance
+                // takes the undo list with it. The run has ended, so a `Cx` kept from it sees
+                // `cancelled()` resolve.
+                if !matches!(outcome, Some(Ok(_))) {
+                    cancel.cancel();
+                    undo.run().await;
                 }
-                // A cancelled activation that returns no instance was stopped, not failed.
-                _ if cancel.is_cancelled() => None,
-                Ok(Err(error)) => Some(Err(error.to_string())),
-                Err(panic) => Some(Err(panic_message(&*panic))),
-            };
-            // An activation that did not produce an instance is disposed of here; an instance
-            // takes the undo list with it. The run has ended, so a `Cx` kept from it sees
-            // `cancelled()` resolve.
-            if !matches!(outcome, Some(Ok(_))) {
-                cancel.cancel();
-                undo.run().await;
+                let _ = events.send(Event::Loaded { id, token, outcome });
             }
-            let _ = events.send(Event::Loaded { id, token, outcome });
-        });
+            .instrument(span),
+        );
     }
 
     fn loaded(&mut self, id: FiberId, token: u64, outcome: Option<Result<Box<dyn Instance>, String>>) {
@@ -926,7 +1034,7 @@ impl Orchestrator {
             Some(Ok(instance)) => {
                 // The target moved while the last step ran; revert what it built.
                 self.fibers[id].state = State::Leaving { instance };
-                self.try_unload(id);
+                self.try_unload(id, None);
             }
             Some(Err(error)) => {
                 tracing::error!(fiber = ?id, %error, "activation failed");
@@ -963,7 +1071,7 @@ impl Orchestrator {
         self.fibers[run.id].state = State::Active { instance, cancel };
     }
 
-    fn leave(&mut self, id: FiberId) {
+    fn leave(&mut self, id: FiberId, cause: Option<&Span>) {
         let fiber = &mut self.fibers[id];
         let State::Active { instance, cancel } = std::mem::replace(&mut fiber.state, State::Inactive) else {
             unreachable!("only an active fiber leaves");
@@ -977,25 +1085,29 @@ impl Orchestrator {
                 self.mark(&slot);
             }
         }
-        self.try_unload(id);
+        self.try_unload(id, cause);
     }
 
     /// Runs the fiber's inverse once no committed view names it.
-    fn try_unload(&mut self, id: FiberId) {
+    fn try_unload(&mut self, id: FiberId, cause: Option<&Span>) {
         if self.relied[id] > 0 || !matches!(self.fibers[id].state, State::Leaving { .. }) {
             return;
         }
+        let span = self.deactivate_span(id, cause);
         let State::Leaving { instance } = std::mem::replace(&mut self.fibers[id].state, State::Deactivating) else {
             unreachable!("checked above");
         };
         self.in_flight += 1;
         let events = self.events.clone();
-        tokio::spawn(async move {
-            if let Err(panic) = AssertUnwindSafe(instance.dispose()).catch_unwind().await {
-                tracing::error!(fiber = ?id, panic = panic_message(&*panic), "disposal panicked");
+        tokio::spawn(
+            async move {
+                if let Err(panic) = AssertUnwindSafe(instance.dispose()).catch_unwind().await {
+                    tracing::error!(fiber = ?id, panic = panic_message(&*panic), "disposal panicked");
+                }
+                let _ = events.send(Event::Deactivated { id });
             }
-            let _ = events.send(Event::Deactivated { id });
-        });
+            .instrument(span),
+        );
     }
 
     fn deactivated(&mut self, id: FiberId) {
@@ -1027,7 +1139,7 @@ impl Orchestrator {
     fn release(&mut self, view: &View) {
         for provider in view.providers() {
             self.relied[provider] -= 1;
-            self.try_unload(provider);
+            self.try_unload(provider, None);
         }
     }
 
