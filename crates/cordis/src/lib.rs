@@ -7,10 +7,11 @@
 //! the [`Guard`] of a registration, to [`Cx::on_dispose`], and the orchestrator runs the list,
 //! newest first, when the fiber is disposed.
 //!
-//! A [`Scope`], derived from a fiber's [`Cx`] or from the [`App`], changes how keys resolve for
-//! the fibers instantiated through it: [`Cx::isolate`] moves a key into another [`Realm`], so
-//! a subtree gets its own provider, and [`Cx::intercept`] hands
-//! its children a remapped view of a provider, such as a read-only wrapper.
+//! A [`Scope`], derived from a fiber's [`Cx`] or from the [`App`], changes how keys resolve and
+//! how lifecycle spans are parented for the fibers instantiated through it: [`Cx::isolate`] moves
+//! a key into another [`Realm`], so a subtree gets its own provider, [`Cx::intercept`] hands its
+//! children a remapped view of a provider, such as a read-only wrapper, and [`Cx::in_span`]
+//! attaches a parent [`tracing::Span`] to a subtree's lifecycle transitions.
 //!
 //! `design.md` at the repository root maps these types to the paper's model.
 

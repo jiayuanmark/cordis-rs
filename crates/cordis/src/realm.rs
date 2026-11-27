@@ -78,8 +78,9 @@ impl fmt::Debug for Slot {
     }
 }
 
-/// The tables a context carries: the realm of each isolated key (the paper's ρ, Def 24) and
-/// the interception of each intercepted key (ι, Def 26).
+/// The tables a context carries: the realm of each isolated key (the paper's ρ, Def 24),
+/// the interception of each intercepted key (ι, Def 26), and an optional parent [`tracing::Span`]
+/// for fibers instantiated under it.
 ///
 /// A fiber's context is fixed when the fiber is inserted, and its children inherit it. Both
 /// tables are copied on write, so deriving a context leaves the one it derives from intact.
@@ -87,6 +88,7 @@ impl fmt::Debug for Slot {
 pub(crate) struct Env {
     realms: Arc<HashMap<KeyId, Realm>>,
     intercepts: Arc<HashMap<KeyId, Remap>>,
+    span: Option<tracing::Span>,
 }
 
 /// An interception with the key's type erased: maps the provider value to the value consumers
@@ -129,14 +131,27 @@ impl Env {
         });
         Arc::make_mut(&mut self.intercepts).insert(key, composed);
     }
+
+    /// Returns the explicit parent span attached to this context, if any.
+    pub(crate) fn span(&self) -> Option<&tracing::Span> {
+        self.span.as_ref()
+    }
+
+    /// Sets the parent span for fibers under this context, or clears it when `span` is
+    /// [`tracing::Span::none`].
+    fn set_span(&mut self, span: tracing::Span) {
+        self.span = if span.is_none() { None } else { Some(span) };
+    }
 }
 
 /// A context derived from a fiber's [`Cx`](crate::Cx) or from an [`App`](crate::App), which
-/// changes how keys resolve for the fibers instantiated through it.
+/// changes how keys resolve and how lifecycle spans are parented for the fibers instantiated
+/// through it.
 ///
-/// [`isolate`](Scope::isolate) moves a key into another realm and
-/// [`intercept`](Scope::intercept) changes the value consumers of a key receive; each returns a new scope and
-/// leaves this one as it was. [`plugin`](Scope::plugin), [`provide`](Scope::provide),
+/// [`isolate`](Scope::isolate) moves a key into another realm, [`intercept`](Scope::intercept)
+/// changes the value consumers of a key receive, and [`in_span`](Scope::in_span) sets a
+/// parent [`tracing::Span`] for lifecycle transitions; each returns a new scope and leaves this
+/// one as it was. [`plugin`](Scope::plugin), [`provide`](Scope::provide),
 /// [`when`](Scope::when), and [`optional`](Scope::optional) instantiate fibers under the scope.
 /// That fiber's own context, and so its children's, inherits every adjustment.
 ///
@@ -228,6 +243,22 @@ impl Scope {
     ) -> Scope {
         let mut env = self.env.clone();
         env.intercept::<K>(remap);
+        Scope { env, spawner: self.spawner.clone() }
+    }
+
+    /// Returns a scope whose fibers (and their descendants) parent their `cordis.activate` and
+    /// `cordis.deactivate` tracing spans to `span`.
+    ///
+    /// Pass [`tracing::Span::none()`] to detach from an inherited parent span.
+    ///
+    /// Because a fiber keeps a clone of `span` until the fiber is discarded, only attach a
+    /// short-lived span (such as an agent turn or HTTP request) to fibers whose lifetime is
+    /// bounded by that span (for example a per-turn subagent retired when the turn ends).
+    /// Long-lived fibers without an explicit parent span still link back to the span that
+    /// triggered their insert, update, or removal via `follows_from` without holding it open.
+    pub fn in_span(&self, span: tracing::Span) -> Scope {
+        let mut env = self.env.clone();
+        env.set_span(span);
         Scope { env, spawner: self.spawner.clone() }
     }
 

@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use futures::future::join_all;
+use tracing::Instrument;
 
 use crate::Guard;
 use crate::dispose::UndoHandle;
@@ -71,8 +72,21 @@ pub mod mode {
 use mode::{Bail, Emit, Mode, Parallel, Serial, Waterfall};
 
 type ListenerOf<E> = <<E as Event>::Mode as Mode>::Listener<<E as Event>::Args, <E as Event>::Output>;
-type Snapshot<E> = Arc<[(u64, Arc<ListenerOf<E>>)]>;
-type Chain<A, O> = Arc<[(u64, Arc<<Waterfall as Mode>::Listener<A, O>>)]>;
+
+struct Entry<L: ?Sized> {
+    id: u64,
+    source: Option<&'static str>,
+    listener: Arc<L>,
+}
+
+impl<L: ?Sized> Clone for Entry<L> {
+    fn clone(&self) -> Self {
+        Self { id: self.id, source: self.source, listener: self.listener.clone() }
+    }
+}
+
+type Snapshot<E> = Arc<[Entry<ListenerOf<E>>]>;
+type Chain<A, O> = Arc<[Entry<<Waterfall as Mode>::Listener<A, O>>]>;
 
 /// The event bus. Clones share one bus.
 #[derive(Clone, Default)]
@@ -96,7 +110,7 @@ impl Inner {
         }
     }
 
-    fn replace<E: Event>(&self, edit: impl FnOnce(&mut Vec<(u64, Arc<ListenerOf<E>>)>)) {
+    fn replace<E: Event>(&self, edit: impl FnOnce(&mut Vec<Entry<ListenerOf<E>>>)) {
         let mut lists = self.lists.lock().unwrap();
         let current = match lists.get(&TypeId::of::<E>()) {
             Some(list) => list.downcast_ref::<Snapshot<E>>().expect("lists are keyed by event type").to_vec(),
@@ -120,13 +134,13 @@ impl Events {
         On { events: self, sink: Detached, _event: PhantomData }
     }
 
-    fn register<E: Event>(&self, listener: Arc<ListenerOf<E>>) -> Guard {
+    fn register<E: Event>(&self, source: Option<&'static str>, listener: Arc<ListenerOf<E>>) -> Guard {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        self.inner.replace::<E>(|list| list.push((id, listener)));
+        self.inner.replace::<E>(|list| list.push(Entry { id, source, listener }));
         let inner: Weak<Inner> = Arc::downgrade(&self.inner);
         Guard::new(move || {
             if let Some(inner) = inner.upgrade() {
-                inner.replace::<E>(|list| list.retain(|(entry, _)| *entry != id));
+                inner.replace::<E>(|list| list.retain(|entry| entry.id != id));
             }
         })
     }
@@ -139,8 +153,17 @@ impl Events {
     /// Events::default().emit::<Request>(1); // `Request` is not an `Emit` event
     /// ```
     pub fn emit<E: Event<Mode = Emit>>(&self, args: E::Args) {
-        for (_, listener) in self.inner.snapshot::<E>().iter() {
-            listener(&args);
+        let _event =
+            tracing::debug_span!(target: "cordis::events", "cordis.event", event = E::NAME, mode = "emit").entered();
+        for entry in self.inner.snapshot::<E>().iter() {
+            let _listener = tracing::debug_span!(
+                target: "cordis::events",
+                "cordis.listener",
+                event = E::NAME,
+                component = entry.source,
+            )
+            .entered();
+            (entry.listener)(&args);
         }
     }
 
@@ -150,13 +173,40 @@ impl Events {
     ///
     /// The first `Some` result, or `None` when every listener returned `None`.
     pub fn bail<E: Event<Mode = Bail>>(&self, args: E::Args) -> Option<E::Output> {
-        self.inner.snapshot::<E>().iter().find_map(|(_, listener)| listener(&args))
+        let _event =
+            tracing::debug_span!(target: "cordis::events", "cordis.event", event = E::NAME, mode = "bail").entered();
+        self.inner.snapshot::<E>().iter().find_map(|entry| {
+            let _listener = tracing::debug_span!(
+                target: "cordis::events",
+                "cordis.listener",
+                event = E::NAME,
+                component = entry.source,
+            )
+            .entered();
+            (entry.listener)(&args)
+        })
     }
 
     /// Runs every listener of `E` concurrently and waits for all of them.
     pub async fn parallel<E: Event<Mode = Parallel>>(&self, args: E::Args) {
+        let event_span =
+            tracing::debug_span!(target: "cordis::events", "cordis.event", event = E::NAME, mode = "parallel");
         let args = Arc::new(args);
-        join_all(self.inner.snapshot::<E>().iter().map(|(_, listener)| listener(args.clone()))).await;
+        async move {
+            join_all(self.inner.snapshot::<E>().iter().map(|entry| {
+                let span = tracing::debug_span!(
+                    target: "cordis::events",
+                    "cordis.listener",
+                    event = E::NAME,
+                    component = entry.source,
+                );
+                let fut = span.in_scope(|| (entry.listener)(args.clone()));
+                fut.instrument(span)
+            }))
+            .await;
+        }
+        .instrument(event_span)
+        .await;
     }
 
     /// Runs listeners of `E` in order, awaiting each, until one returns `Some`.
@@ -165,13 +215,26 @@ impl Events {
     ///
     /// The first `Some` result, or `None` when every listener returned `None`.
     pub async fn serial<E: Event<Mode = Serial>>(&self, args: E::Args) -> Option<E::Output> {
+        let event_span =
+            tracing::debug_span!(target: "cordis::events", "cordis.event", event = E::NAME, mode = "serial");
         let args = Arc::new(args);
-        for (_, listener) in self.inner.snapshot::<E>().iter() {
-            if let Some(output) = listener(args.clone()).await {
-                return Some(output);
+        async move {
+            for entry in self.inner.snapshot::<E>().iter() {
+                let span = tracing::debug_span!(
+                    target: "cordis::events",
+                    "cordis.listener",
+                    event = E::NAME,
+                    component = entry.source,
+                );
+                let fut = span.in_scope(|| (entry.listener)(args.clone()));
+                if let Some(output) = fut.instrument(span).await {
+                    return Some(output);
+                }
             }
+            None
         }
-        None
+        .instrument(event_span)
+        .await
     }
 
     /// Runs the listeners of `E` as middleware around `default`.
@@ -188,9 +251,15 @@ impl Events {
         args: E::Args,
         default: impl DefaultAction<E::Args, E::Output>,
     ) -> E::Output {
-        let next =
-            Next { chain: self.inner.snapshot::<E>(), index: 0, default: Box::new(|args| Box::pin(default(args))) };
-        next.run(args).await.0
+        let event_span =
+            tracing::debug_span!(target: "cordis::events", "cordis.event", event = E::NAME, mode = "waterfall");
+        let next = Next {
+            event: E::NAME,
+            chain: self.inner.snapshot::<E>(),
+            index: 0,
+            default: Box::new(|args| Box::pin(default(args))),
+        };
+        async move { next.run(args).await.0 }.instrument(event_span).await
     }
 }
 
@@ -211,6 +280,7 @@ where
 
 /// The rest of a waterfall chain, passed to each waterfall listener.
 pub struct Next<A: Send + Sync + 'static, O: Send + 'static> {
+    event: &'static str,
     chain: Chain<A, O>,
     index: usize,
     default: Box<dyn FnOnce(A) -> BoxFuture<O> + Send>,
@@ -223,8 +293,18 @@ impl<A: Send + Sync + 'static, O: Send + 'static> Next<A, O> {
     ///
     /// A future of the downstream output, as a [`Flow`] the listener can return or map.
     pub fn run(self, args: A) -> BoxFuture<Flow<O>> {
-        match self.chain.get(self.index).map(|(_, listener)| listener.clone()) {
-            Some(listener) => listener(args, Next { chain: self.chain, index: self.index + 1, default: self.default }),
+        match self.chain.get(self.index).cloned() {
+            Some(entry) => {
+                let span = tracing::debug_span!(
+                    target: "cordis::events",
+                    "cordis.listener",
+                    event = self.event,
+                    component = entry.source,
+                );
+                let next = Next { event: self.event, chain: self.chain, index: self.index + 1, default: self.default };
+                let fut = span.in_scope(|| (entry.listener)(args, next));
+                Box::pin(fut.instrument(span))
+            }
             None => {
                 let output = (self.default)(args);
                 Box::pin(async move { Flow(output.await) })
@@ -258,6 +338,10 @@ pub trait Sink {
     type Out;
     #[doc(hidden)]
     fn accept(self, guard: Guard) -> Self::Out;
+    #[doc(hidden)]
+    fn source(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Returns the guard to the caller.
@@ -271,12 +355,18 @@ impl Sink for Detached {
 }
 
 /// Hands the guard to the registering fiber's undo list, which drops it when the fiber unloads.
-pub struct Held<'a>(pub(crate) &'a UndoHandle);
+pub struct Held<'a> {
+    pub(crate) undo: &'a UndoHandle,
+    pub(crate) component: &'static str,
+}
 
 impl Sink for Held<'_> {
     type Out = ();
     fn accept(self, guard: Guard) {
-        self.0.push(guard);
+        self.undo.push(guard);
+    }
+    fn source(&self) -> Option<&'static str> {
+        Some(self.component)
     }
 }
 
@@ -291,7 +381,8 @@ impl<E: Event<Mode = Emit>, S: Sink> On<'_, E, Emit, S> {
     /// Registers a listener called with each emitted payload.
     pub fn listen(self, listener: impl Fn(&E::Args) + Send + Sync + 'static) -> S::Out {
         let listener: Arc<ListenerOf<E>> = Arc::new(listener);
-        self.sink.accept(self.events.register::<E>(listener))
+        let source = self.sink.source();
+        self.sink.accept(self.events.register::<E>(source, listener))
     }
 }
 
@@ -299,7 +390,8 @@ impl<E: Event<Mode = Bail>, S: Sink> On<'_, E, Bail, S> {
     /// Registers a listener; returning `Some` stops the dispatch with that result.
     pub fn listen(self, listener: impl Fn(&E::Args) -> Option<E::Output> + Send + Sync + 'static) -> S::Out {
         let listener: Arc<ListenerOf<E>> = Arc::new(listener);
-        self.sink.accept(self.events.register::<E>(listener))
+        let source = self.sink.source();
+        self.sink.accept(self.events.register::<E>(source, listener))
     }
 }
 
@@ -310,7 +402,8 @@ impl<E: Event<Mode = Parallel>, S: Sink> On<'_, E, Parallel, S> {
         Fut: Future<Output = ()> + Send + 'static,
     {
         let listener: Arc<ListenerOf<E>> = Arc::new(move |args| Box::pin(listener(args)) as BoxFuture<()>);
-        self.sink.accept(self.events.register::<E>(listener))
+        let source = self.sink.source();
+        self.sink.accept(self.events.register::<E>(source, listener))
     }
 }
 
@@ -322,7 +415,8 @@ impl<E: Event<Mode = Serial>, S: Sink> On<'_, E, Serial, S> {
     {
         let listener: Arc<ListenerOf<E>> =
             Arc::new(move |args| Box::pin(listener(args)) as BoxFuture<Option<E::Output>>);
-        self.sink.accept(self.events.register::<E>(listener))
+        let source = self.sink.source();
+        self.sink.accept(self.events.register::<E>(source, listener))
     }
 }
 
@@ -338,7 +432,8 @@ impl<E: Event<Mode = Waterfall>, S: Sink> On<'_, E, Waterfall, S> {
     {
         let listener: Arc<ListenerOf<E>> =
             Arc::new(move |args, next| Box::pin(listener(args, next)) as BoxFuture<Flow<E::Output>>);
-        self.sink.accept(self.events.register::<E>(listener))
+        let source = self.sink.source();
+        self.sink.accept(self.events.register::<E>(source, listener))
     }
 }
 

@@ -578,6 +578,12 @@ impl<C: Component> Cx<C> {
         self.control.scope().intercept::<K>(remap)
     }
 
+    /// Returns a scope whose children (and their descendants) parent their `cordis.activate` and
+    /// `cordis.deactivate` tracing spans to `span`. See [`Scope::in_span`].
+    pub fn in_span(&self, span: tracing::Span) -> Scope {
+        self.control.scope().in_span(span)
+    }
+
     /// Returns the resolved dependencies, one typed field per key in `deps(...)`.
     ///
     /// ```
@@ -725,6 +731,10 @@ impl<C: Component> Cx<C> {
     /// removed when the fiber unloads or its activation is cancelled or fails. Registering after
     /// that removes the listener at once.
     pub fn on<E: Event>(&self) -> On<'_, E, E::Mode, Held<'_>> {
-        On { events: &self.events, sink: Held(self.control.undo()), _event: PhantomData }
+        On {
+            events: &self.events,
+            sink: Held { undo: self.control.undo(), component: std::any::type_name::<C>() },
+            _event: PhantomData,
+        }
     }
 }
