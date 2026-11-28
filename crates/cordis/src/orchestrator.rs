@@ -554,9 +554,13 @@ enum Event {
         id: FiberId,
         token: u64,
         outcome: Option<Result<Box<dyn Instance>, String>>,
+        /// The span of the activation, so the steps it unblocks can link back to it.
+        span: Span,
     },
     Deactivated {
         id: FiberId,
+        /// The span of the teardown, so the steps it unblocks can link back to it.
+        span: Span,
     },
 }
 
@@ -670,10 +674,7 @@ impl Orchestrator {
                     Some(command) => self.command(command),
                     None => return self.drop_consumers_first(),
                 },
-                Some(event) = events.recv() => {
-                    self.event(event);
-                    None
-                }
+                Some(event) = events.recv() => self.event(event),
             };
             while let Some(id) = self.dirty.pop_front() {
                 self.settle(id, cause.as_ref());
@@ -835,11 +836,18 @@ impl Orchestrator {
         }
     }
 
-    fn event(&mut self, event: Event) {
+    /// Handles a finished step and returns its span, the cause of the steps it unblocks.
+    fn event(&mut self, event: Event) -> Option<Span> {
         self.in_flight -= 1;
         match event {
-            Event::Loaded { id, token, outcome } => self.loaded(id, token, outcome),
-            Event::Deactivated { id } => self.deactivated(id),
+            Event::Loaded { id, token, outcome, span } => {
+                self.loaded(id, token, outcome, &span);
+                Some(span)
+            }
+            Event::Deactivated { id, span } => {
+                self.deactivated(id, &span);
+                Some(span)
+            }
         }
     }
 
@@ -993,6 +1001,7 @@ impl Orchestrator {
 
         self.in_flight += 1;
         let events = self.events.clone();
+        let link = span.clone();
         tokio::spawn(
             async move {
                 // `activate` always runs to its end. Dropping it at an `.await` could stop it between
@@ -1016,13 +1025,13 @@ impl Orchestrator {
                     cancel.cancel();
                     undo.run().await;
                 }
-                let _ = events.send(Event::Loaded { id, token, outcome });
+                let _ = events.send(Event::Loaded { id, token, outcome, span: link });
             }
             .instrument(span),
         );
     }
 
-    fn loaded(&mut self, id: FiberId, token: u64, outcome: Option<Result<Box<dyn Instance>, String>>) {
+    fn loaded(&mut self, id: FiberId, token: u64, outcome: Option<Result<Box<dyn Instance>, String>>, cause: &Span) {
         let Some(fiber) = self.fibers.get(id) else { return };
         if !matches!(fiber.state, State::Loading { token: loading, .. } if loading == token) {
             return;
@@ -1034,7 +1043,7 @@ impl Orchestrator {
             Some(Ok(instance)) => {
                 // The target moved while the last step ran; revert what it built.
                 self.fibers[id].state = State::Leaving { instance };
-                self.try_unload(id, None);
+                self.try_unload(id, Some(cause));
             }
             Some(Err(error)) => {
                 tracing::error!(fiber = ?id, %error, "activation failed");
@@ -1042,7 +1051,7 @@ impl Orchestrator {
                 let fiber = &mut self.fibers[id];
                 let committed = fiber.committed.take().expect("a loading fiber has a committed view");
                 fiber.state = State::Failed { view: committed.view.clone(), epoch: committed.epoch, error };
-                self.release(&committed.view);
+                self.release(&committed.view, cause);
                 self.dirty.push_back(id);
             }
             None => {
@@ -1050,7 +1059,7 @@ impl Orchestrator {
                 let fiber = &mut self.fibers[id];
                 let committed = fiber.committed.take().expect("a loading fiber has a committed view");
                 fiber.state = State::Inactive;
-                self.release(&committed.view);
+                self.release(&committed.view, cause);
                 self.dirty.push_back(id);
             }
         }
@@ -1099,24 +1108,25 @@ impl Orchestrator {
         };
         self.in_flight += 1;
         let events = self.events.clone();
+        let link = span.clone();
         tokio::spawn(
             async move {
                 if let Err(panic) = AssertUnwindSafe(instance.dispose()).catch_unwind().await {
                     tracing::error!(fiber = ?id, panic = panic_message(&*panic), "disposal panicked");
                 }
-                let _ = events.send(Event::Deactivated { id });
+                let _ = events.send(Event::Deactivated { id, span: link });
             }
             .instrument(span),
         );
     }
 
-    fn deactivated(&mut self, id: FiberId) {
+    fn deactivated(&mut self, id: FiberId, cause: &Span) {
         // The undo list retired the children; this catches any whose insertion raced with it.
         self.retire_children(id);
         let fiber = &mut self.fibers[id];
         fiber.state = State::Inactive;
         if let Some(committed) = fiber.committed.take() {
-            self.release(&committed.view);
+            self.release(&committed.view, cause);
         }
         self.dirty.push_back(id);
     }
@@ -1136,10 +1146,10 @@ impl Orchestrator {
     }
 
     /// Drops one reliance on each provider in `view`, unloading providers that were waiting.
-    fn release(&mut self, view: &View) {
+    fn release(&mut self, view: &View, cause: &Span) {
         for provider in view.providers() {
             self.relied[provider] -= 1;
-            self.try_unload(provider, None);
+            self.try_unload(provider, Some(cause));
         }
     }
 
