@@ -475,3 +475,81 @@ async fn info_only_subscriber_preserves_emitter_span_through_events() {
 
     app.shutdown().await;
 }
+
+macro_rules! layer {
+    ($service:ident, $name:literal, $component:ident $(, $dep:ident: $dep_service:ident)*) => {
+        pub trait $service: Send + Sync {}
+        cordis::key!(dyn $service = $name);
+
+        #[component(deps($($dep: dyn $dep_service),*), provides(dyn $service))]
+        struct $component;
+
+        impl $service for $component {}
+
+        impl Component for $component {
+            async fn activate(_: Cx<Self>, _: ()) -> Result<Self> {
+                Ok(Self)
+            }
+        }
+    };
+}
+
+// A chain `Chain4 -> Chain3 -> Chain2 -> Chain1`, and a diamond `Top -> {Left, Right} -> Chain2`.
+layer!(Layer1, "layer-1", Chain1);
+layer!(Layer2, "layer-2", Chain2, below: Layer1);
+layer!(Layer3, "layer-3", Chain3, below: Layer2);
+layer!(Layer4, "layer-4", Chain4, below: Layer3);
+layer!(LayerLeft, "layer-left", Left, below: Layer2);
+layer!(LayerRight, "layer-right", Right, below: Layer2);
+layer!(LayerTop, "layer-top", Top, left: LayerLeft, right: LayerRight);
+
+/// Follows `follows_from` links from `span` until a span that is not a lifecycle span.
+fn root_cause(recorder: &Recorder, span: &SpanRecord) -> SpanRecord {
+    let mut current = span.clone();
+    while current.target == "cordis::lifecycle" {
+        let &[cause] = current.follows_from.as_slice() else {
+            panic!("{} {:?} should have one cause, has {:?}", current.name, current.fields, current.follows_from);
+        };
+        current = recorder.span(cause);
+    }
+    current
+}
+
+#[tokio::test]
+async fn steps_unblocked_by_other_fibers_link_back_to_the_request() {
+    let recorder = Recorder::new(Level::INFO);
+    let _guard = tracing::subscriber::set_default(recorder.clone());
+    let app = App::new();
+
+    // Consumers first, so each fiber waits for the provider below it to finish activating.
+    let boot = tracing::info_span!("boot");
+    let boot_id = boot.id().unwrap().into_u64();
+    let bottom = async {
+        app.insert::<Top>(serde_json::Value::Null).await;
+        app.insert::<Right>(serde_json::Value::Null).await;
+        app.insert::<Left>(serde_json::Value::Null).await;
+        app.insert::<Chain4>(serde_json::Value::Null).await;
+        app.insert::<Chain3>(serde_json::Value::Null).await;
+        app.insert::<Chain2>(serde_json::Value::Null).await;
+        app.insert::<Chain1>(serde_json::Value::Null).await
+    }
+    .instrument(boot)
+    .await;
+    app.settled().await;
+
+    // Removing the bottom provider waits for every consumer above it to deactivate first.
+    let remove = tracing::info_span!("remove-bottom");
+    let remove_id = remove.id().unwrap().into_u64();
+    remove.in_scope(|| app.remove(bottom));
+    drop(remove);
+    app.settled().await;
+
+    let lifecycle: Vec<_> = recorder.spans().into_iter().filter(|s| s.target == "cordis::lifecycle").collect();
+    assert_eq!(lifecycle.len(), 14, "seven activations and seven deactivations");
+    for span in &lifecycle {
+        let expected = if span.name == "cordis.activate" { boot_id } else { remove_id };
+        assert_eq!(root_cause(&recorder, span).id, expected, "{} {:?}", span.name, span.fields);
+    }
+
+    app.shutdown().await;
+}
